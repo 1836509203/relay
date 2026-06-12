@@ -2,6 +2,7 @@
 // 检查 → 系统通知/对话框 → 下载 zip（直连失败走加速镜像）→ ditto 原地
 // 覆盖 → 重启。发布侧配套 scripts/release.sh（构建打包 + tag + Release）。
 import AppKit
+import CryptoKit
 import Foundation
 import UserNotifications
 
@@ -122,8 +123,12 @@ enum Updater {
         }
     }
 
-    // MARK: - 下载（多镜像顺序尝试）
+    // MARK: - 下载 + 完整性校验（多镜像顺序尝试）
 
+    /// 下载 zip → 取同名 `.sha256` → 比对哈希 → 安装。校验基于内容哈希、
+    /// 与下载通道解耦：即便经第三方镜像（ghfast.top 等）被投毒，哈希不符即
+    /// 拒装。全程在后台线程（URLSession 回调队列），不阻塞 UI；仅弹框/重启
+    /// 回主线程。
     private static func download(_ urlString: String, version: String, mirrorIndex: Int = 0) {
         guard mirrorIndex < mirrors.count else {
             alert("下载失败", info: "直连与加速镜像均不可达，请稍后再试或到发布页手动下载。")
@@ -132,28 +137,56 @@ enum Updater {
         guard let url = URL(string: mirrors[mirrorIndex] + urlString) else { return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 120
-        let task = URLSession.shared.downloadTask(with: req) { local, resp, _ in
-            DispatchQueue.main.async {
-                guard let local, (resp as? HTTPURLResponse)?.statusCode == 200 else {
-                    download(urlString, version: version, mirrorIndex: mirrorIndex + 1)
-                    return
-                }
-                // downloadTask 的临时文件回调结束即删：先挪走再安装。
-                let zip = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("Relay-update-\(version).zip")
-                try? FileManager.default.removeItem(at: zip)
-                do {
-                    try FileManager.default.moveItem(at: local, to: zip)
-                    install(zip: zip, version: version)
-                } catch {
-                    alert("下载失败", info: error.localizedDescription)
-                }
+        URLSession.shared.downloadTask(with: req) { local, resp, _ in
+            guard let local, (resp as? HTTPURLResponse)?.statusCode == 200 else {
+                download(urlString, version: version, mirrorIndex: mirrorIndex + 1) // 换下个镜像
+                return
             }
-        }
-        task.resume()
+            // downloadTask 的临时文件回调结束即删：先挪走。
+            let zip = FileManager.default.temporaryDirectory
+                .appendingPathComponent("Relay-update-\(version).zip")
+            try? FileManager.default.removeItem(at: zip)
+            do {
+                try FileManager.default.moveItem(at: local, to: zip)
+            } catch {
+                alert("下载失败", info: error.localizedDescription)
+                return
+            }
+            // 完整性校验：取同镜像下的 .sha256，比对本地计算的哈希。
+            guard let expected = fetchExpectedHash(urlString: urlString, mirrorIndex: mirrorIndex) else {
+                alert("无法验证更新包", info: "未能获取发布校验和（.sha256）。为防止下载内容被篡改，已取消安装；请到发布页手动下载。")
+                return
+            }
+            guard let actual = sha256(of: zip) else {
+                alert("无法验证更新包", info: "未能计算下载文件的校验和，已取消安装。")
+                return
+            }
+            guard expected.caseInsensitiveCompare(actual) == .orderedSame else {
+                alert("更新包校验失败",
+                      info: "下载内容与发布校验和不匹配（可能传输损坏或来源不可信），已取消安装。请到发布页手动下载。")
+                return
+            }
+            install(zip: zip, version: version)
+        }.resume()
     }
 
-    // MARK: - 安装（原地覆盖 + 重启）
+    /// 取发布的期望哈希：同镜像下 `<asset>.sha256`，内容形如 `<hex>  <文件名>`。
+    private static func fetchExpectedHash(urlString: String, mirrorIndex: Int) -> String? {
+        guard let url = URL(string: mirrors[mirrorIndex] + urlString + ".sha256"),
+              let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let hex = text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).first.map(String.init)
+        // 基本健壮性：必须是 64 位十六进制，否则视为无效。
+        guard let h = hex, h.count == 64, h.allSatisfy({ $0.isHexDigit }) else { return nil }
+        return h
+    }
+
+    private static func sha256(of file: URL) -> String? {
+        guard let data = try? Data(contentsOf: file) else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    // MARK: - 安装（原地覆盖 + 重启，后台线程执行）
 
     private static func install(zip: URL, version: String) {
         let unpack = FileManager.default.temporaryDirectory
@@ -188,17 +221,23 @@ enum Updater {
             alert("安装失败", info: "无法写入 \(target.path)，请检查权限。")
             return
         }
+        // 重启：sleep 1 等本进程退出后 open。路径单引号包裹并转义单引号，
+        // 杜绝安装路径含特殊字符时的命令注入。
+        let quoted = "'" + target.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let relaunch = Process()
         relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
-        relaunch.arguments = ["-c", "sleep 1; /usr/bin/open \"\(target.path)\""]
+        relaunch.arguments = ["-c", "sleep 1; /usr/bin/open \(quoted)"]
         try? relaunch.run()
-        NSApp.terminate(nil)
+        DispatchQueue.main.async { NSApp.terminate(nil) }
     }
 
+    /// 任何线程可调：弹框统一回主线程（NSAlert 必须主线程）。
     private static func alert(_ msg: String, info: String) {
-        let a = NSAlert()
-        a.messageText = msg
-        a.informativeText = info
-        a.runModal()
+        DispatchQueue.main.async {
+            let a = NSAlert()
+            a.messageText = msg
+            a.informativeText = info
+            a.runModal()
+        }
     }
 }

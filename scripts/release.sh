@@ -31,6 +31,12 @@ echo "==> 打包 DMG"
 DMG="dist/Relay-$VERSION.dmg"
 ./scripts/mkdmg.sh
 
+# 生成校验和（自动更新器下载后比对哈希，防镜像投毒）。
+# shasum 输出 "<hex>  <文件名>"，文件名只留 basename 便于客户端核对。
+echo "==> 生成校验和"
+( cd dist && shasum -a 256 "Relay.app.zip" > "Relay.app.zip.sha256" )
+( cd dist && shasum -a 256 "Relay-$VERSION.dmg" > "Relay-$VERSION.dmg.sha256" )
+
 echo "==> 打 tag 并推送"
 git tag "$TAG"
 git push origin main "$TAG"
@@ -55,6 +61,15 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
         -H "Content-Type: application/x-apple-diskimage" \
         --data-binary @"$DMG" \
         "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$(basename "$DMG")" >/dev/null
+    # 校验和文件（必须随包上传，否则新版客户端校验失败会拒装）。
+    for SUM in "$ZIP.sha256" "$DMG.sha256"; do
+        echo "==> 上传 $(basename "$SUM")"
+        curl -sf -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @"$SUM" \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$(basename "$SUM")" >/dev/null
+    done
     echo "==> 完成: https://github.com/$REPO/releases/tag/$TAG"
 else
     echo "未设置 GITHUB_TOKEN，请手动操作："
