@@ -2,6 +2,7 @@
 // 单进程单线程模型：除 ps 快照与磁盘 IO 外全部在主线程，无锁。
 import AppKit
 import Combine
+import Darwin
 import SwiftTerm
 import UserNotifications
 
@@ -72,6 +73,12 @@ final class SessionStore: ObservableObject {
     private var det: [String: DetState] = [:]
     /// 会话 id → 常驻终端视图（创建后保活，切换 tab 不销毁，历史天然保留）。
     private var views: [String: RelayTerminalView] = [:]
+    /// 会话 id → 最近读到的子 shell 工作目录（onTick 用 proc_pidinfo 采样，
+    /// 不入 @Published 避免每秒触发 SwiftUI 重渲染；落盘时并入 Session.cwd）。
+    private var liveCwd: [String: String] = [:]
+    /// 启动时从磁盘恢复出来的会话 id（区分「恢复」与「本次新建」）：仅对恢复的
+    /// agent 会话在重开时预填 resume 命令，首次实体化后即移除。
+    private var restoredIds: Set<String> = []
     private var ticker: Timer?
     private var tick: UInt64 = 0
     private var idCounter = 0
@@ -499,12 +506,53 @@ final class SessionStore: ObservableObject {
         }
         let shell = env["SHELL"] ?? "/bin/zsh"
         ds.startedAt = Date()
+        // 工作目录恢复：优先用上次落盘且仍存在的 cwd，否则回落 home。
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let session = sessions.first(where: { $0.id == id })
+        let startDir = (session?.cwd).flatMap { isUsableDir($0) ? $0 : nil } ?? home
         v.startProcess(
             executable: shell, args: ["-l"],
             environment: env.map { "\($0.key)=\($0.value)" },
-            execName: nil, currentDirectory: FileManager.default.homeDirectoryForCurrentUser.path
+            execName: nil, currentDirectory: startDir
         )
+        // 恢复出来的 agent 会话：在提示符上预填 resume 命令（不回车，用户按
+        // Enter 即恢复）。仅对从磁盘恢复的会话触发一次；新建的 claude/codex
+        // 不预填。延迟一拍等 shell -l 打出提示符，避免预填字被启动输出顶乱。
+        if restoredIds.remove(id) != nil,
+           let kind = session?.kind, let cmd = resumeCommand(for: kind) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak v] in
+                v?.send(txt: cmd)
+            }
+        }
         return v
+    }
+
+    /// 路径存在且是目录（恢复 cwd 前校验，目录被删/改名则回落 home）。
+    private func isUsableDir(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+    }
+
+    /// 恢复 agent 会话时预填的 resume 命令（不含回车）。
+    private func resumeCommand(for kind: WindowType) -> String? {
+        switch kind {
+        case .claude: return "claude --continue"
+        case .codex: return "codex resume --last"
+        default: return nil
+        }
+    }
+
+    /// 读子 shell 当前工作目录（proc_pidinfo / PROC_PIDVNODEPATHINFO，无需 shell
+    /// 配合 OSC 7）。对自己拥有的子进程无需特殊权限。
+    private func processCwd(pid: pid_t) -> String? {
+        guard pid > 0 else { return nil }
+        var info = proc_vnodepathinfo()
+        let sz = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, sz) == sz else { return nil }
+        let path = withUnsafeBytes(of: &info.pvi_cdir.vip_path) { raw -> String in
+            String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+        }
+        return path.isEmpty ? nil : path
     }
 
     // MARK: - 输出喂入（RelayTerminalView.dataReceived，主线程）
@@ -620,6 +668,13 @@ final class SessionStore: ObservableObject {
             guard let lf = ds.lastFeed, Date().timeIntervalSince(lf) > 2 else { continue }
             det[id]?.quietRefreshed = true
             views[id]?.fullRefresh()
+        }
+        // 采样各活动会话的工作目录（退出时并入 Session.cwd 落盘，重开恢复）。
+        // proc_pidinfo 读自己子进程很便宜，无需 shell 发 OSC 7。
+        for (id, v) in views {
+            guard v.process?.running == true,
+                  let dir = processCwd(pid: v.process?.shellPid ?? 0) else { continue }
+            liveCwd[id] = dir
         }
         // ps 全表 fork+exec 不便宜：5s 一次足以跟上 claude/ssh 的启停。
         if tick % 5 == 0 { reclassifyTypes() }
@@ -750,13 +805,25 @@ final class SessionStore: ObservableObject {
             list[i].phase = nil
         }
         sessions = list
+        restoredIds = Set(list.map { $0.id }) // 这批是恢复的，agent 会话重开预填 resume
+        for s in list where s.cwd != nil { liveCwd[s.id] = s.cwd } // 落盘前先沿用上次目录
         activeId = list.last?.id
         if let a = activeId { panes = [a] }
         persistSessions() // 归位后的状态立即落盘，避免磁盘上残留旧 running 状态
     }
 
+    /// 落盘前把最近采样到的工作目录并入会话快照（liveCwd 不入 @Published）。
+    private func sessionsForPersist() -> [Session] {
+        sessions.map { s in
+            guard let dir = liveCwd[s.id] else { return s }
+            var c = s
+            c.cwd = dir
+            return c
+        }
+    }
+
     func persistSessions() {
-        let snapshot = sessions
+        let snapshot = sessionsForPersist()
         ioQueue.async {
             if let data = try? JSONEncoder().encode(snapshot) {
                 try? data.write(to: DataDir.sessionsFile, options: .atomic)
@@ -785,9 +852,13 @@ final class SessionStore: ObservableObject {
     /// 退出前同步落盘全部会话缓冲（applicationWillTerminate 调用）。
     func persistAllScrollback() {
         for (id, v) in views {
+            // 退出前最后采样一次工作目录，确保落盘的是最新位置。
+            if v.process?.running == true, let dir = processCwd(pid: v.process?.shellPid ?? 0) {
+                liveCwd[id] = dir
+            }
             try? snapshotData(of: v).write(to: DataDir.scrollbackFile(id), options: .atomic)
         }
-        if let data = try? JSONEncoder().encode(sessions) {
+        if let data = try? JSONEncoder().encode(sessionsForPersist()) {
             try? data.write(to: DataDir.sessionsFile, options: .atomic)
         }
     }

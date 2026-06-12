@@ -45,6 +45,9 @@ struct Session: Identifiable, Codable, Equatable {
     /// 两级结构：nil = 任务（侧栏条目/首个标签页）；非 nil = 该任务下的附加标签页。
     /// Optional 字段旧版 sessions.json 缺 key 时自动解码为 nil，无需手写容错。
     var parentId: String?
+    /// 上次的工作目录（proc_pidinfo 读子 shell cwd 落盘）；重开时在此目录启动
+    /// shell。旧版 sessions.json 缺此 key → nil → 回落 home。
+    var cwd: String?
 }
 
 /// 侧栏显示用的派生阶段。
