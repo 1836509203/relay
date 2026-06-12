@@ -2022,8 +2022,29 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     open func paste(_ sender: Any)
     {
         let clipboard = NSPasteboard.general
+        // Relay patch: 从 Finder 复制/拖拽的文件，剪贴板 .string 往往只是显示名
+        // （如 "stodownload.MP4"），真实绝对路径在 file-url 类型里。优先读文件
+        // URL，插入 shell 转义后的绝对路径（多文件以空格分隔），符合「在终端粘贴
+        // 文件即得到可用路径」的预期（对齐 Terminal.app/iTerm2 行为）。
+        if let urls = clipboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+            let joined = urls.map { Self.shellEscapePath($0.path) }.joined(separator: " ")
+            insertText(joined, replacementRange: NSRange(location: 0, length: 0), isPaste: true)
+            return
+        }
         let text = clipboard.string(forType: .string)
         insertText(text ?? "", replacementRange: NSRange(location: 0, length: 0), isPaste: true)
+    }
+
+    /// Relay patch: shell 安全的路径表示——全是安全字符则原样输出（多数路径如此，
+    /// 与手输一致）；含空格/元字符则用单引号包裹（内嵌单引号转义为 '\''），
+    /// 任意字符都安全、回车即可用。
+    static func shellEscapePath(_ path: String) -> String {
+        if path.isEmpty { return "''" }
+        let safe = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-./")
+        if path.allSatisfy({ safe.contains($0) }) { return path }
+        return "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
     
     @objc
