@@ -9,7 +9,7 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.relay.native</string>
+	<string>com.relay.terminal</string>
 	<key>CFBundleName</key>
 	<string>Relay</string>
 	<key>CFBundlePackageType</key>
