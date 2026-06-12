@@ -93,6 +93,18 @@ public class LocalProcess {
     private var pendingChunkIndex: Int = 0
     private var pendingScheduled = false
     private let pendingLock = NSLock()
+    // Relay patch: read backpressure. The background reader drains the PTY into
+    // pendingChunks unconditionally, so under a TUI output flood (claude/codex
+    // redrawing) the backlog grows without bound and the producer never blocks —
+    // a keystroke's echo lands at the tail and only paints after the whole
+    // backlog is parsed (visible input lag). Suspending reads at a high-water
+    // mark lets the kernel PTY buffer fill and block the producer, capping
+    // backlog depth and therefore echo latency. Throughput is unaffected: the
+    // main thread is the bottleneck either way; we just stop reading ahead.
+    private let readHighWater = 256 * 1024
+    private let readLowWater = 64 * 1024
+    private var pendingBytes = 0      // undrained bytes in pendingChunks (pendingLock)
+    private var readSuspended = false // reads paused for backpressure (pendingLock)
     
     #if false //canImport(Subprocess)
     // Swift Subprocess related properties
@@ -130,6 +142,7 @@ public class LocalProcess {
         } else {
             pendingChunks.append(bytes)
         }
+        pendingBytes += bytes.count
         let shouldSchedule = !pendingScheduled
         if shouldSchedule {
             pendingScheduled = true
@@ -149,6 +162,7 @@ public class LocalProcess {
             pendingLock.lock()
             if pendingChunkIndex < pendingChunks.count {
                 chunk = pendingChunks[pendingChunkIndex]
+                pendingBytes -= chunk!.count
                 pendingChunkIndex += 1
                 if pendingChunkIndex >= pendingChunkFlushThreshold {
                     pendingChunks.removeFirst(pendingChunkIndex)
@@ -158,7 +172,9 @@ public class LocalProcess {
                 pendingChunks.removeAll(keepingCapacity: true)
                 pendingChunkIndex = 0
                 pendingScheduled = false
+                pendingBytes = 0
                 pendingLock.unlock()
+                resumeReadIfNeeded() // backlog empty → must resume a suspended reader
                 return
             }
             pendingLock.unlock()
@@ -166,6 +182,7 @@ public class LocalProcess {
             if let chunk {
                 delegate?.dataReceived(slice: chunk[...])
             }
+            resumeReadIfNeeded() // resume as soon as backlog falls below low-water
 
             if DispatchTime.now().uptimeNanoseconds - start >= pendingTimeSliceNs {
                 dispatchQueue.async { [weak self] in
@@ -173,6 +190,31 @@ public class LocalProcess {
                 }
                 return
             }
+        }
+    }
+
+    // Relay patch: re-issue a read suspended by backpressure once the backlog
+    // has drained below the low-water mark. Safe to call from the drain (main)
+    // queue — io.read merely schedules; the ioHandler still runs on readQueue.
+    private func resumeReadIfNeeded() {
+        pendingLock.lock()
+        let resume = readSuspended && pendingBytes < readLowWater && running
+        if resume { readSuspended = false }
+        pendingLock.unlock()
+        if resume {
+            io?.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
+        }
+    }
+
+    // Relay patch: continue the read chain, unless the backlog is at/over the
+    // high-water mark — then mark the reader suspended and let drain resume it.
+    private func scheduleNextReadOrSuspend() {
+        pendingLock.lock()
+        let suspend = pendingBytes >= readHighWater
+        if suspend { readSuspended = true }
+        pendingLock.unlock()
+        if !suspend {
+            io?.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
         }
     }
     
@@ -274,7 +316,7 @@ public class LocalProcess {
             // falls through to the stop path below.
             if done && errno == 0 && currentOpBytes > 0 && running {
                 currentOpBytes = 0
-                io?.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
+                scheduleNextReadOrSuspend()
                 return
             }
             childfd = -1
@@ -317,7 +359,7 @@ public class LocalProcess {
         // chunks for the parser.
         if done {
             currentOpBytes = 0
-            io?.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
+            scheduleNextReadOrSuspend()
         }
     }
 
