@@ -104,6 +104,42 @@ final class SessionStore: ObservableObject {
         sessions.filter { $0.id == tid || $0.parentId == tid }
     }
 
+    // MARK: - 任务重排（侧栏拖拽）
+
+    /// 把任务 sourceId 移到 targetId 之前。仅改变 sessions 数组里任务根的
+    /// 相对顺序（子标签页跟随各自任务根，组内/标签页顺序不变；侧栏 groups
+    /// 按 group 聚合，跨组拖拽不会拆散分组，只影响显示先后）。拖动过程频繁
+    /// 触发，只做内存重排刷新 UI；落盘留给 commitTaskOrder（拖放结束一次）。
+    func moveTask(_ sourceId: String, before targetId: String) {
+        guard sourceId != targetId else { return }
+        var order = tasks.map { $0.id }
+        guard let from = order.firstIndex(of: sourceId) else { return }
+        order.remove(at: from)
+        guard let to = order.firstIndex(of: targetId) else { return }
+        order.insert(sourceId, at: to)
+        rebuildSessions(byTaskOrder: order)
+    }
+
+    /// 按任务顺序重建 sessions：每个任务根后紧跟其子标签页（各自相对顺序
+    /// 不变）。不在 order 内的会话（理论不存在）补到末尾，绝不丢会话。
+    private func rebuildSessions(byTaskOrder order: [String]) {
+        var rebuilt: [Session] = []
+        rebuilt.reserveCapacity(sessions.count)
+        for tid in order {
+            for s in sessions where s.id == tid || s.parentId == tid {
+                rebuilt.append(s)
+            }
+        }
+        if rebuilt.count != sessions.count {
+            let kept = Set(rebuilt.map { $0.id })
+            rebuilt.append(contentsOf: sessions.filter { !kept.contains($0.id) })
+        }
+        sessions = rebuilt
+    }
+
+    /// 拖放结束：把当前任务顺序落盘。
+    func commitTaskOrder() { persistSessions() }
+
     /// 当前聚焦标签页所在任务的标签页列表（TabStrip 数据源）。
     var activeTabs: [Session] {
         guard let a = activeId else { return [] }

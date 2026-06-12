@@ -5,11 +5,14 @@
 // 会复用旧分组里的 row 视图导致图标/状态卡在旧值（TabStrip 用普通 HStack 无此
 // 问题，实测对照定位）。任务数量级几十，Lazy 本无收益。
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @ObservedObject var store: SessionStore
     @State private var query = ""
     @State private var renamingId: String?
+    /// 正在拖拽的任务 id（拖动中该行半透明；拖放/取消后复位）。
+    @State private var draggingId: String?
 
     private var filteredTasks: [Session] {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
@@ -68,6 +71,16 @@ struct SidebarView: View {
                                 beginRename: { renamingId = root.id },
                                 endRename: { renamingId = nil }
                             )
+                            .opacity(draggingId == root.id ? 0.35 : 1)
+                            // 搜索过滤时禁用拖拽（显示的不是全量顺序，重排语义混乱）：
+                            // query 非空则返回空 provider 且不设 draggingId，放置不生效。
+                            .onDrag {
+                                guard query.isEmpty else { return NSItemProvider() }
+                                draggingId = root.id
+                                return NSItemProvider(object: root.id as NSString)
+                            }
+                            .onDrop(of: [.text], delegate: TaskDropDelegate(
+                                targetId: root.id, store: store, draggingId: $draggingId))
                         }
                     }
                     if filteredTasks.isEmpty {
@@ -85,6 +98,13 @@ struct SidebarView: View {
             newButton
         }
         .frame(width: 232)
+        // 拖到行与行之间空白/列表外松开的兜底：顺序已在 dropEntered 实时更新，
+        // 这里只负责落盘并复位拖拽态（否则被拖行会一直卡在半透明）。
+        .onDrop(of: [.text], isTargeted: nil) { _ in
+            if draggingId != nil { store.commitTaskOrder() }
+            draggingId = nil
+            return true
+        }
         // 不自己垫色：整窗唯一一层半透明底在 RootView（图45：色调完全一致）。
     }
 
@@ -126,6 +146,31 @@ struct SidebarView: View {
         }
         .buttonStyle(.plain) // ⌘N 由主菜单提供，这里不重复绑定（避免双触发）
         .padding(10)
+    }
+}
+
+/// 任务行放置代理：拖拽经过某行时实时把被拖任务移到该行之前（带动画），
+/// 落盘留到 performDrop（拖放结束一次写盘，避免拖动途中频繁 IO）。
+private struct TaskDropDelegate: DropDelegate {
+    let targetId: String
+    let store: SessionStore
+    @Binding var draggingId: String?
+
+    func dropEntered(info: DropInfo) {
+        guard let dragging = draggingId, dragging != targetId else { return }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            store.moveTask(dragging, before: targetId)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        store.commitTaskOrder()
+        draggingId = nil
+        return true
     }
 }
 
