@@ -15,7 +15,13 @@ cp "$BIN/Relay" "$APP/Contents/MacOS/Relay"
 cp Info.plist "$APP/Contents/Info.plist"
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
-codesign --force --deep --sign - "$APP"
+# 优先自签证书（稳定签名身份，macOS 26 WindowManager 角标缓存认它），
+# 没有证书的机器回落 ad-hoc。证书生成见 README 或 scripts/release.sh 注释。
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Relay Local Dev"; then
+    codesign --force --deep --sign "Relay Local Dev" "$APP"
+else
+    codesign --force --deep --sign - "$APP"
+fi
 # Finder 自定义图标（必须在签名后：Icon\r 资源文件不属于签名内容）。
 # macOS 26 角标管线只认 Assets.car，icns 不够 —— 见 scripts/seticon.swift。
 swift scripts/seticon.swift "$APP" scripts/AppIcon-1024.png
