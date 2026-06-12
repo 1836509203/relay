@@ -2,6 +2,7 @@
 import AppKit
 import SwiftUI
 import SwiftTerm
+import UserNotifications
 
 // 窗口背景毛玻璃：iTerm2/Ghostty 同款 CGS 私有 API（App Store 不可上，
 // 本应用 adhoc 签名分发无碍）。radius 0 = 关闭。
@@ -35,6 +36,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 通知代理须在收到任何通知前就位：点击「已完成/需确认/响铃」横幅跳回会话，
+        // 点击「有新版本」横幅触发检查更新（详见扩展实现）。
+        UNUserNotificationCenter.current().delegate = self
+
         // 运行时直设 Dock/切换器图标：ad-hoc 签名 + 手工组包的 app，
         // iconservices 常按 bundle id 命中旧缓存（通用图标），不等系统刷新。
         if let icns = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
@@ -336,5 +341,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let v = SessionStore.shared.activeView else { return }
         v.getTerminal().resetToInitialState()
         v.send(txt: "\u{0C}")
+    }
+}
+
+// MARK: - 通知交互（点击横幅跳回会话 / 触发更新）
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    /// 前台也展示横幅：默认前台收到的通知被系统抑制，但终端类应用用户常切到
+    /// 别的窗口等结果，必须明确弹出「已完成/需确认」提醒才有意义。
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// 点击通知：带 task 的跳回对应任务并激活窗口；更新提示（identifier 前缀
+    /// relay.update.）则触发一次交互式检查更新，弹出安装对话框。
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let request = response.notification.request
+        if let task = request.content.userInfo["task"] as? String {
+            SessionStore.shared.showTask(task)
+            window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else if request.identifier.hasPrefix("relay.update.") {
+            Updater.check(interactive: true)
+        }
+        completionHandler()
     }
 }

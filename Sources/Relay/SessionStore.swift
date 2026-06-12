@@ -63,6 +63,10 @@ final class SessionStore: ObservableObject {
         /// 干净的、脏行重绘遗漏）；输出停 2 秒后刷一帧兜底，零持续成本。
         var lastFeed: Date?
         var quietRefreshed = true
+        /// 进程已退出：阻止退出瞬间残留的 PTY 输出经 feed 把状态点回 Running。
+        var exited = false
+        /// 本次进程启动时刻：判定"startProcess 根本没起来就秒退"（坏 $SHELL）。
+        var startedAt: Date?
     }
 
     private var det: [String: DetState] = [:]
@@ -369,7 +373,7 @@ final class SessionStore: ObservableObject {
     /// 终端铃声：非聚焦会话走系统通知（聚焦会话已有系统提示音，不再打扰）。
     func noteBell(id: String) {
         guard id != activeId, let s = sessions.first(where: { $0.id == id }) else { return }
-        postSystemNotification(title: "\(s.name) 响铃", body: "\(s.group) · 终端 BEL")
+        postSystemNotification(title: "\(s.name) 响铃", body: "\(s.group) · 终端 BEL", taskId: taskId(of: id))
     }
 
     // MARK: - 菜单/快捷键动作
@@ -494,6 +498,7 @@ final class SessionStore: ObservableObject {
             env["RELAY_HOOK_TOKEN"] = hs.token
         }
         let shell = env["SHELL"] ?? "/bin/zsh"
+        ds.startedAt = Date()
         v.startProcess(
             executable: shell, args: ["-l"],
             environment: env.map { "\($0.key)=\($0.value)" },
@@ -510,6 +515,9 @@ final class SessionStore: ObservableObject {
     func feed(id: String) {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         guard let ds = det[id] else { return }
+        // 进程已退出：退出与最后一批 PTY 输出几乎同时到达，残留输出不应把
+        // 刚结束的会话从 Done 点回 Running（侧栏状态抖动）。
+        if ds.exited { return }
 
         ds.dirty = true
         ds.lastFeed = Date()
@@ -527,12 +535,23 @@ final class SessionStore: ObservableObject {
 
     /// shell 进程退出（delegate 回调）。
     func onExit(id: String, code: Int32?) {
-        if let ds = det[id] {
-            ds.dirty = false
-            ds.lastBusy = nil
-        }
+        let ds = det[id]
+        ds?.dirty = false
+        ds?.lastBusy = nil
+        ds?.exited = true // 退出后残留输出不再点亮状态（见 feed）
         if let v = views[id] {
             saveScrollback(id, snapshotData(of: v))
+        }
+        let failed = (code ?? 1) != 0
+        // 进程在视图创建后极短时间内异常退出 = startProcess 没真正起来
+        //（如 $SHELL 指向坏路径）。清掉死视图与检测态，让下次点开重建，
+        // 否则 terminalView(for:) 永远返回这个黑屏死视图、会话彻底坏死。
+        // 正常用过的 shell（存活超过阈值）即便非零退出也保留，用户可能想
+        // 看最后的输出。历史快照仍在磁盘，重建时会回放。
+        if failed, let started = ds?.startedAt, Date().timeIntervalSince(started) < 1.5 {
+            views[id]?.removeFromSuperview()
+            views.removeValue(forKey: id)
+            det.removeValue(forKey: id)
         }
         let st: SessionStatus = (code ?? 0) == 0 ? .done : .error
         applyStatus(id, st, nil)
@@ -694,17 +713,19 @@ final class SessionStore: ObservableObject {
             pair = nil
         }
         guard let (title, sub) = pair else { return }
-        postSystemNotification(title: title, body: sub)
+        postSystemNotification(title: title, body: sub, taskId: taskId(of: s.id))
     }
 
     /// 系统通知中心（应用内不再弹浮层角标）。
     /// 裸二进制（无 bundle id）下 UNUserNotificationCenter 会崩，须守护。
-    private func postSystemNotification(title: String, body: String) {
+    /// taskId 写入 userInfo，供点击通知时跳回对应任务（见 AppDelegate 代理）。
+    private func postSystemNotification(title: String, body: String, taskId: String? = nil) {
         guard Bundle.main.bundleIdentifier != nil else { return }
         notifCounter += 1
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
+        if let taskId { content.userInfo = ["task": taskId] }
         let req = UNNotificationRequest(identifier: "n\(notifCounter)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
     }
