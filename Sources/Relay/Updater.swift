@@ -29,10 +29,9 @@ enum Updater {
                 guard let http = resp as? HTTPURLResponse, http.statusCode == 200, let data,
                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                       let tag = obj["tag_name"] as? String else {
-                    if interactive {
-                        alert("无法获取更新信息",
-                              info: err?.localizedDescription ?? "网络不可达，或仓库还没有发布任何版本。")
-                    }
+                    // API 不可达或匿名配额耗尽（共享代理出口 60 次/时/IP 很容易
+                    // 被打满，403）→ 改走网页重定向探测，不消耗 API 配额。
+                    checkViaRedirect(interactive: interactive, apiError: err)
                     return
                 }
                 let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
@@ -45,6 +44,37 @@ enum Updater {
                     }
                     offer(version: latest, urlString: assetURL,
                           notes: obj["body"] as? String ?? "", interactive: interactive)
+                } else if interactive {
+                    alert("已是最新版本", info: "当前 \(currentVersion)；远端最新 \(latest)。")
+                }
+            }
+        }.resume()
+    }
+
+    /// API 的后备路径：releases/latest 网页 302 到 /releases/tag/<tag>，
+    /// 跟随重定向后从最终 URL 提取版本号（无 rate limit）。asset 地址按
+    /// GitHub 固定格式构造，发布说明拿不到（留空）。
+    private static func checkViaRedirect(interactive: Bool, apiError: Error?) {
+        guard let url = URL(string: "https://github.com/\(repo)/releases/latest") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        req.timeoutInterval = 15
+        URLSession.shared.dataTask(with: req) { _, resp, err in
+            DispatchQueue.main.async {
+                guard let final = resp?.url, final.pathComponents.dropLast().last == "tag",
+                      let tag = final.pathComponents.last, tag.hasPrefix("v") else {
+                    if interactive {
+                        alert("无法获取更新信息",
+                              info: (apiError ?? err)?.localizedDescription
+                                  ?? "网络不可达，或仓库还没有发布任何版本。")
+                    }
+                    return
+                }
+                let latest = String(tag.dropFirst())
+                if isNewer(latest, than: currentVersion) {
+                    offer(version: latest,
+                          urlString: "https://github.com/\(repo)/releases/download/\(tag)/\(assetName)",
+                          notes: "", interactive: interactive)
                 } else if interactive {
                     alert("已是最新版本", info: "当前 \(currentVersion)；远端最新 \(latest)。")
                 }
