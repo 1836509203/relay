@@ -53,9 +53,36 @@ final class RelayTerminalView: LocalProcessTerminalView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         processDelegate = ProcessEvents.shared
+        // 接受从 Finder 拖入的文件：drop 时插入 shell 转义后的绝对路径（见下方
+        // performDragOperation）。与粘贴文件走同一套 shellEscapePath 转义。
+        registerForDraggedTypes([.fileURL])
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
+
+    // MARK: - 文件拖入 → 插入绝对路径
+
+    /// 拖入内容含文件才接收（显示「拷贝」光标），否则不拦截。
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        sender.draggingPasteboard.canReadObject(
+            forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) ? .copy : []
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { true }
+
+    /// 落下：读全部文件 URL，插入 shell 转义后的绝对路径（多文件空格分隔），
+    /// 直送 PTY（不加括号粘贴标记，更接近手输路径的预期）。
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let urls = sender.draggingPasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else {
+            return false
+        }
+        let joined = urls.map { Self.shellEscapePath($0.path) }.joined(separator: " ")
+        send(txt: joined)
+        window?.makeFirstResponder(self)
+        return true
+    }
 
     /// 终端铃声（BEL）：系统提示音 + 非聚焦会话冒泡通知。
     override func bell(source: Terminal) {

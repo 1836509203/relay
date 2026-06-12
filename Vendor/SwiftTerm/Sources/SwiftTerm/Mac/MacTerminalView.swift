@@ -2039,8 +2039,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     /// Relay patch: shell 安全的路径表示——全是安全字符则原样输出（多数路径如此，
     /// 与手输一致）；含空格/元字符则用单引号包裹（内嵌单引号转义为 '\''），
-    /// 任意字符都安全、回车即可用。
-    static func shellEscapePath(_ path: String) -> String {
+    /// 任意字符都安全、回车即可用。public 供宿主拖放处理复用同一套转义。
+    public static func shellEscapePath(_ path: String) -> String {
         if path.isEmpty { return "''" }
         let safe = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-./")
         if path.allSatisfy({ safe.contains($0) }) { return path }
