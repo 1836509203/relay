@@ -43,6 +43,12 @@
 
 ## 📦 安装与构建
 
+### 直接下载（推荐）
+
+从 [Releases](https://github.com/1836509203/relay/releases/latest) 下载 **Relay-x.y.z.dmg**，双击打开后把 Relay 拖入 Applications 即完成安装。首次打开若被安全拦截：系统设置 → 隐私与安全性 → 仍要打开。
+
+### 从源码构建
+
 只需 macOS 13+ 与 Xcode Command Line Tools（**不需要完整 Xcode**）：
 
 ```bash

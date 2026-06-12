@@ -27,6 +27,10 @@ rm -f "$ZIP"
 # --sequesterRsrc 保留 resource fork（Finder 自定义图标）。
 ditto -c -k --sequesterRsrc --keepParent dist/Relay.app "$ZIP"
 
+echo "==> 打包 DMG"
+DMG="dist/Relay-$VERSION.dmg"
+./scripts/mkdmg.sh
+
 echo "==> 打 tag 并推送"
 git tag "$TAG"
 git push origin main "$TAG"
@@ -45,10 +49,16 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
         -H "Content-Type: application/zip" \
         --data-binary @"$ZIP" \
         "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=Relay.app.zip" >/dev/null
+    echo "==> 上传 $DMG"
+    curl -sf -X POST \
+        -H "Authorization: Bearer $GITHUB_TOKEN" \
+        -H "Content-Type: application/x-apple-diskimage" \
+        --data-binary @"$DMG" \
+        "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$(basename "$DMG")" >/dev/null
     echo "==> 完成: https://github.com/$REPO/releases/tag/$TAG"
 else
     echo "未设置 GITHUB_TOKEN，请手动操作："
     echo "  1. 打开 https://github.com/$REPO/releases/new?tag=$TAG"
-    echo "  2. 上传 $ZIP（asset 名必须是 Relay.app.zip）"
+    echo "  2. 上传 $ZIP（asset 名必须是 Relay.app.zip）和 $DMG"
     echo "  3. 点击 Publish release"
 fi
