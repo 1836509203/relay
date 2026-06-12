@@ -2561,11 +2561,20 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 // Default implementations for TerminalViewDelegate
 
 extension TerminalViewDelegate {
+    /// Relay patch: terminal output is untrusted. An OSC 8 hyperlink can display
+    /// innocent text (e.g. "https://github.com/...") while the actual target is a
+    /// `file://`, `x-apple-...`, or custom app scheme — a ⌘-click would then hand a
+    /// dangerous URL to the OS. Only safe web/mail schemes are opened; anything else
+    /// is silently ignored. (iTerm2/Ghostty apply the same kind of scheme gating.)
     public func requestOpenLink (source: TerminalView, link: String, params: [String:String])
     {
-        if let url = URL(string: link) {
-            NSWorkspace.shared.open(url)
+        let allowedSchemes: Set<String> = ["http", "https", "mailto", "ftp", "ftps"]
+        guard let url = URL(string: link),
+              let scheme = url.scheme?.lowercased(),
+              allowedSchemes.contains(scheme) else {
+            return
         }
+        NSWorkspace.shared.open(url)
     }
     
     public func bell (source: TerminalView)
