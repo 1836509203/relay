@@ -1,1 +1,121 @@
-# relay
+<div align="center">
+
+<img src="docs/icon.png" width="128" alt="Relay" />
+
+# Relay
+
+**原生单进程 AI 终端 · 为 Claude Code / Codex 等 agent 工作流而生**
+
+纯 Swift + AppKit/SwiftUI 构建，无 Electron、无 Web 运行时、无多进程开销。
+一个窗口管理所有 AI 编码任务：侧栏感知每个 agent 的工作状态，终端以 Metal 渲染跑满 ProMotion 120Hz。
+
+<img src="docs/screenshots/main-dark.png" width="800" alt="Relay 暗色主题" />
+
+<img src="docs/screenshots/main-light.png" width="800" alt="Relay 亮色主题" />
+
+</div>
+
+---
+
+## ✨ 特性
+
+### 为 AI agent 设计的任务模型
+
+- **任务 = 一组标签页**：每个任务（如一次 Claude Code 会话）可挂多个标签页（agent 主会话 + 看日志的 shell + ssh），侧栏一行聚合展示
+- **状态感知侧栏**：自动识别会话里跑的是 claude / codex / ssh / shell，实时显示 Thinking / Working / Waiting / Done / Failed 阶段，完成未读时亮点提醒
+- **Claude Code hook 集成**：内置本地 HTTP hook 服务，agent 的状态变化（等待输入、任务完成）直接驱动 UI 与系统通知，不靠猜屏幕
+- **会话持久化**：退出后自动保存所有会话回看内容（纯文本快照），重启点开即恢复历史并重启 shell
+
+### 原生性能
+
+- **单进程架构**：所有任务共享一个进程，几十个会话照样轻量（对比：Electron 终端每窗口一个渲染进程）
+- **Metal GPU 渲染**：字形图集 + 逐 cell quad，agent TUI 高频全屏重绘（CSI 2026 同步输出）下依然流畅，重绘跟随 ProMotion 120Hz
+- **吞吐实测**：`seq 2000000` 灌满输出从上游 SwiftTerm 的 62s / +1.5GB 内存优化到 **~3s / +60MB**，与 Ghostty 同量级
+- **内存克制**：空闲常驻 ~136MB（含 Metal 字形图集），滚动缓冲按需实体化
+
+### macOS 原生体验
+
+- **Safari 式标签条**：单标签融入标题栏无感显示，多标签均分宽度、淡色胶囊高亮，深度融合窗口色调
+- **整窗半透明 + 毛玻璃**：透明度/模糊半径可调，侧栏、标签条、终端区单层垫色，色调完全一致
+- **明暗跟随系统**：暗色 / 亮色各配一套主题（内置 Catppuccin Mocha/Latte、Solarized、One Dark、Gruvbox 等），随系统外观即时切换
+- **中文输入法完整支持**：preedit 组合浮层跟随光标，组合期光标定位正确；CJK 宽字符按网格列锚定渲染，中英混排零漂移
+- **细节**：overlay 滚动条滚动浮现自动隐藏、⌘ 长按显示任务快捷角标（⌘1-9 直达）、双击侧栏重命名任务
+
+## 📦 安装与构建
+
+只需 macOS 13+ 与 Xcode Command Line Tools（**不需要完整 Xcode**）：
+
+```bash
+git clone https://github.com/1836509203/relay.git
+cd relay
+./build.sh          # swift build + 手工组包 + ad-hoc 签名 + 应用图标
+open dist/Relay.app # 或拷贝到 /Applications
+```
+
+构建产物为 `dist/Relay.app`，数据目录在 `~/Library/Application Support/RelayNative/`。
+
+## ⌨️ 快捷键
+
+| 快捷键 | 功能 |
+|---|---|
+| `⌘N` | 新建任务 |
+| `⌘T` | 当前任务内新建标签页 |
+| `⌘W` | 关闭标签页 |
+| `⌘D` / `⌘⇧D` | 左右分屏 / 取消分屏 |
+| `⌘F` | 搜索终端内容 |
+| `⌘K` | 清屏 |
+| `⌘⇧[` / `⌘⇧]` | 上一个 / 下一个标签页 |
+| `⌘1`–`⌘9` | 直达第 N 个任务（按住 ⌘ 侧栏显示角标） |
+| `⌘+` / `⌘-` / `⌘0` | 字体放大 / 缩小 / 复位 |
+| `⌘,` | 偏好设置 |
+
+## ⚙️ 设置项
+
+偏好设置（`⌘,`）实时生效并持久化：
+
+- **主题**：暗色 / 亮色主题独立选择，可跟随系统明暗自动切换
+- **字体**：等宽字体族 + 字号；行距、字距微调（负字距可收紧 CJK 全角间隙）
+- **背景**：不透明度（0.7–1.0）+ 毛玻璃模糊半径
+- **光标**：块 / 竖线 / 下划线，闪烁开关
+- **回看行数**：500–10000（内存敏感场景可调低）
+- **GPU 渲染**：Metal / CoreGraphics 运行时切换
+
+## 🏗 架构
+
+```
+macapp/
+├── Package.swift           # SPM 工程（无 xcodeproj）
+├── build.sh                # 构建 + 组包 + 签名 + 图标，一步出 app
+├── Sources/Relay/
+│   ├── AppDelegate.swift   # 窗口/菜单/生命周期
+│   ├── SessionStore.swift  # 会话中枢：CRUD/状态机/持久化/检测 ticker
+│   ├── TerminalHost.swift  # SwiftTerm 视图封装 + SwiftUI 桥接
+│   ├── Detector.swift      # agent 状态检测（spinner/等待模式识别）
+│   ├── HookServer.swift    # Claude Code hook 本地 HTTP 服务
+│   ├── RootView.swift      # 主界面壳（侧栏 + 标签条 + 终端区）
+│   ├── SidebarView.swift   # 任务侧栏
+│   ├── TabStrip.swift      # Safari 式标签条
+│   └── …
+└── Vendor/SwiftTerm/       # vendored 终端引擎（含性能/渲染补丁）
+```
+
+终端引擎基于 [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)（MIT）vendor 并深度打磨，主要补丁：
+
+- **吞吐**：修复 DispatchIO 读链泄漏（长输出 +1.5GB 不释放）与按长度完成误判 EOF（会话失活打不进字）；PTY 微块合并
+- **内存**：修复 `Buffer.resize` 借惰性下标把整个滚动缓冲容量实体化的问题（10k 回看 × 8 会话 ≈ 无谓 +240MB）
+- **渲染**：Metal 渲染器 CJK 字形按网格列逐字锚定（修长中文 run 漂移/裁切）；半透明背景的预乘 clear 与 layer 透明合成
+- **输入法**：补全 macOS IME preedit 浮层与组合期光标定位（上游为空实现）
+- **滚动条**：overlay 风格、滚动浮现自动隐藏、不占列宽
+
+## 🔧 调试
+
+```bash
+RELAY_DEBUG=1 dist/Relay.app/Contents/MacOS/Relay   # 启用分布式通知调试接口
+RELAY_DATA_DIR=/tmp/relay-test …                     # 隔离数据目录（不污染正式数据）
+RELAY_IO_STATS=1 …                                   # 吞吐插桩计时
+```
+
+## 🙏 致谢
+
+- [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) — Miguel de Icaza 的优秀终端引擎（MIT License，见 `Vendor/SwiftTerm/LICENSE`）
+- [Catppuccin](https://github.com/catppuccin/catppuccin) 等主题配色方案
