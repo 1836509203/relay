@@ -14,6 +14,7 @@ private func CGSSetWindowBackgroundBlurRadius(
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
+    private var updateTimer: Timer?
 
     /// 窗口级透明与毛玻璃（applySettings 每次调用）。透明度 <1 才放开
     /// isOpaque/clear 背景 —— 不透明时保持系统默认，避免无谓的合成开销。
@@ -102,6 +103,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { e in
             SessionStore.shared.noteCmdHeld(e.modifierFlags.contains(.command))
             return e
+        }
+
+        // 自动更新：启动 10s 后后台静默检查一次（不抢启动期网络/CPU），
+        // 之后每 24h 一次。开关实时读 settings，关掉后定时器到点直接跳过。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            if SessionStore.shared.settings.autoUpdateCheck {
+                Updater.check(interactive: false)
+            }
+        }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { _ in
+            if SessionStore.shared.settings.autoUpdateCheck {
+                Updater.check(interactive: false)
+            }
         }
 
         // 基准/排障入口：仅 RELAY_DEBUG=1 直接执行二进制时注册（open 启动的
@@ -230,6 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu("Relay") { m in
             add(m, "关于 Relay", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), "")
+            add(m, "检查更新…", #selector(self.checkForUpdates(_:)), "", target: self)
             m.addItem(.separator())
             add(m, "偏好设置…", #selector(self.openSettings(_:)), ",", target: self)
             m.addItem(.separator())
@@ -303,6 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
+    @objc private func checkForUpdates(_ sender: Any?) { Updater.check(interactive: true) }
     @objc private func prevSession(_ sender: Any?) { SessionStore.shared.cycle(-1) }
     @objc private func nextSession(_ sender: Any?) { SessionStore.shared.cycle(1) }
     @objc private func zoomIn(_ sender: Any?) { SessionStore.shared.zoom(1) }

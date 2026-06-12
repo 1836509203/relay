@@ -54,6 +54,15 @@ open dist/Relay.app # 或拷贝到 /Applications
 
 构建产物为 `dist/Relay.app`，数据目录在 `~/Library/Application Support/RelayNative/`。
 
+### 自动更新
+
+应用内置基于 GitHub Releases 的轻量更新器（无 Sparkle 依赖）：
+
+- 启动后与每 24 小时后台检查一次 [Releases](https://github.com/1836509203/relay/releases)，发现新版通过系统通知提醒（可在设置中关闭）
+- 菜单 **Relay → 检查更新…** 手动检查，一键下载安装并自动重启，会话状态无损恢复
+- 下载直连失败时自动切换加速镜像，国内网络无需代理
+- 发布侧使用 `./scripts/release.sh`：构建 → 打 `Relay.app.zip` → 打 tag → 创建 Release 并上传产物（需 `GITHUB_TOKEN`，无 token 时给出手动上传指引）
+
 ## ⌨️ 快捷键
 
 | 快捷键 | 功能 |
@@ -79,6 +88,7 @@ open dist/Relay.app # 或拷贝到 /Applications
 - **光标**：块 / 竖线 / 下划线，闪烁开关
 - **回看行数**：500–10000（内存敏感场景可调低）
 - **GPU 渲染**：Metal / CoreGraphics 运行时切换
+- **自动更新**：自动检查开关 + 立即检查按钮
 
 ## 🏗 架构
 

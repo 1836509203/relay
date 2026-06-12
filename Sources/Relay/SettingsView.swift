@@ -18,6 +18,7 @@ struct SettingsView: View {
             layoutSection
             scrollbackSection
             gpuSection
+            updateSection
 
             Divider()
 
@@ -132,6 +133,21 @@ struct SettingsView: View {
                 .toggleStyle(.switch)
                 .font(.system(size: 12))
             Text("显著增加内存占用（约 +150MB）；默认的 CPU 渲染滚动同样流畅")
+                .font(.system(size: 10))
+                .foregroundColor(Theme.fg3)
+        }
+    }
+
+    private var updateSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Toggle("自动检查更新", isOn: bind(\.autoUpdateCheck))
+                    .toggleStyle(.switch)
+                    .font(.system(size: 12))
+                Button("立即检查") { Updater.check(interactive: true) }
+                    .font(.system(size: 11))
+            }
+            Text("当前版本 \(Updater.currentVersion) · 发现新版本时通过系统通知提醒")
                 .font(.system(size: 10))
                 .foregroundColor(Theme.fg3)
         }
