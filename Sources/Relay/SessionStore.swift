@@ -76,6 +76,9 @@ final class SessionStore: ObservableObject {
     /// 会话 id → 最近读到的子 shell 工作目录（onTick 用 proc_pidinfo 采样，
     /// 不入 @Published 避免每秒触发 SwiftUI 重渲染；落盘时并入 Session.cwd）。
     private var liveCwd: [String: String] = [:]
+    /// liveCwd 采样发生变化、尚未落盘：onTick 节流落盘（缩小崩溃/强杀丢失最新
+    /// cwd 的窗口，否则采样到的目录只在显式 persistSessions 时才并入磁盘）。
+    private var cwdDirty = false
     /// 启动时从磁盘恢复出来的会话 id（区分「恢复」与「本次新建」）：仅对恢复的
     /// agent 会话在重开时预填 resume 命令，首次实体化后即移除。
     private var restoredIds: Set<String> = []
@@ -172,8 +175,20 @@ final class SessionStore: ObservableObject {
         )
         s.status = .idle
         s.parentId = parentId
+        // 新建标签页/分屏（隶属已有任务）：继承当前聚焦标签的工作目录，新标签
+        // 与同任务其他标签起在同一项目目录而非 home。新建独立任务（parentId
+        // == nil）不继承，保持从 home 起步。
+        if parentId != nil { s.cwd = activeCwd() }
         sessions.append(s)
         return s
+    }
+
+    /// 当前聚焦会话的工作目录（实时采样优先，回落上次落盘值；目录须仍存在）。
+    private func activeCwd() -> String? {
+        guard let sid = activeId else { return nil }
+        if let live = liveCwd[sid], isUsableDir(live) { return live }
+        if let saved = sessions.first(where: { $0.id == sid })?.cwd, isUsableDir(saved) { return saved }
+        return nil
     }
 
     /// 新建任务（侧栏新条目，自带第一个标签页）。
@@ -506,10 +521,11 @@ final class SessionStore: ObservableObject {
         }
         let shell = env["SHELL"] ?? "/bin/zsh"
         ds.startedAt = Date()
-        // 工作目录恢复：优先用上次落盘且仍存在的 cwd，否则回落 home。
+        // 工作目录恢复：本会话落盘/实时 cwd 优先；缺失则借同任务其他标签页的
+        // 可用目录（同项目下各标签目录一致）；最后才回落 home。
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let session = sessions.first(where: { $0.id == id })
-        let startDir = (session?.cwd).flatMap { isUsableDir($0) ? $0 : nil } ?? home
+        let startDir = resolveStartDir(for: id) ?? home
         v.startProcess(
             executable: shell, args: ["-l"],
             environment: env.map { "\($0.key)=\($0.value)" },
@@ -531,6 +547,19 @@ final class SessionStore: ObservableObject {
     private func isUsableDir(_ path: String) -> Bool {
         var isDir: ObjCBool = false
         return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+    }
+
+    /// 恢复 shell 的起始目录：本会话落盘 cwd / 实时采样优先；缺失则借同任务
+    /// 其他标签页的可用目录（同项目下各标签目录一致）；都没有返回 nil（调用
+    /// 方回落 home）。修复「采样未及落盘 + 崩溃 → 恢复起在 home」的缺口。
+    private func resolveStartDir(for id: String) -> String? {
+        if let c = sessions.first(where: { $0.id == id })?.cwd, isUsableDir(c) { return c }
+        if let c = liveCwd[id], isUsableDir(c) { return c }
+        for t in tabs(ofTask: taskId(of: id)) where t.id != id {
+            if let c = liveCwd[t.id], isUsableDir(c) { return c }
+            if let c = t.cwd, isUsableDir(c) { return c }
+        }
+        return nil
     }
 
     /// 恢复 agent 会话时预填的 resume 命令（不含回车）。
@@ -674,11 +703,13 @@ final class SessionStore: ObservableObject {
         for (id, v) in views {
             guard v.process?.running == true,
                   let dir = processCwd(pid: v.process?.shellPid ?? 0) else { continue }
-            liveCwd[id] = dir
+            if liveCwd[id] != dir { liveCwd[id] = dir; cwdDirty = true }
         }
         // ps 全表 fork+exec 不便宜：5s 一次足以跟上 claude/ssh 的启停。
         if tick % 5 == 0 { reclassifyTypes() }
         if tick % 5 == 2 { flushDirtyScrollback() }
+        // 采样到的工作目录有变更：节流落盘（≤5s），避免崩溃/强杀丢失最新 cwd。
+        if tick % 5 == 3, cwdDirty { cwdDirty = false; persistSessions() }
     }
 
     /// 进程树类型识别（ps 在后台队列跑，主线程应用结果）。
