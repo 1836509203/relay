@@ -97,6 +97,8 @@ enum Updater {
     // MARK: - 提示
 
     private static func offer(version: String, urlString: String, notes: String, interactive: Bool) {
+        // 点亮 App 内更新条（后台与手动检查都点亮）；手动检查再额外弹对话框即时确认。
+        UpdateModel.shared.found(version: version, assetURL: urlString, notes: notes)
         if !interactive {
             // 后台发现：系统通知推送，不打断当前操作；安装走通知点击或菜单。
             let content = UNMutableNotificationContent()
@@ -129,19 +131,43 @@ enum Updater {
     /// 与下载通道解耦：即便经第三方镜像（ghfast.top 等）被投毒，哈希不符即
     /// 拒装。全程在后台线程（URLSession 回调队列），不阻塞 UI；仅弹框/重启
     /// 回主线程。
+    /// 更新条「更新 / 重试」入口：用已登记的版本与地址开始下载。
+    static func startDownload() {
+        guard let urlString = UpdateModel.shared.assetURL,
+              let version = UpdateModel.shared.version else { return }
+        download(urlString, version: version)
+    }
+
+    /// 进度观察句柄：downloadTask.progress 的 KVO，须强引用否则立即释放、无回调。
+    private static var progressObservation: NSKeyValueObservation?
+
+    /// 阶段切换统一回主线程（更新条是 @Published）。
+    private static func setPhase(_ p: UpdateModel.Phase) {
+        DispatchQueue.main.async { UpdateModel.shared.phase = p }
+    }
+
+    /// 失败收尾：停掉进度观察、更新条转失败态（保留「重试」）、并弹框告知。
+    private static func fail(_ title: String, _ info: String) {
+        progressObservation = nil
+        setPhase(.failed(info))
+        alert(title, info: info)
+    }
+
     private static func download(_ urlString: String, version: String, mirrorIndex: Int = 0) {
         guard mirrorIndex < mirrors.count else {
-            alert("下载失败", info: "直连与加速镜像均不可达，请稍后再试或到发布页手动下载。")
+            fail("下载失败", "直连与加速镜像均不可达，请稍后再试或到发布页手动下载。")
             return
         }
         guard let url = URL(string: mirrors[mirrorIndex] + urlString) else { return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 120
-        URLSession.shared.downloadTask(with: req) { local, resp, _ in
+        let task = URLSession.shared.downloadTask(with: req) { local, resp, _ in
             guard let local, (resp as? HTTPURLResponse)?.statusCode == 200 else {
                 download(urlString, version: version, mirrorIndex: mirrorIndex + 1) // 换下个镜像
                 return
             }
+            progressObservation = nil
+            setPhase(.verifying)
             // downloadTask 的临时文件回调结束即删：先挪走。
             let zip = FileManager.default.temporaryDirectory
                 .appendingPathComponent("Relay-update-\(version).zip")
@@ -149,25 +175,34 @@ enum Updater {
             do {
                 try FileManager.default.moveItem(at: local, to: zip)
             } catch {
-                alert("下载失败", info: error.localizedDescription)
+                fail("下载失败", error.localizedDescription)
                 return
             }
             // 完整性校验：取同镜像下的 .sha256，比对本地计算的哈希。
             guard let expected = fetchExpectedHash(urlString: urlString, mirrorIndex: mirrorIndex) else {
-                alert("无法验证更新包", info: "未能获取发布校验和（.sha256）。为防止下载内容被篡改，已取消安装；请到发布页手动下载。")
+                fail("无法验证更新包", "未能获取发布校验和（.sha256）。为防止下载内容被篡改，已取消安装；请到发布页手动下载。")
                 return
             }
             guard let actual = sha256(of: zip) else {
-                alert("无法验证更新包", info: "未能计算下载文件的校验和，已取消安装。")
+                fail("无法验证更新包", "未能计算下载文件的校验和，已取消安装。")
                 return
             }
             guard expected.caseInsensitiveCompare(actual) == .orderedSame else {
-                alert("更新包校验失败",
-                      info: "下载内容与发布校验和不匹配（可能传输损坏或来源不可信），已取消安装。请到发布页手动下载。")
+                fail("更新包校验失败",
+                     "下载内容与发布校验和不匹配（可能传输损坏或来源不可信），已取消安装。请到发布页手动下载。")
                 return
             }
+            setPhase(.installing)
             install(zip: zip, version: version)
-        }.resume()
+        }
+        // 进度：fractionCompleted 基于 Content-Length；镜像不返回长度时 totalUnitCount<=0，
+        // 用 -1 表示不确定，更新条改走无限进度样式。
+        progressObservation = task.progress.observe(\.fractionCompleted) { prog, _ in
+            let f = prog.totalUnitCount > 0 ? prog.fractionCompleted : -1
+            setPhase(.downloading(f))
+        }
+        setPhase(.downloading(0))
+        task.resume()
     }
 
     /// 取发布的期望哈希：同镜像下 `<asset>.sha256`，内容形如 `<hex>  <文件名>`。
@@ -203,12 +238,12 @@ enum Updater {
         guard p.terminationStatus == 0,
               let newApp = (try? FileManager.default.contentsOfDirectory(at: unpack, includingPropertiesForKeys: nil))?
                   .first(where: { $0.pathExtension == "app" }) else {
-            alert("安装失败", info: "更新包解压失败或不含 .app。")
+            fail("安装失败", "更新包解压失败或不含 .app。")
             return
         }
         let target = Bundle.main.bundleURL
         guard target.pathExtension == "app" else {
-            alert("安装失败", info: "当前不是从 .app 包运行，无法原地更新。")
+            fail("安装失败", "当前不是从 .app 包运行，无法原地更新。")
             return
         }
         // 原地覆盖：运行中的进程持有旧 inode，文件替换不影响存活；
@@ -218,7 +253,7 @@ enum Updater {
         cp.arguments = [newApp.path, target.path]
         try? cp.run(); cp.waitUntilExit()
         guard cp.terminationStatus == 0 else {
-            alert("安装失败", info: "无法写入 \(target.path)，请检查权限。")
+            fail("安装失败", "无法写入 \(target.path)，请检查权限。")
             return
         }
         // 重启：sleep 1 等本进程退出后 open。路径单引号包裹并转义单引号，

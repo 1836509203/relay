@@ -4,6 +4,7 @@ import SwiftUI
 
 struct RootView: View {
     @ObservedObject var store = SessionStore.shared
+    @ObservedObject var update = UpdateModel.shared
 
     var body: some View {
         // 整窗只垫一层底色 = 当前生效主题的背景色 × bgOpacity。
@@ -18,6 +19,10 @@ struct RootView: View {
                 Rectangle().fill(Theme.line).frame(width: 1)
             }
             VStack(spacing: 0) {
+                // 顶部更新条：发现新版/下载进度/校验/安装/失败的可见入口（占布局，不遮终端）。
+                if update.isVisible {
+                    UpdateBanner(model: update)
+                }
                 TabStrip(store: store)
                 if store.searchVisible {
                     SearchBar()
@@ -34,6 +39,7 @@ struct RootView: View {
         .background(Color(hex: termTheme.bg).opacity(alpha).ignoresSafeArea())
         .ignoresSafeArea()
         .animation(.easeInOut(duration: 0.18), value: store.settings.sidebarVisible)
+        .animation(.easeInOut(duration: 0.2), value: update.isVisible)
         // 不强制 colorScheme：壳层明暗由窗口 appearance 驱动（applyWindowChrome），
         // Theme 动态色与 SwiftUI 语义色一起切。
     }
