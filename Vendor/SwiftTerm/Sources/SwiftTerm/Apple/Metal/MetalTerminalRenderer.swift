@@ -1024,13 +1024,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     if let backgroundColor = backgroundColor {
                         let columnSpan = max(0, endColumn - startColumn)
                         if columnSpan > 0 {
-                            let x0 = lineOriginPx.x + (CGFloat(startColumn) * cellWidthPx)
-                            let y0 = lineOriginPx.y
-                            var x1 = lineOriginPx.x + (CGFloat(startColumn + columnSpan) * cellWidthPx)
+                            // Relay patch: 背景/选区矩形按 run 分段绘制，浮点边界经
+                            // 光栅化会在相邻 run（中英混排尤多）与相邻行之间留 1px
+                            // 缝隙 → 选区视觉断裂、不连贯。把矩形吸附到整数像素：
+                            // 相邻边界的列号/行号精确相接，round 后必然相等，拼接无缝。
+                            let x0 = (lineOriginPx.x + CGFloat(startColumn) * cellWidthPx).rounded()
+                            let y0 = lineOriginPx.y.rounded()
+                            var x1 = (lineOriginPx.x + CGFloat(startColumn + columnSpan) * cellWidthPx).rounded()
                             if endColumn >= buffer.cols {
-                                x1 = lineOriginPx.x + viewWidthPx
+                                x1 = (lineOriginPx.x + viewWidthPx).rounded()
                             }
-                            let y1 = lineOriginPx.y + cellHeightPx
+                            let y1 = (lineOriginPx.y + cellHeightPx).rounded()
                             let (tx0, ty0, tx1, ty1) = transformRect(x0: x0, y0: y0, x1: x1, y1: y1)
                             if let clipped = self.clipRect(tx0, ty0, tx1, ty1, clipRect) {
                                 let color = colorToSIMD(backgroundColor)
