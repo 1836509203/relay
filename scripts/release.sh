@@ -74,6 +74,6 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
 else
     echo "未设置 GITHUB_TOKEN，请手动操作："
     echo "  1. 打开 https://github.com/$REPO/releases/new?tag=$TAG"
-    echo "  2. 上传 $ZIP（asset 名必须是 Relay.app.zip）和 $DMG"
+    echo "  2. 上传 ${ZIP}（asset 名必须是 Relay.app.zip）和 ${DMG}"
     echo "  3. 点击 Publish release"
 fi
