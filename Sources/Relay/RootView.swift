@@ -1,10 +1,15 @@
 // 主界面外壳：侧栏 + 标题条（当前会话徽标+名）+ 终端区。
 // 状态变化提醒走系统通知中心，不在窗口内弹浮层（遮挡终端内容）。
+import AppKit
 import SwiftUI
 
 struct RootView: View {
     @ObservedObject var store = SessionStore.shared
     @ObservedObject var update = UpdateModel.shared
+    /// 侧栏拖拽调宽：记拖动起始宽度（onChanged 按 translation 累加），松手清空。
+    @State private var resizeStartWidth: Double?
+    private static let sidebarMin: Double = 170
+    private static let sidebarMax: Double = 460
 
     var body: some View {
         // 整窗只垫一层底色 = 当前生效主题的背景色 × bgOpacity。
@@ -16,7 +21,7 @@ struct RootView: View {
             if store.settings.sidebarVisible {
                 SidebarView(store: store)
                     .transition(.move(edge: .leading))
-                Rectangle().fill(Theme.line).frame(width: 1)
+                sidebarResizer
             }
             VStack(spacing: 0) {
                 // 顶部更新条：发现新版/下载进度/校验/安装/失败的可见入口（占布局，不遮终端）。
@@ -42,6 +47,36 @@ struct RootView: View {
         .animation(.easeInOut(duration: 0.2), value: update.isVisible)
         // 不强制 colorScheme：壳层明暗由窗口 appearance 驱动（applyWindowChrome），
         // Theme 动态色与 SwiftUI 语义色一起切。
+    }
+
+    /// 侧栏右缘可拖拽分隔条：1px 视觉线 + 加宽透明命中区（便于抓取），hover
+    /// 显示左右调整光标，拖动实时改宽并钳制到 [min,max]，松手落盘。
+    private var sidebarResizer: some View {
+        Rectangle()
+            .fill(Theme.line)
+            .frame(width: 1)
+            .overlay {
+                Rectangle()
+                    .fill(Color.clear)
+                    .frame(width: 10)
+                    .contentShape(Rectangle())
+                    .onHover { inside in
+                        if inside { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                    }
+                    .gesture(
+                        DragGesture()
+                            .onChanged { v in
+                                let start = resizeStartWidth ?? store.settings.sidebarWidth
+                                if resizeStartWidth == nil { resizeStartWidth = start }
+                                store.settings.sidebarWidth = min(
+                                    Self.sidebarMax, max(Self.sidebarMin, start + v.translation.width))
+                            }
+                            .onEnded { _ in
+                                resizeStartWidth = nil
+                                store.persistSettings()
+                            }
+                    )
+            }
     }
 
     @ViewBuilder private var terminalArea: some View {

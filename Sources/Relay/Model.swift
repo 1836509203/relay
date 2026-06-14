@@ -116,6 +116,8 @@ struct AppSettings: Codable {
     var letterSpacing: Double = 0
     /// 侧边栏显隐（Safari 式收起/展开，标签条左侧按钮切换）。
     var sidebarVisible: Bool = true
+    /// 侧边栏宽度（pt，可拖拽右缘分隔条调整，持久化）。
+    var sidebarWidth: Double = 232
     /// 自动检查更新（启动后台 + 每 24h 查 GitHub Releases，有新版发通知）。
     var autoUpdateCheck: Bool = true
 
@@ -138,6 +140,7 @@ struct AppSettings: Codable {
         lineSpacing = (try? c.decode(Double.self, forKey: .lineSpacing)) ?? 0
         letterSpacing = (try? c.decode(Double.self, forKey: .letterSpacing)) ?? 0
         sidebarVisible = (try? c.decode(Bool.self, forKey: .sidebarVisible)) ?? true
+        sidebarWidth = (try? c.decode(Double.self, forKey: .sidebarWidth)) ?? 232
         autoUpdateCheck = (try? c.decode(Bool.self, forKey: .autoUpdateCheck)) ?? true
     }
 }

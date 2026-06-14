@@ -97,7 +97,7 @@ struct SidebarView: View {
 
             newButton
         }
-        .frame(width: 232)
+        .frame(width: store.settings.sidebarWidth)
         // 拖到行与行之间空白/列表外松开的兜底：顺序已在 dropEntered 实时更新，
         // 这里只负责落盘并复位拖拽态（否则被拖行会一直卡在半透明）。
         .onDrop(of: [.text], isTargeted: nil) { _ in

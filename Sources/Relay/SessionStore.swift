@@ -447,6 +447,12 @@ final class SessionStore: ObservableObject {
         }
         (NSApp.delegate as? AppDelegate)?.applyWindowChrome(
             opacity: settings.bgOpacity, blur: settings.bgBlur)
+        persistSettings()
+    }
+
+    /// 仅把设置落盘（不重新 apply 主题/字体/刷新视图）。拖拽调宽等高频改动后
+    /// 只需持久化，无需整屏 refresh。
+    func persistSettings() {
         let snapshot = settings
         ioQueue.async {
             if let data = try? JSONEncoder().encode(snapshot) {
