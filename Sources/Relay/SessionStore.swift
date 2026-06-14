@@ -531,14 +531,13 @@ final class SessionStore: ObservableObject {
             environment: env.map { "\($0.key)=\($0.value)" },
             execName: nil, currentDirectory: startDir
         )
-        // 恢复出来的 agent 会话：在提示符上预填 resume 命令（不回车，用户按
-        // Enter 即恢复）。仅对从磁盘恢复的会话触发一次；新建的 claude/codex
-        // 不预填。延迟一拍等 shell -l 打出提示符，避免预填字被启动输出顶乱。
+        // 恢复出来的 agent 会话：等提示符就绪后自动执行 resume 命令（带回车，
+        // 无感继续）。仅对从磁盘恢复的会话触发一次；新建的 claude/codex 不动。
+        // 不用固定延时——login shell 启动慢会在提示符出现前误执行残缺命令；
+        // 改由 autoResume 等「shell 已输出且静默一小段」再发，并有超时兜底。
         if restoredIds.remove(id) != nil,
            let kind = session?.kind, let cmd = resumeCommand(for: kind) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak v] in
-                v?.send(txt: cmd)
-            }
+            autoResume(id: id, cmd: cmd, view: v, started: Date())
         }
         return v
     }
@@ -562,12 +561,36 @@ final class SessionStore: ObservableObject {
         return nil
     }
 
-    /// 恢复 agent 会话时预填的 resume 命令（不含回车）。
+    /// 恢复 agent 会话要执行的 resume 命令（不含回车；autoResume 发送时补 \r）。
     private func resumeCommand(for kind: WindowType) -> String? {
         switch kind {
         case .claude: return "claude --continue"
         case .codex: return "codex resume --last"
         default: return nil
+        }
+    }
+
+    /// 恢复的 agent 会话自动继续：轮询等「提示符就绪」——shell 已产生过输出、
+    /// 且最近一次输出后静默 ≥quiet（login shell 的 banner/提示符已打完）——再发
+    /// resume 命令并回车。固定延时不可靠：login shell 启动慢会在提示符出现前
+    /// 误执行残缺命令。
+    /// - maxWait 兜底：极端情况下 shell 长时间无输出也强制发，避免永不继续。
+    /// - 视图被替换 / 会话已删 / 进程已退出 → 放弃，不向错误目标注入。
+    private func autoResume(id: String, cmd: String, view: RelayTerminalView, started: Date) {
+        let quiet = 0.6, maxWait = 8.0
+        guard views[id] === view, sessions.contains(where: { $0.id == id }) else { return }
+        let ds = det[id]
+        if ds?.exited == true { return }
+        let now = Date()
+        let hadOutput = ds?.lastFeed != nil
+        let silent = ds?.lastFeed.map { now.timeIntervalSince($0) >= quiet } ?? false
+        if (hadOutput && silent) || now.timeIntervalSince(started) >= maxWait {
+            view.send(txt: cmd + "\r")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, weak view] in
+            guard let self, let view else { return }
+            self.autoResume(id: id, cmd: cmd, view: view, started: started)
         }
     }
 
