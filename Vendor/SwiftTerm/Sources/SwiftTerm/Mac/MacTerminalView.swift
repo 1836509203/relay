@@ -2125,8 +2125,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
     
+    /// 终端通用约定：按住 Shift 或 Option 拖动时，临时绕过鼠标上报
+    /// （mouse reporting），改走本地文本选择。这样即使 TUI（vim/tmux/
+    /// Claude Code/Codex 等）开启了鼠标追踪，用户仍可选中并复制屏幕内容。
+    /// 对应 xterm 的 Shift 与 iTerm2 的 Option 两种肌肉记忆。
+    @inline(__always)
+    func mouseReportingBypassed(with event: NSEvent) -> Bool {
+        let f = event.modifierFlags
+        return f.contains(.shift) || f.contains(.option)
+    }
+
     public override func mouseDown(with event: NSEvent) {
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+        if allowMouseReporting && terminal.mouseMode.sendButtonPress() && !mouseReportingBypassed(with: event) {
             sharedMouseEvent(with: event)
             return
         }
@@ -2171,7 +2181,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
             return
         }
-        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() {
+        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() && !mouseReportingBypassed(with: event) {
             sharedMouseEvent(with: event)
             return
         }
@@ -2188,7 +2198,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let displayBuffer = terminal.displayBuffer
         let mouseHit = calculateMouseHit(with: event)
         let hit = mouseHit.grid
-        if allowMouseReporting {
+        if allowMouseReporting && !mouseReportingBypassed(with: event) {
             if terminal.mouseMode.sendMotionEvent() {
                 let flags = encodeMouseEvent(with: event)
                 let screenRow = max (0, min (displayBuffer.rows - 1, hit.row - displayBuffer.yDisp))
