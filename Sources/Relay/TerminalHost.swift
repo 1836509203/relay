@@ -59,6 +59,9 @@ final class RelayTerminalView: LocalProcessTerminalView {
         registerForDraggedTypes([.fileURL])
         // ⌘-click 屏幕上的裸文件路径 → 在访达中定位（见 handleOpenLocalPath）。
         onRequestOpenLocalPath = { [weak self] in self?.handleOpenLocalPath($0) }
+        // ⌘-hover 时，能解析为真实文件的裸路径才高亮成链接（下划线 + 手型光标），
+        // 让「⌘-点击打开」这一手势可被发现。与打开走同一套解析，能高亮即能点开。
+        onResolveLocalPath = { [weak self] in self?.resolveLocalPath($0) != nil }
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
@@ -99,13 +102,24 @@ final class RelayTerminalView: LocalProcessTerminalView {
     /// 覆盖：~ 路径、绝对路径、以及能用实时 cwd 拼出的相对路径；必须真实存在
     /// 才动作，不存在则轻提示（beep）。含空格的路径不在覆盖内。
     private func handleOpenLocalPath(_ raw: String) {
+        guard let path = resolveLocalPath(raw) else {
+            NSSound.beep()   // 路径不存在/解析不出：给反馈，避免「点了没动静」。
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// 屏幕明文 token → 「确实存在」的绝对路径；解析不出或不存在返回 nil。
+    /// ⌘-悬停高亮（onResolveLocalPath）与 ⌘-点击打开（handleOpenLocalPath）共用此口，
+    /// 保证「能高亮的」与「点了能开的」完全一致。
+    private func resolveLocalPath(_ raw: String) -> String? {
         var s = raw.trimmingCharacters(in: .whitespaces)
         // 去成对包裹符与行尾标点（行尾的 。，；：)]}」 等多是排版，不属于路径）。
         while let f = s.first, "\"'`([{<「『（".contains(f) { s.removeFirst() }
         while let l = s.last, "\"'`)]}>」』），,.;:".contains(l) { s.removeLast() }
         // 去行号后缀（file.swift:42 / file.swift:42:10）→ 定位文件本身。
         s = s.replacingOccurrences(of: #":[0-9]+(?::[0-9]+)?$"#, with: "", options: .regularExpression)
-        guard !s.isEmpty else { return }
+        guard !s.isEmpty else { return nil }
 
         let absolute: String
         if s == "~" || s.hasPrefix("~/") {
@@ -115,14 +129,10 @@ final class RelayTerminalView: LocalProcessTerminalView {
         } else if let cwd = currentCwd() {
             absolute = (cwd as NSString).appendingPathComponent(s)
         } else {
-            return
+            return nil
         }
         let path = (absolute as NSString).standardizingPath
-        guard FileManager.default.fileExists(atPath: path) else {
-            NSSound.beep()   // 路径不存在/解析不出：给反馈，避免「点了没动静」。
-            return
-        }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        return FileManager.default.fileExists(atPath: path) ? path : nil
     }
 
     /// 子 shell 实时工作目录（proc_pidinfo，读自己拥有的子进程无需特殊权限）；

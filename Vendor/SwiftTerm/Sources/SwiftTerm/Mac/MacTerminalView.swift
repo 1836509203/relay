@@ -862,6 +862,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             removePreviewUrl()
             commandActive = false
             lastReportedLink = nil
+            updatePathPointerCursor(active: false)   // ⌘ 松开：手型光标复位 I-beam
             if linkHighlightMode == .hoverWithModifier {
                 let oldRange = linkHighlightRange
                 linkHighlightRange = nil
@@ -2125,14 +2126,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
     
-    /// 终端通用约定：按住 Shift 或 Option 拖动时，临时绕过鼠标上报
-    /// （mouse reporting），改走本地文本选择。这样即使 TUI（vim/tmux/
-    /// Claude Code/Codex 等）开启了鼠标追踪，用户仍可选中并复制屏幕内容。
-    /// 对应 xterm 的 Shift 与 iTerm2 的 Option 两种肌肉记忆。
+    /// 终端通用约定：按住 Shift / Option / ⌘ 时，临时绕过鼠标上报
+    /// （mouse reporting），改走本地手势。这样即使 TUI（vim/tmux/
+    /// Claude Code/Codex 等）开启了鼠标追踪，用户仍可：Shift/Option 选中复制，
+    /// ⌘ 点击打开屏幕里的文件路径（见 mouseUp 的 ⌘-click 分支）。⌘ 是 GUI 修饰键，
+    /// 本就不该把点击泄漏给 TUI，对应 iTerm2 ⌘-click 语义历史的本地手势约定。
     @inline(__always)
     func mouseReportingBypassed(with event: NSEvent) -> Bool {
         let f = event.modifierFlags
-        return f.contains(.shift) || f.contains(.option)
+        return f.contains(.shift) || f.contains(.option) || f.contains(.command)
     }
 
     /// Relay patch: ⌘-click 命中的「裸文件路径」回调（非 URL，与 OSC 8 超链接分开）。
@@ -2140,10 +2142,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// （RelayTerminalView）负责展开 ~ / 拼接 cwd 解析相对路径，并在访达中定位。
     public var onRequestOpenLocalPath: ((String) -> Void)?
 
-    /// Relay patch: 取点击格子所在行的屏幕明文「路径 token」—— 以空白为界向左右
+    /// Relay patch: 宿主回答「这个 token 是否解析为真实存在的本地文件」。仅在 ⌘-悬停时
+    /// 调用（节流于鼠标移动），用于决定裸路径要不要高亮成可点链接。与打开同源解析。
+    public var onResolveLocalPath: ((String) -> Bool)?
+
+    /// Relay patch: 取格子所在行的屏幕明文「路径 token」及其列范围 —— 以空白为界向左右
     /// 扩展的连续非空白串。点在空白上返回 nil；含空格的路径不在覆盖范围（终端无法
-    /// 无歧义界定其边界）。NUL 视作空白边界。
-    func localPathToken(at hit: Position) -> String? {
+    /// 无歧义界定其边界）。NUL 视作空白边界。range 为半开区间 [s, e+1)，供高亮用。
+    func localPathTokenRange(at hit: Position) -> (token: String, range: Range<Int>)? {
         let buf = terminal.displayBuffer
         guard hit.row >= 0, hit.row < buf.lines.count else { return nil }
         let line = buf.lines[hit.row]
@@ -2172,7 +2178,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             out.append(cd.getCharacter())
         }
         let t = out.trimmingCharacters(in: .whitespaces)
-        return t.isEmpty ? nil : t
+        return t.isEmpty ? nil : (t, s ..< (e + 1))
+    }
+
+    func localPathToken(at hit: Position) -> String? {
+        localPathTokenRange(at: hit)?.token
     }
 
     public override func mouseDown(with event: NSEvent) {
@@ -2355,15 +2365,37 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 invalidateLinkHighlight(oldRange: oldRange, newRange: nil)
                 queuePendingDisplay()
             }
+            updatePathPointerCursor(active: false)
             return
         }
         let match = terminal.linkMatch(at: .buffer(position), mode: .explicitAndImplicit)
-        let newRange = match?.rowRanges
+        var newRange = match?.rowRanges
+        // Relay patch: OSC8/URL 未命中且 ⌘ 处于活动态时，若命中的裸 token 能解析为真实
+        // 文件，则把它也高亮成链接（下划线 + 手型光标），让「⌘-点击打开」可被发现。
+        if newRange == nil, effectiveCommandActive,
+           let hit = localPathTokenRange(at: position),
+           onResolveLocalPath?(hit.token) == true {
+            newRange = [Terminal.LinkMatch.RowRange(row: position.row, range: hit.range)]
+        }
         if newRange != linkHighlightRange {
             let oldRange = linkHighlightRange
             linkHighlightRange = newRange
             invalidateLinkHighlight(oldRange: oldRange, newRange: newRange)
             queuePendingDisplay()
+        }
+        updatePathPointerCursor(active: newRange != nil && effectiveCommandActive)
+    }
+
+    // Relay patch: 悬停在可点击链接/路径上时切手型光标，离开恢复 I-beam。只追踪自己设过
+    // 的状态，避免和文本选择的 I-beam 互相打架。.set() 幂等，逐次 mouseMoved 调用无害。
+    private var pathPointerActive = false
+    func updatePathPointerCursor(active: Bool) {
+        if active {
+            pathPointerActive = true
+            NSCursor.pointingHand.set()
+        } else if pathPointerActive {
+            pathPointerActive = false
+            NSCursor.iBeam.set()
         }
     }
 
