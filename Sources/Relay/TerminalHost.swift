@@ -227,6 +227,25 @@ final class RelayTerminalView: LocalProcessTerminalView {
         // host() 的异步 makeFirstResponder 在视图尚未入窗时是 no-op；
         // 这里在真正入窗的时机兜底认领，保证切回会话即可打字。
         window?.makeFirstResponder(self)
+        pinViewportAfterLayout()
+    }
+
+    /// 首次挂载期间会有多次瞬态 resize：初始 800×600 → 真实尺寸，叠加
+    /// UpdateBanner 出现的 0.2s 动画。其中某次若把终端压到极矮（可视行数 <
+    /// 已输出行数），内容贴底会让 SwiftTerm 的 yBase 抬起；随后增高时
+    /// Buffer.resize 的「向上滚」分支便把视口停在缓冲顶部的空行上 —— 表现为
+    /// 内容上方约一屏 1/6 的留白，且只在首次打开出现。对策：入窗后分两个时机
+    /// 再贴回底部，把空行推出视口。下一 runloop（本轮布局已定）+ 0.3s（覆盖
+    /// banner 动画）。普通 buffer 贴底即内容不足一屏时的顶部对齐；alternate
+    /// buffer（全屏 TUI）无回看 scroll 为 no-op；已贴底时也是 no-op，零副作用。
+    private func pinViewportAfterLayout() {
+        let pin: () -> Void = { [weak self] in
+            guard let self, self.window != nil else { return }
+            self.scroll(toPosition: 1.0)
+            self.fullRefresh()
+        }
+        DispatchQueue.main.async(execute: pin)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: pin)
     }
 }
 
