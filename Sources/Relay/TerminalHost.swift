@@ -4,6 +4,7 @@
 import AppKit
 import SwiftUI
 import SwiftTerm
+import Darwin
 
 /// 缓冲格子 → 纯文本字符。TUI 用光标跳跃绘制时跳过的格子是 NUL（code 0），
 /// getCharacter() 原样返回 U+0000 —— 写进快照回放会被解析器丢弃（单词粘连），
@@ -56,6 +57,8 @@ final class RelayTerminalView: LocalProcessTerminalView {
         // 接受从 Finder 拖入的文件：drop 时插入 shell 转义后的绝对路径（见下方
         // performDragOperation）。与粘贴文件走同一套 shellEscapePath 转义。
         registerForDraggedTypes([.fileURL])
+        // ⌘-click 屏幕上的裸文件路径 → 在访达中定位（见 handleOpenLocalPath）。
+        onRequestOpenLocalPath = { [weak self] in self?.handleOpenLocalPath($0) }
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
@@ -88,6 +91,51 @@ final class RelayTerminalView: LocalProcessTerminalView {
     override func bell(source: Terminal) {
         NSSound.beep()
         SessionStore.shared.noteBell(id: sessionId)
+    }
+
+    // MARK: - ⌘-click 文件路径 → 访达定位
+
+    /// SwiftTerm 回调来的屏幕明文 token → 解析为绝对路径并在访达中选中。
+    /// 覆盖：~ 路径、绝对路径、以及能用实时 cwd 拼出的相对路径；必须真实存在
+    /// 才动作，不存在则轻提示（beep）。含空格的路径不在覆盖内。
+    private func handleOpenLocalPath(_ raw: String) {
+        var s = raw.trimmingCharacters(in: .whitespaces)
+        // 去成对包裹符与行尾标点（行尾的 。，；：)]}」 等多是排版，不属于路径）。
+        while let f = s.first, "\"'`([{<「『（".contains(f) { s.removeFirst() }
+        while let l = s.last, "\"'`)]}>」』），,.;:".contains(l) { s.removeLast() }
+        // 去行号后缀（file.swift:42 / file.swift:42:10）→ 定位文件本身。
+        s = s.replacingOccurrences(of: #":[0-9]+(?::[0-9]+)?$"#, with: "", options: .regularExpression)
+        guard !s.isEmpty else { return }
+
+        let absolute: String
+        if s == "~" || s.hasPrefix("~/") {
+            absolute = (s as NSString).expandingTildeInPath
+        } else if s.hasPrefix("/") {
+            absolute = s
+        } else if let cwd = currentCwd() {
+            absolute = (cwd as NSString).appendingPathComponent(s)
+        } else {
+            return
+        }
+        let path = (absolute as NSString).standardizingPath
+        guard FileManager.default.fileExists(atPath: path) else {
+            NSSound.beep()   // 路径不存在/解析不出：给反馈，避免「点了没动静」。
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// 子 shell 实时工作目录（proc_pidinfo，读自己拥有的子进程无需特殊权限）；
+    /// 把相对路径拼成绝对路径用。与 SessionStore 的 cwd 采样同源。
+    private func currentCwd() -> String? {
+        guard let pid = process?.shellPid, pid > 0 else { return nil }
+        var info = proc_vnodepathinfo()
+        let sz = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, sz) == sz else { return nil }
+        let path = withUnsafeBytes(of: &info.pvi_cdir.vip_path) { raw -> String in
+            String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+        }
+        return path.isEmpty ? nil : path
     }
 
     // RELAY_IO_STATS=1 时的吞吐插桩账本（仅 debug 排障用，热路径零开销门控）。

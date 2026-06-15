@@ -2135,6 +2135,46 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return f.contains(.shift) || f.contains(.option)
     }
 
+    /// Relay patch: ⌘-click 命中的「裸文件路径」回调（非 URL，与 OSC 8 超链接分开）。
+    /// 取的是屏幕明文，所见即所点，不存在「显示文本≠真实目标」的伪装风险；由宿主
+    /// （RelayTerminalView）负责展开 ~ / 拼接 cwd 解析相对路径，并在访达中定位。
+    public var onRequestOpenLocalPath: ((String) -> Void)?
+
+    /// Relay patch: 取点击格子所在行的屏幕明文「路径 token」—— 以空白为界向左右
+    /// 扩展的连续非空白串。点在空白上返回 nil；含空格的路径不在覆盖范围（终端无法
+    /// 无歧义界定其边界）。NUL 视作空白边界。
+    func localPathToken(at hit: Position) -> String? {
+        let buf = terminal.displayBuffer
+        guard hit.row >= 0, hit.row < buf.lines.count else { return nil }
+        let line = buf.lines[hit.row]
+        let limit = min(terminal.cols, line.count)
+        guard limit > 0, hit.col >= 0, hit.col < limit else { return nil }
+        // 宽字符（CJK，width=2）的尾随格 code==0：属于前一字符，既非边界也不取字。
+        // 不特判会让「发票…」这类中文路径在每个汉字后断开。
+        func isTrailing(_ i: Int) -> Bool { i > 0 && line[i].code == 0 && line[i - 1].width == 2 }
+        func isSep(_ i: Int) -> Bool {
+            if isTrailing(i) { return false }
+            let cd = line[i]
+            if cd.isNull { return true }
+            let c = cd.getCharacter()
+            return c == " " || c == "\t"
+        }
+        guard !isSep(hit.col) else { return nil }
+        var s = hit.col, e = hit.col
+        while s > 0, !isSep(s - 1) { s -= 1 }
+        while e + 1 < limit, !isSep(e + 1) { e += 1 }
+        var out = ""
+        out.reserveCapacity(e - s + 1)
+        for i in s...e {
+            if isTrailing(i) { continue }
+            let cd = line[i]
+            if cd.isNull { continue }
+            out.append(cd.getCharacter())
+        }
+        let t = out.trimmingCharacters(in: .whitespaces)
+        return t.isEmpty ? nil : t
+    }
+
     public override func mouseDown(with event: NSEvent) {
         if allowMouseReporting && terminal.mouseMode.sendButtonPress() && !mouseReportingBypassed(with: event) {
             sharedMouseEvent(with: event)
@@ -2179,6 +2219,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
             terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
+            return
+        }
+        // Relay patch: ⌘-click 裸文件路径（OSC 8/URL 未命中时）。读屏幕明文，
+        // 所见即所点；拖拽选择（didSelectionDrag）不算点击，跳过。
+        if event.modifierFlags.contains(.command), !didSelectionDrag,
+           let token = localPathToken(at: hit) {
+            onRequestOpenLocalPath?(token)
             return
         }
         if allowMouseReporting && terminal.mouseMode.sendButtonRelease() && !mouseReportingBypassed(with: event) {
