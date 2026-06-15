@@ -509,13 +509,21 @@ final class SessionStore: ObservableObject {
         var env = ProcessInfo.processInfo.environment
         // 剔除宿主终端注入的变量：如 cmux 的 PROMPT_COMMAND 指向仅宿主里
         // 存在的 shell 函数，子 shell 每个提示符都会报 command not found。
+        // 末三个是 macOS 以 GUI app 拉起进程时 LaunchServices/XPC 注入的残留：
+        // 对登录 shell 毫无意义，还会把 app 身份（bundle id）泄漏给每个子进程，
+        // 规矩的终端不会传它们。__CF_USER_TEXT_ENCODING 是合法 locale 提示，保留。
         for k in ["PROMPT_COMMAND", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID",
                   "ITERM_SESSION_ID", "ITERM_PROFILE", "TMUX", "TMUX_PANE", "STY",
-                  "INSIDE_EMACS", "VSCODE_INJECTION", "WEZTERM_PANE", "KITTY_WINDOW_ID"] {
+                  "INSIDE_EMACS", "VSCODE_INJECTION", "WEZTERM_PANE", "KITTY_WINDOW_ID",
+                  "__CFBundleIdentifier", "XPC_SERVICE_NAME", "XPC_FLAGS"] {
             env.removeValue(forKey: k)
         }
         env = env.filter { !$0.key.lowercased().hasPrefix("_cmux") && !$0.key.lowercased().hasPrefix("cmux") }
         env["TERM_PROGRAM"] = "Relay"
+        // 自报版本号：Claude Code、neovim 等会用 TERM_PROGRAM + _VERSION 做能力
+        // 门控；上面刚把继承来的旧值清掉，这里必须补回 Relay 自己的版本，否则
+        // 版本判断走保守 fallback、把本可启用的能力一并关掉。与「关于」面板同源。
+        env["TERM_PROGRAM_VERSION"] = Updater.currentVersion
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env["CLICOLOR"] = "1"
