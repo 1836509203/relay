@@ -96,6 +96,11 @@ struct RowDrawBuffers {
 struct RowCacheEntry {
     var data: RowDrawData?
     var buffers: RowDrawBuffers?
+    // Relay patch: 该缓存渲染的 BufferLine 对象身份。lines 是环形缓冲，回看填满后
+    // 滚动会让同一绝对行号指向不同的 BufferLine 对象（内容已上移），而此时 yDisp
+    // 不变、缓存 signature 不变。靠对象身份逐行校验即可发现这种「行号没变但内容换了」，
+    // 不再单纯依赖 metalDirtyRange 覆盖，杜绝底部残留旧内容。
+    var lineId: ObjectIdentifier
 }
 
 struct FrameDrawData {
@@ -656,10 +661,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var rebuiltRows = 0
         var cachedRows = 0
         for row in visibleRange {
+            // Relay patch: 行内容是否被「换掉」靠对象身份判定——环形缓冲滚动后，同一
+            // 行号会指向不同的 BufferLine。身份不符即重建，覆盖 metalDirtyRange 漏标的情况。
+            let lineId = ObjectIdentifier(buffer.lines[row])
             var entry = rowCache[row]
             let needsRebuild = needsFullRebuild ||
                 (rebuildRange?.contains(row) ?? false) ||
                 entry == nil ||
+                entry?.lineId != lineId ||
                 (bufferingMode == .perFrameAggregated && entry?.data == nil)
             let rowBuffers: RowDrawBuffers?
             let rowData: RowDrawData
@@ -674,7 +683,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                            scale: scale,
                                            virtualPlacementsByImageId: virtualPlacementsByImageId)
                 let buffers = bufferingMode == .perRowPersistent ? makeRowBuffers(from: rowData) : nil
-                entry = RowCacheEntry(data: rowData, buffers: buffers)
+                entry = RowCacheEntry(data: rowData, buffers: buffers, lineId: lineId)
                 rowCache[row] = entry
                 rowBuffers = buffers
                 rebuiltRows += 1
@@ -689,7 +698,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                                           scale: scale,
                                                           virtualPlacementsByImageId: virtualPlacementsByImageId)
                 if cached.data == nil {
-                    entry = RowCacheEntry(data: rowData, buffers: cached.buffers)
+                    entry = RowCacheEntry(data: rowData, buffers: cached.buffers, lineId: lineId)
                     rowCache[row] = entry
                 }
                 if bufferingMode == .perRowPersistent {
@@ -716,7 +725,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                            scale: scale,
                                            virtualPlacementsByImageId: virtualPlacementsByImageId)
                 let buffers = bufferingMode == .perRowPersistent ? makeRowBuffers(from: rowData) : nil
-                entry = RowCacheEntry(data: rowData, buffers: buffers)
+                entry = RowCacheEntry(data: rowData, buffers: buffers, lineId: lineId)
                 rowCache[row] = entry
                 rowBuffers = buffers
                 rebuiltRows += 1
