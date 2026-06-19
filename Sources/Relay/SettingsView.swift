@@ -39,7 +39,16 @@ struct SettingsView: View {
             Toggle("跟随系统明暗（自动切换到配对的亮/暗款）", isOn: followBinding)
                 .toggleStyle(.switch).font(.system(size: 12))
             Picker("", selection: themeBinding) {
-                ForEach(TerminalTheme.all) { t in Text(t.name).tag(t.id) }
+                Section("暗色") {
+                    ForEach(TerminalTheme.all.filter { !$0.isLight }) { t in
+                        Text(t.name).tag(t.id)
+                    }
+                }
+                Section("亮色") {
+                    ForEach(TerminalTheme.all.filter { $0.isLight }) { t in
+                        Text(t.name).tag(t.id)
+                    }
+                }
             }
             .pickerStyle(.menu)
             .labelsHidden()
