@@ -57,7 +57,7 @@ final class RelayTerminalView: LocalProcessTerminalView {
         // 接受从 Finder 拖入的文件：drop 时插入 shell 转义后的绝对路径（见下方
         // performDragOperation）。与粘贴文件走同一套 shellEscapePath 转义。
         registerForDraggedTypes([.fileURL])
-        // ⌘-click 屏幕上的裸文件路径 → 在访达中定位（见 handleOpenLocalPath）。
+        // ⌘-click 屏幕上的裸文件路径 → 直接打开（目录进文件夹 / 文件用默认 App，见 handleOpenLocalPath）。
         onRequestOpenLocalPath = { [weak self] in self?.handleOpenLocalPath($0) }
         // ⌘-hover 时，能解析为真实文件的裸路径才高亮成链接（下划线 + 手型光标），
         // 让「⌘-点击打开」这一手势可被发现。与打开走同一套解析，能高亮即能点开。
@@ -106,7 +106,9 @@ final class RelayTerminalView: LocalProcessTerminalView {
             NSSound.beep()   // 路径不存在/解析不出：给反馈，避免「点了没动静」。
             return
         }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        // 直接打开：目录 → 在访达中进入该文件夹；文件 → 用默认 App 打开。
+        // （区别于 activateFileViewerSelecting 的「只在父目录里选中高亮」。）
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
     /// 屏幕明文 token → 「确实存在」的绝对路径；解析不出或不存在返回 nil。
