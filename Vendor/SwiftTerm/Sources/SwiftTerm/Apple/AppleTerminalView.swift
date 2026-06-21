@@ -2027,6 +2027,12 @@ extension TerminalView {
      */
     public func send(data: ArraySlice<UInt8>)
     {
+        // Relay patch: single funnel for user input (keyboard/paste/mouse-encoded).
+        // Engine query responses go through the separate TerminalDelegate.send(
+        // source: Terminal,…) path, so this hook observes user input only —
+        // RelayTerminalView uses it to mirror keystrokes to other sessions
+        // (broadcast-to-all). No-op when unset.
+        onUserInput?(data)
         ensureCaretIsVisible ()
         #if os(iOS) || os(visionOS)
         if TerminalView.textInputDebugEnabled {

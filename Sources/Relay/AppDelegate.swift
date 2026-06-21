@@ -36,6 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 崩溃标记判定须最先做：检测上次是否异常退出，并落下本次运行标记。
+        Diagnostics.shared.onLaunch()
+
         // 通知代理须在收到任何通知前就位：点击「已完成/需确认/响铃」横幅跳回会话，
         // 点击「有新版本」横幅触发检查更新（详见扩展实现）。
         UNUserNotificationCenter.current().delegate = self
@@ -133,7 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 forName: Notification.Name("relay.sendText.\(pid)"), object: nil, queue: .main
             ) { note in
                 if let t = note.userInfo?["text"] as? String {
-                    SessionStore.shared.activeView?.send(txt: t)
+                    SessionStore.shared.activeView?.sendProgrammatic(txt: t)
                 }
             }
             //   notifyutil 投递 relay.dump.<pid>：各会话 cols/rows/frame 落到 stderr。
@@ -224,6 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         SessionStore.shared.persistAllScrollback()
+        Diagnostics.shared.onCleanExit() // 走到这里 = 洁净退出，清掉崩溃标记
     }
 
     /// 主菜单：原生终端常用命令与快捷键全量支持。
@@ -259,11 +263,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu("Shell") { m in
             add(m, "新建任务", #selector(self.newTask(_:)), "n", target: self)
+            add(m, "新建任务…", #selector(self.newTaskGuided(_:)), "n", [.command, .shift], target: self)
             add(m, "新建标签页", #selector(self.newTab(_:)), "t", target: self)
             add(m, "关闭标签页", #selector(self.closeSession(_:)), "w", target: self)
+            add(m, "撤销关闭标签页", #selector(self.reopenClosed(_:)), "t", [.command, .shift], target: self)
             m.addItem(.separator())
             add(m, "左右分屏", #selector(self.splitPane(_:)), "d", target: self)
+            add(m, "上下分屏", #selector(self.splitPaneDown(_:)), "d", [.command, .option], target: self)
+            add(m, "切换分屏焦点", #selector(self.focusOtherPane(_:)), "o", [.command, .option], target: self)
             add(m, "取消分屏", #selector(self.unsplitPane(_:)), "d", [.command, .shift], target: self)
+            m.addItem(.separator())
+            add(m, "广播输入到所有会话", #selector(self.toggleBroadcast(_:)), "b", [.command, .option], target: self)
             m.addItem(.separator())
             add(m, "清屏", #selector(self.clearScreen(_:)), "k", target: self)
         }
@@ -273,17 +283,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             add(m, "全选", #selector(NSText.selectAll(_:)), "a")
             m.addItem(.separator())
             add(m, "搜索终端内容", #selector(self.toggleSearch(_:)), "f", target: self)
+            m.addItem(.separator())
+            add(m, "命令面板", #selector(self.toggleCommandPalette(_:)), "p", target: self)
+            add(m, "快捷键速查", #selector(self.toggleShortcuts(_:)), "/", target: self)
         }
         menu("显示") { m in
             add(m, "放大字体", #selector(self.zoomIn(_:)), "+", target: self)
             add(m, "缩小字体", #selector(self.zoomOut(_:)), "-", target: self)
             add(m, "默认字号", #selector(self.zoomReset(_:)), "0", target: self)
+            m.addItem(.separator())
+            add(m, "诊断…", #selector(self.openDiagnostics(_:)), "i", [.command, .shift], target: self)
         }
         menu("窗口") { m in
             add(m, "最小化", #selector(NSWindow.miniaturize(_:)), "m")
             m.addItem(.separator())
             add(m, "上一个标签页", #selector(self.prevSession(_:)), "[", [.command, .shift], target: self)
             add(m, "下一个标签页", #selector(self.nextSession(_:)), "]", [.command, .shift], target: self)
+            m.addItem(.separator())
+            add(m, "跳到下一个待处理", #selector(self.nextAttention(_:)),
+                String(UnicodeScalar(NSRightArrowFunctionKey)!), [.command, .option], target: self)
             m.addItem(.separator())
             for n in 1...9 {
                 add(m, "任务 \(n)", #selector(self.selectTask(_:)), "\(n)", target: self)
@@ -296,33 +314,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 菜单动作
 
     @objc private func newTask(_ sender: Any?) { _ = SessionStore.shared.newTask() }
+    @objc private func newTaskGuided(_ sender: Any?) { SessionStore.shared.showNewTaskGuide = true }
     @objc private func newTab(_ sender: Any?) { _ = SessionStore.shared.newTab() }
     @objc private func closeSession(_ sender: Any?) { SessionStore.shared.closeActive() }
+    @objc private func reopenClosed(_ sender: Any?) { SessionStore.shared.restoreLastClosed() }
     @objc private func splitPane(_ sender: Any?) { SessionStore.shared.splitActive() }
+    @objc private func splitPaneDown(_ sender: Any?) { SessionStore.shared.splitActive(.down) }
+    @objc private func focusOtherPane(_ sender: Any?) { SessionStore.shared.focusOtherPane() }
     @objc private func unsplitPane(_ sender: Any?) { SessionStore.shared.unsplit() }
+    @objc private func toggleBroadcast(_ sender: Any?) { SessionStore.shared.toggleBroadcast() }
+    @objc private func nextAttention(_ sender: Any?) { SessionStore.shared.focusNextAttention() }
     @objc private func toggleSearch(_ sender: Any?) { SessionStore.shared.searchVisible.toggle() }
+    @objc private func toggleCommandPalette(_ sender: Any?) { SessionStore.shared.showCommandPalette.toggle() }
+    @objc private func toggleShortcuts(_ sender: Any?) { SessionStore.shared.showShortcuts.toggle() }
 
     private var settingsWindow: NSWindow?
 
     @objc private func openSettings(_ sender: Any?) {
         if settingsWindow == nil {
             let w = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 420, height: 470),
-                styleMask: [.titled, .closable],
+                contentRect: NSRect(x: 0, y: 0, width: 880, height: 600),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
                 backing: .buffered, defer: false
             )
             w.title = "Relay 设置"
             w.isReleasedWhenClosed = false
+            w.minSize = NSSize(width: 720, height: 460)
             let hosting = NSHostingView(rootView: SettingsView())
             w.contentView = hosting
-            // 设置项随版本增减，窗口高度跟内容走。
-            w.setContentSize(hosting.fittingSize)
             w.appearance = window?.appearance
             w.center()
             settingsWindow = w
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
+
+    private var diagnosticsWindow: NSWindow?
+
+    @objc private func openDiagnostics(_ sender: Any?) {
+        if diagnosticsWindow == nil {
+            let w = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 520, height: 480),
+                styleMask: [.titled, .closable],
+                backing: .buffered, defer: false
+            )
+            w.title = "Relay 诊断"
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: DiagnosticsView())
+            w.appearance = window?.appearance
+            w.center()
+            diagnosticsWindow = w
+        }
+        diagnosticsWindow?.makeKeyAndOrderFront(nil)
+    }
+
     @objc private func checkForUpdates(_ sender: Any?) { Updater.check(interactive: true) }
     @objc private func prevSession(_ sender: Any?) { SessionStore.shared.cycle(-1) }
     @objc private func nextSession(_ sender: Any?) { SessionStore.shared.cycle(1) }
@@ -340,7 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func clearScreen(_ sender: Any?) {
         guard let v = SessionStore.shared.activeView else { return }
         v.getTerminal().resetToInitialState()
-        v.send(txt: "\u{0C}")
+        v.sendProgrammatic(txt: "\u{0C}")   // 清屏是 UI 动作，不广播
     }
 }
 

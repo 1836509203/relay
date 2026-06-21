@@ -94,7 +94,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
      * The delegate that the TerminalView uses to interact with its hosting
      */
     public weak var terminalDelegate: TerminalViewDelegate?
-    
+
+    /// Relay patch: observes user-originated input (keyboard/paste/mouse-encoded)
+    /// as it leaves the view toward the PTY, via send(data:). Used to mirror
+    /// keystrokes to other sessions (broadcast-to-all). Engine query responses do
+    /// NOT pass through here. No-op when unset.
+    public var onUserInput: ((ArraySlice<UInt8>) -> Void)?
+
     /// If true, the caret view will show different shapes depending on the focus
     /// otherwise, it will behave like it is focused
     public var caretViewTracksFocus: Bool {

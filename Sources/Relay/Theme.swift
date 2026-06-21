@@ -23,7 +23,9 @@ enum Theme {
     static let bg2 = dyn(0x1B1F27, 0xE2E5EC)     // 卡片/行 hover
     static let fg0 = dyn(0xE8E6E1, 0x2A2D3A)     // 主文字
     static let fg2 = dyn(0x8E94A3, 0x5C5F77)     // 次级文字
-    static let fg3 = dyn(0x5C6273, 0x9CA0AF)     // 占位/弱文字
+    // 亮色值 0x9CA0AF 在浅背景上仅 ~2.4:1（低于 WCAG AA）；加深到 0x787C8C
+    // ≈3.8:1：可读性达「弱文字」可接受档，又仍明显弱于 fg2(0x5C5F77) 保层级。
+    static let fg3 = dyn(0x5C6273, 0x787C8C)     // 占位/弱文字
     static let line = dyn(0x262B36, 0xD6DAE3)    // 分隔线
     /// 高亮底（⌘ 角标 pill / 关闭钮 hover）：暗用白、亮用黑，配 opacity 用。
     static let pill = dyn(0xFFFFFF, 0x000000)

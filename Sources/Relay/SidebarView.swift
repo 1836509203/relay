@@ -255,6 +255,8 @@ private struct TaskRow: View {
         .contextMenu {
             Button("重命名") { startRename() }
             Button("新建标签页") { store.showTask(root.id); _ = store.newTab() }
+            Button("存为模板") { store.saveTemplateFromTask(root.id) }
+            Divider()
             Button("关闭任务", role: .destructive) { store.confirmCloseTask(root.id) }
         }
     }

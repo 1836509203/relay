@@ -2,10 +2,13 @@
 // 自己独立的一组 tab；⌘T / + 在当前任务内新建标签页，切任务时整条更换。
 // 点击切换、hover 显示关闭、活动 tab 底部亮线。
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct TabStrip: View {
     @ObservedObject var store: SessionStore
     @State private var hoveredId: String?
+    /// 正在拖拽的标签页 id（拖放重排用）。
+    @State private var draggingId: String?
 
     var body: some View {
         HStack(spacing: 6) {
@@ -33,6 +36,14 @@ struct TabStrip: View {
             .padding(.trailing, 12)
         }
         .frame(height: 38)
+        // 拖到标签外（plus/分屏按钮/padding 空白）、窗口外或取消时松手的兜底：
+        // 顺序已在 dropEntered 实时更新，这里只落盘并复位拖拽态——否则被拖标签会
+        // 一直卡在半透明 0.4 直到下次拖拽（与 SidebarView 同款兜底对齐）。
+        .onDrop(of: [.plainText], isTargeted: nil) { _ in
+            if draggingId != nil { store.commitTaskOrder() }
+            draggingId = nil
+            return true
+        }
         // 不自己垫色：整窗唯一一层半透明底在 RootView（图45：色调完全一致）。
     }
 
@@ -129,8 +140,36 @@ struct TabStrip: View {
         .contentShape(Rectangle())
         .onTapGesture { store.show(s.id) }
         .onHover { hoveredId = $0 ? s.id : (hoveredId == s.id ? nil : hoveredId) }
+        .opacity(draggingId == s.id ? 0.4 : 1)   // 被拖标签淡出，给出抓取反馈
+        .onDrag {
+            draggingId = s.id
+            return NSItemProvider(object: s.id as NSString)
+        }
+        .onDrop(of: [.plainText], delegate: TabDropDelegate(
+            targetId: s.id, store: store, draggingId: $draggingId))
         .contextMenu {
             Button("关闭标签页", role: .destructive) { store.confirmClose(s.id) }
         }
+    }
+}
+
+/// 标签页拖放重排：拖经某标签即把被拖标签移到它之前（同任务内，moveTab 守卫
+/// 跨任务）；松手落盘一次。拖动取消不回滚——重排本身无害，留新序即可。
+private struct TabDropDelegate: DropDelegate {
+    let targetId: String
+    let store: SessionStore
+    @Binding var draggingId: String?
+
+    func dropEntered(info: DropInfo) {
+        guard let src = draggingId, src != targetId else { return }
+        store.moveTab(src, before: targetId)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+
+    func performDrop(info: DropInfo) -> Bool {
+        store.commitTaskOrder()
+        draggingId = nil
+        return true
     }
 }

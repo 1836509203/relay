@@ -28,6 +28,11 @@ struct RootView: View {
                 if update.isVisible {
                     UpdateBanner(model: update)
                 }
+                // 广播模式常驻指示：危险模式（输入同发多个会话）必须时刻可见，
+                // 属持久状态条而非瞬时浮层，故进布局（不遮终端）。
+                if store.broadcastActive {
+                    BroadcastBar(store: store)
+                }
                 TabStrip(store: store)
                 if store.searchVisible {
                     SearchBar()
@@ -43,6 +48,9 @@ struct RootView: View {
         }
         .background(Color(hex: termTheme.bg).opacity(alpha).ignoresSafeArea())
         .ignoresSafeArea()
+        .sheet(isPresented: $store.showNewTaskGuide) { NewTaskGuide() }
+        .sheet(isPresented: $store.showCommandPalette) { CommandPalette() }
+        .sheet(isPresented: $store.showShortcuts) { ShortcutsView() }
         .animation(.easeInOut(duration: 0.18), value: store.settings.sidebarVisible)
         .animation(.easeInOut(duration: 0.2), value: update.isVisible)
         // 不强制 colorScheme：壳层明暗由窗口 appearance 驱动（applyWindowChrome），
@@ -117,4 +125,36 @@ struct RootView: View {
         }
     }
 
+}
+
+/// 广播模式指示条：红底常驻提示，显示触达会话数 + 一键关闭。危险模式必须
+/// 时刻可见——把命令打进可能忘了的后台会话是真实风险（仿 iTerm2 红框告警）。
+private struct BroadcastBar: View {
+    @ObservedObject var store: SessionStore
+
+    var body: some View {
+        let n = store.broadcastTargetCount
+        HStack(spacing: 8) {
+            Image(systemName: "dot.radiowaves.left.and.right")
+                .font(.system(size: 11, weight: .semibold))
+            Text(n > 0
+                 ? "广播输入已开启 · 你的输入将同发另外 \(n) 个会话"
+                 : "广播输入已开启 · 暂无其他活动会话")
+                .font(.system(size: 11, weight: .medium))
+            Spacer(minLength: 8)
+            Button(action: { store.toggleBroadcast() }) {
+                Text("关闭  ⌥⌘B")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.18)))
+            }
+            .buttonStyle(.plain)
+        }
+        .foregroundColor(.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.red.opacity(0.92))
+    }
 }

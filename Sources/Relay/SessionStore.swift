@@ -13,10 +13,16 @@ final class SessionStore: ObservableObject {
     /// 聚焦会话：侧栏高亮、标题条与 ⌘W/⌘K 等快捷键的作用对象。
     @Published var activeId: String?
     /// 终端区布局：1-2 个会话 id（2 个 = 左右分屏）。
-    @Published var panes: [String] = []
+    @Published var panes: [String] = [] { didSet { scheduleLayoutPersist() } }
     @Published var settings = AppSettings()
     /// ⌘F 搜索条显隐。
     @Published var searchVisible = false
+    /// 新建任务引导 sheet 显隐（⌘⇧N）。
+    @Published var showNewTaskGuide = false
+    /// 命令面板 sheet 显隐（⌘P）。
+    @Published var showCommandPalette = false
+    /// 快捷键速查 sheet 显隐（⌘/）。
+    @Published var showShortcuts = false
     /// 完成/出错但用户还没回看的会话（侧栏任务行亮点提示，回看即清）。不持久化。
     @Published var unread: Set<String> = []
     /// 按住 ⌘ 时侧栏任务行显示 ⌘1-9 快捷角标（松开即隐）。
@@ -24,11 +30,12 @@ final class SessionStore: ObservableObject {
     /// 系统当前是否暗色（followSystemTheme 用；AppDelegate 监听变化刷新）。
     @Published var systemIsDark = true
 
-    /// 当前生效的终端主题 id：跟随系统时自动配对到当前明暗的对应款，
+    /// 当前生效的终端主题 id：跟随系统时按系统明暗显式取 theme(暗)/themeLight(亮)
+    /// （Ghostty 的 light:…,dark:… 语义，两侧都由用户在设置里独立指定），
     /// 否则用 theme 原值。
     var effectiveThemeId: String {
         guard settings.followSystemTheme else { return settings.theme }
-        return TerminalTheme.counterpart(of: settings.theme, wantLight: !systemIsDark)
+        return systemIsDark ? settings.theme : settings.themeLight
     }
 
     /// 壳层（侧栏/标签条/设置页）明暗 = 生效终端主题的明暗。
@@ -95,6 +102,9 @@ final class SessionStore: ObservableObject {
         hookServer = HookServer { [weak self] sid, event in
             DispatchQueue.main.async { self?.applyHook(sid, event: event) }
         }
+        if (hookServer?.port ?? 0) == 0 {
+            Diagnostics.shared.log(.warn, "Hook 本地服务未能就绪，agent 状态退化为屏幕启发式检测（仍可用，但精度下降）。")
+        }
         requestNotificationPermission()
         ticker = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.onTick()
@@ -154,6 +164,20 @@ final class SessionStore: ObservableObject {
     /// 拖放结束：把当前任务顺序落盘。
     func commitTaskOrder() { persistSessions() }
 
+    /// TabStrip 拖拽：把标签页 sourceId 移到同任务的 targetId 之前。仅同任务内
+    /// 生效（跨任务忽略，标签页不该跨任务搬）。任务根身份由 parentId 判定、与
+    /// 位置无关，故根可被拖到非首位，无副作用。拖动频繁→只改内存，落盘留给
+    /// commitTaskOrder（拖放结束一次）。
+    func moveTab(_ sourceId: String, before targetId: String) {
+        guard sourceId != targetId,
+              taskId(of: sourceId) == taskId(of: targetId),
+              let si = sessions.firstIndex(where: { $0.id == sourceId }) else { return }
+        let moved = sessions.remove(at: si)
+        // 移除后 target 下标可能左移，重新定位；找不到（理论不会）则放回原处末尾。
+        let to = sessions.firstIndex(where: { $0.id == targetId }) ?? sessions.count
+        sessions.insert(moved, at: to)
+    }
+
     /// 当前聚焦标签页所在任务的标签页列表（TabStrip 数据源）。
     var activeTabs: [Session] {
         guard let a = activeId else { return [] }
@@ -183,6 +207,11 @@ final class SessionStore: ObservableObject {
         return s
     }
 
+    /// 新建任务引导的默认起始目录：当前聚焦会话的工作目录，缺失则 home。
+    func defaultNewTaskDir() -> String {
+        activeCwd() ?? FileManager.default.homeDirectoryForCurrentUser.path
+    }
+
     /// 当前聚焦会话的工作目录（实时采样优先，回落上次落盘值；目录须仍存在）。
     private func activeCwd() -> String? {
         guard let sid = activeId else { return nil }
@@ -198,6 +227,85 @@ final class SessionStore: ObservableObject {
         show(s.id)
         persistSessions()
         return s
+    }
+
+    /// 待发首条命令（新建任务引导）：键=会话 id，值=命令（不含回车）。
+    /// 视图首次创建、提示符就绪后由 autoResume 发送，发完即清。
+    private var pendingStarter: [String: String] = [:]
+
+    /// 新建任务（引导版，⌘⇧N）：在指定目录起 shell，并可选执行一条首命令
+    /// （如 `claude` / `codex` / 自定义）。目录无效则回落常规起步逻辑。
+    @discardableResult
+    /// 供新建引导校验用户手填的起始目录（无效则禁用「创建」+ 内联提示），从
+    /// 源头杜绝「目录不可用 → 静默回落 home → 首命令在错误目录执行」。
+    func isUsableTaskDir(_ path: String) -> Bool { isUsableDir(path) }
+
+    func newGuidedTask(cwd: String?, starter: String?) -> Session {
+        let s = makeSession(parentId: nil)
+        if let cwd, isUsableDir(cwd), let i = sessions.firstIndex(where: { $0.id == s.id }) {
+            sessions[i].cwd = cwd
+        } else if let cwd, !cwd.isEmpty {
+            // UI 已在按钮层拦无效目录；这里是其余调用方（如 worktree 回落）的兜底
+            // 可观测性，对齐 worktree 失败路径——不再静默丢目录。
+            Diagnostics.shared.log(.warn, "起始目录不可用（\(cwd)），任务起在 home，首命令将在 home 执行。")
+        }
+        if let cmd = starter?.trimmingCharacters(in: .whitespacesAndNewlines), !cmd.isEmpty {
+            pendingStarter[s.id] = cmd
+        }
+        show(s.id)
+        persistSessions()
+        return s
+    }
+
+    /// 在独立 git worktree 里新建任务（新建引导勾选「独立 worktree」）：先在
+    /// 后台为 dir 所在仓库开 worktree + 新分支，成功则把任务起在 worktree 路径，
+    /// 失败回落到原目录的普通任务并留诊断。纯本地操作，不碰远端/鉴权。
+    func newGuidedTaskInWorktree(dir: String, starter: String?) {
+        let stamp = Int(Date().timeIntervalSince1970)
+        ioQueue.async { [weak self] in
+            let root = GitWorktree.repoRoot(of: dir) ?? dir
+            let made = GitWorktree.create(repoRoot: root, stamp: stamp)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let made {
+                    Diagnostics.shared.log(.info, "已为任务创建 git worktree：\(made.branch) → \(made.path)")
+                    _ = self.newGuidedTask(cwd: made.path, starter: starter)
+                } else {
+                    Diagnostics.shared.log(.warn, "创建 git worktree 失败（\(root) 非仓库或目标已存在），任务起在原目录。")
+                    _ = self.newGuidedTask(cwd: dir, starter: starter)
+                }
+            }
+        }
+    }
+
+    // MARK: - 任务模板
+
+    /// 把一组「目录 + 启动命令」存为模板（随设置持久化，重启可用）。
+    func saveTemplate(name: String, cwd: String?, starter: String?) {
+        let t = TaskTemplate(
+            id: "tpl\(Int(Date().timeIntervalSince1970 * 1000))-\(settings.taskTemplates.count)",
+            name: name, cwd: cwd, starter: starter)
+        settings.taskTemplates.append(t)
+        persistSettings()
+    }
+
+    func deleteTemplate(_ id: String) {
+        settings.taskTemplates.removeAll { $0.id == id }
+        persistSettings()
+    }
+
+    /// 从现有任务一键存模板（侧栏右键）：取实时工作目录 + 按 agent 类型推断
+    /// 启动命令。claude/codex → 对应命令；shell/ssh → 纯 shell（ssh 主机不重建）。
+    func saveTemplateFromTask(_ id: String) {
+        guard let s = sessions.first(where: { $0.id == id }) else { return }
+        let cwd = liveCwd[id] ?? s.cwd
+        let starter: String?
+        switch s.kind {
+        case .claude: starter = "claude"
+        case .codex: starter = "codex"
+        case .shell, .ssh: starter = nil
+        }
+        saveTemplate(name: s.name, cwd: cwd, starter: starter)
     }
 
     /// 当前任务内新建标签页（⌘T / TabStrip 的 +）。没有任务时等价于新建任务。
@@ -237,41 +345,75 @@ final class SessionStore: ObservableObject {
         persistSessions()
     }
 
-    /// 关闭前确认（⌘W / 标签 × / 任务 × 的统一入口）。关闭是破坏性操作：
-    /// 进程被终止、回看历史删除且不可恢复，所以一律先弹确认。
+    // MARK: - 关闭 + 撤销关闭（⌘⇧T）
+
+    /// 关闭前快照的会话（含关闭瞬间的纯文本回看 + 在 sessions 中的原始下标），
+    /// 供撤销恢复。index 用于把会话插回原位，而非一律追加到末尾打乱侧栏顺序。
+    private struct ClosedTab { let session: Session; let scrollback: Data?; let index: Int }
+    /// 一次关闭操作（单标签=1 个；整任务=全部标签），记住原聚焦标签以便恢复后落焦。
+    private struct ClosedRecord { let tabs: [ClosedTab]; let focusId: String? }
+    private var closedStack: [ClosedRecord] = []
+    private static let closedStackCap = 10
+
+    /// 关闭标签页（⌘W / 标签 ×）。去模态：即时关闭，压入撤销栈——破坏性由
+    /// 「撤销关闭 ⌘⇧T」兜底（恢复会话与回看历史；运行中的进程无法复活，
+    /// 这与原先确认后关闭的结果一致，只是少了每次的弹窗摩擦）。
     func confirmClose(_ id: String) {
-        guard let s = sessions.first(where: { $0.id == id }) else { return }
-        confirmDestructive(
-            title: "关闭标签页「\(s.name)」？",
-            info: "标签页内的进程将被终止，回看历史将被删除。"
-        ) { [weak self] in self?.close(id) }
+        guard let tab = captureClosed(id) else { return }
+        pushClosed(ClosedRecord(tabs: [tab], focusId: id))
+        close(id)
     }
 
+    /// 关闭整个任务（侧栏 ×）。同样即时执行 + 可撤销（恢复全部标签）。
     func confirmCloseTask(_ tid: String) {
-        guard let root = sessions.first(where: { $0.id == tid }) else { return }
-        let n = tabs(ofTask: tid).count
-        confirmDestructive(
-            title: "关闭任务「\(root.name)」？",
-            info: n > 1
-                ? "任务下的 \(n) 个标签页将一并关闭，进程终止、回看历史删除。"
-                : "任务内的进程将被终止，回看历史将被删除。"
-        ) { [weak self] in self?.closeTask(tid) }
+        let captured = tabs(ofTask: tid).compactMap { captureClosed($0.id) }
+        guard !captured.isEmpty else { return }
+        pushClosed(ClosedRecord(tabs: captured, focusId: activeId ?? tid))
+        closeTask(tid)
     }
 
-    private func confirmDestructive(title: String, info: String, onConfirm: @escaping () -> Void) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = info
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "关闭")
-        alert.addButton(withTitle: "取消") // 标题为「取消」自动绑定 Esc
-        if let w = NSApp.keyWindow ?? NSApp.mainWindow {
-            alert.beginSheetModal(for: w) { resp in
-                if resp == .alertFirstButtonReturn { onConfirm() }
+    /// 关闭瞬间快照：会话结构原样保留 + 当前回看（有活动视图取实时快照，
+    /// 否则读磁盘历史）。destroy 随后会删文件，字节已在内存里握住。
+    private func captureClosed(_ id: String) -> ClosedTab? {
+        guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return nil }
+        let s = sessions[idx]
+        let live: Data? = views[id].map { snapshotData(of: $0) }
+        let data = live ?? (try? Data(contentsOf: DataDir.scrollbackFile(id)))
+        return ClosedTab(session: s, scrollback: data, index: idx)
+    }
+
+    private func pushClosed(_ rec: ClosedRecord) {
+        guard !rec.tabs.isEmpty else { return }
+        closedStack.append(rec)
+        if closedStack.count > Self.closedStackCap { closedStack.removeFirst() }
+    }
+
+    var canRestoreClosed: Bool { !closedStack.isEmpty }
+
+    /// 撤销最近一次关闭（⌘⇧T）：写回回看历史 → 重新登记会话 → 落焦。
+    /// 父任务已不在的悬挂引用降为独立任务根，避免坏掉的层级。
+    func restoreLastClosed() {
+        guard let rec = closedStack.popLast() else { return }
+        // 按原始下标升序插回原位（而非一律 append 打乱侧栏顺序）。下标在关闭时
+        // 捕获，恢复时其余会话可能已移动，故 clamp 到当前长度。
+        for tab in rec.tabs.sorted(by: { $0.index < $1.index }) {
+            if let data = tab.scrollback, !data.isEmpty {
+                try? data.write(to: DataDir.scrollbackFile(tab.session.id), options: .atomic)
             }
-        } else if alert.runModal() == .alertFirstButtonReturn {
-            onConfirm()
+            if !sessions.contains(where: { $0.id == tab.session.id }) {
+                sessions.insert(tab.session, at: min(tab.index, sessions.count))
+            }
         }
+        // 悬挂父引用清理：父不在则降为独立任务根（单标签恢复时父任务可能已关）。
+        for i in sessions.indices {
+            if let pid = sessions[i].parentId, !sessions.contains(where: { $0.id == pid }) {
+                sessions[i].parentId = nil
+            }
+        }
+        let focus = rec.focusId.flatMap { fid in sessions.first(where: { $0.id == fid })?.id }
+            ?? rec.tabs.first?.session.id
+        if let f = focus { show(f) }
+        persistSessions()
     }
 
     /// 释放单个会话的所有资源（视图/进程/检测态/磁盘历史），不处理层级与焦点。
@@ -279,6 +421,7 @@ final class SessionStore: ObservableObject {
         if let v = views.removeValue(forKey: id) {
             v.process?.terminate()
             v.removeFromSuperview()
+            bumpViewsRevision()
         }
         det.removeValue(forKey: id)
         sessions.removeAll { $0.id == id }
@@ -361,7 +504,7 @@ final class SessionStore: ObservableObject {
     enum SplitDirection { case right, down }
 
     /// 当前分屏轴向（true = 上下分屏）。单 pane 时无意义。
-    @Published var splitVertical = false
+    @Published var splitVertical = false { didSet { scheduleLayoutPersist() } }
 
     /// ⌘D / 工具条分屏：开新会话（归属当前任务）。已分屏时不再分（MVP 最多两个 pane）。
     func splitActive(_ dir: SplitDirection = .right) {
@@ -377,10 +520,50 @@ final class SessionStore: ObservableObject {
     /// ⌘⇧D 取消分屏：只留聚焦 pane（另一侧会话保活，可从侧栏再打开）。
     func unsplit() {
         guard panes.count > 1, let a = activeId, panes.contains(a) else {
-            if let f = panes.first { panes = [f] }
+            // 已是单 pane 时不要把数组赋回自身——didSet 会触发一次无谓的布局落盘。
+            if panes.count != 1, let f = panes.first { panes = [f] }
             return
         }
         panes = [a]
+    }
+
+    /// OSC 7 上报的工作目录（file://host/path 或裸路径）→ 更新实时 cwd + 自动命名。
+    /// 比 proc_pidinfo 每秒采样更及时（cd 即触发）。
+    func noteOscCwd(id: String, dir raw: String) {
+        var path = raw
+        if let url = URL(string: raw), url.isFileURL { path = url.path }
+        guard isUsableDir(path) else { return }
+        if liveCwd[id] != path {
+            liveCwd[id] = path; cwdDirty = true
+            autoNameFromCwd(id, dir: path)
+        }
+    }
+
+    /// 跳到下一个「需要你」的会话（⌘⌥→）：等待确认 > 出错 > 完成未读，按
+    /// sessions 顺序在当前聚焦之后循环查找。把「一屏排开的 tab」变成可逐个
+    /// 处理的 triage 队列；无待处理会话时 beep 提示。
+    func focusNextAttention() {
+        let order = sessions.map { $0.id }
+        let needsAttention: (Session) -> Bool = { $0.status == .waiting || $0.status == .error || self.unread.contains($0.id) }
+        let targets = sessions.filter(needsAttention).map { $0.id }
+        guard !targets.isEmpty else { NSSound.beep(); return }
+        // 当前聚焦之后的第一个待处理；没有则回到第一个（循环）。
+        let startIdx = activeId.flatMap { order.firstIndex(of: $0) } ?? -1
+        let rotated = order.indices.map { order[($0 + startIdx + 1) % order.count] }
+        let next = rotated.first(where: { targets.contains($0) }) ?? targets[0]
+        showTask(taskId(of: next))
+        // 任务内若该具体标签页才是待处理项，进一步落到它。
+        if taskId(of: next) != next { show(next) }
+    }
+
+    /// 切换聚焦到另一个分屏（⌘⌥O）。仅一个 pane 时无操作。
+    func focusOtherPane() {
+        guard panes.count > 1 else { return }
+        let i = panes.firstIndex(of: activeId ?? "") ?? 0
+        let next = panes[(i + 1) % panes.count]
+        activeId = next
+        lastTabByTask[taskId(of: next)] = next
+        focusActiveTerminal()
     }
 
     /// 终端视图拿到键盘焦点（点击分屏 pane）→ 活动会话跟随。
@@ -396,6 +579,65 @@ final class SessionStore: ObservableObject {
     func noteBell(id: String) {
         guard id != activeId, let s = sessions.first(where: { $0.id == id }) else { return }
         postSystemNotification(title: "\(s.name) 响铃", body: "\(s.group) · 终端 BEL", taskId: taskId(of: id))
+    }
+
+    // MARK: - 广播输入（一次输入同发多个会话）
+
+    /// 广播模式：开启后，聚焦终端的每次用户输入（键盘/粘贴/鼠标编码）都镜像到
+    /// 其余所有已实例化的会话终端。多 agent 并行时「一次 yes 发给全部」的命门。
+    /// 危险性高（会把命令打进你可能忘了的后台会话），所以默认关 + 顶部红条常驻提示。
+    @Published var broadcastActive = false
+
+    /// 正在扇出：避免目标视图的 send(data:) 钩子再次触发广播（N×N 风暴）。
+    private var fanningOut = false
+
+    /// 活动视图集合（views）增减的版本号。views 非 @Published，BroadcastBar 的
+    /// 触达数（broadcastTargetCount）派生自它；bump 这个 @Published 值即可驱动
+    /// SwiftUI 重新读取计算属性，让指示条实时反映会话增减。
+    @Published private(set) var viewsRevision = 0
+
+    /// views 发生增减后调用。异步到下一拍：terminalView(for:) 由 SwiftUI 的
+    /// makeNSView/updateNSView 调用，在更新周期内改 @Published 会触发
+    /// "Publishing changes from within view updates" 告警。
+    private func bumpViewsRevision() {
+        DispatchQueue.main.async { [weak self] in self?.viewsRevision &+= 1 }
+    }
+
+    /// 当前广播会触达的目标数（聚焦会话之外、已实例化的终端）。指示条用。
+    var broadcastTargetCount: Int {
+        max(0, views.keys.filter { $0 != activeId }.count)
+    }
+
+    /// 切换广播模式（⌘⌥B）。开启时把钩子挂到所有活动视图；关闭时摘除。
+    func toggleBroadcast() {
+        broadcastActive.toggle()
+        syncBroadcastHooks()
+    }
+
+    /// 给每个活动终端视图安装/卸载用户输入钩子。视图在生命周期内常驻，
+    /// 新建视图时也会在 terminalView(for:) 末尾按当前开关补挂。
+    /// （[id] 显式按值捕获：Swift for-in 循环变量本就是每次迭代的新常量，
+    /// 这里只为表意清晰，确保每个闭包持有自己会话 id 的不可变副本。）
+    private func syncBroadcastHooks() {
+        for (id, v) in views {
+            v.onUserInput = broadcastActive
+                ? { [weak self, id] data in self?.relayUserInput(from: id, data: data) }
+                : nil
+        }
+    }
+
+    /// 把源会话的一次用户输入镜像到其余活动终端。
+    /// - 再入保护（fanningOut）避免目标的钩子回灌成 N×N 风暴。
+    /// - 程序化发送（autoResume/IPC/清屏/拖入路径）经同一漏斗但不是用户击键，
+    ///   据源视图的 isProgrammaticSend 跳过，只镜像真·键盘/粘贴输入。
+    private func relayUserInput(from sourceId: String, data: ArraySlice<UInt8>) {
+        guard broadcastActive, !fanningOut else { return }
+        if views[sourceId]?.isProgrammaticSend == true { return }
+        fanningOut = true
+        defer { fanningOut = false }
+        for (id, v) in views where id != sourceId {
+            v.send(data: data)
+        }
     }
 
     // MARK: - 菜单/快捷键动作
@@ -461,12 +703,63 @@ final class SessionStore: ObservableObject {
         }
     }
 
+    /// 终端区布局落盘（分屏 pane id + 轴向）。panes/splitVertical 的 didSet 触发；
+    /// 文件极小，每次变更直接异步原子写，不放大 sessions.json。
+    private func scheduleLayoutPersist() {
+        let snapshot = LayoutState(panes: panes, vertical: splitVertical)
+        ioQueue.async {
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: DataDir.layoutFile, options: .atomic)
+            }
+        }
+    }
+
+    /// 启动时恢复上次的分屏布局：仅当落盘的 pane id 仍存在且数量合法（1-2）。
+    /// 失败回落单 pane（最后一个会话）。返回是否成功恢复了分屏。
+    private func restoreLayout() {
+        let fallback: () -> Void = { [self] in
+            splitVertical = false   // 单 pane，轴向无意义且会让 RootView 误渲染 VSplitView
+            activeId = sessions.last?.id
+            if let a = activeId { panes = [a] } else { panes = [] }
+        }
+        guard let data = try? Data(contentsOf: DataDir.layoutFile),
+              let saved = try? JSONDecoder().decode(LayoutState.self, from: data) else {
+            fallback(); return
+        }
+        let valid = saved.panes.filter { id in sessions.contains(where: { $0.id == id }) }
+        guard (1...2).contains(valid.count) else { fallback(); return }
+        // 只有真的两个 pane 才恢复分屏轴向：若一侧会话已不在（崩溃时序导致
+        // layout 比 sessions 新），valid 退化为 1，强制单 pane 轴向，否则
+        // RootView 会拿一个 pane 去渲染 VSplitView/HSplitView。
+        splitVertical = valid.count == 2 ? saved.vertical : false
+        panes = valid
+        activeId = valid.first
+    }
+
     func rename(_ id: String, to name: String) {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         let t = name.trimmingCharacters(in: .whitespaces)
         guard !t.isEmpty else { return }
         sessions[i].name = t
         persistSessions()
+    }
+
+    /// 默认类型标签集（shell/claude/codex/ssh）——名字仍属此集即「未被命名过」。
+    private static let defaultNames = Set(WindowType.allCases.map(\.label))
+
+    /// 任务名仍是默认类型标签时，用工作目录名替代，提升侧栏可读性
+    /// （"shell" → "iterm"）。只命名任务根；用户自定义名与类型降级保留的名都不动；
+    /// home / 根目录名无识别价值，跳过。落盘随 cwd 节流（cwdDirty）。
+    private func autoNameFromCwd(_ id: String, dir: String) {
+        guard let i = sessions.firstIndex(where: { $0.id == id }),
+              sessions[i].parentId == nil,                       // 只给任务根命名
+              Self.defaultNames.contains(sessions[i].name) else { return }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        guard dir != home, dir != "/" else { return }
+        let base = (dir as NSString).lastPathComponent
+        guard !base.isEmpty, base != "/" else { return }
+        sessions[i].name = base
+        cwdDirty = true   // 与 cwd 同批落盘
     }
 
     /// 取（或创建）会话的常驻终端视图。首次创建时起 shell 并回放磁盘历史。
@@ -492,6 +785,11 @@ final class SessionStore: ObservableObject {
         v.ensureScrollback(reset: true)
         v.applyCursorStyle(shape: settings.cursorShape, blink: settings.cursorBlink)
         views[id] = v
+        bumpViewsRevision()
+        // 广播模式开启期间新建的视图：立即补挂用户输入钩子（捕获自身 id）。
+        if broadcastActive {
+            v.onUserInput = { [weak self, id] data in self?.relayUserInput(from: id, data: data) }
+        }
 
         // 回放上次的历史（纯文本快照，不进入检测累计）。纯文本在任何窗口
         // 尺寸下回放都干净；原始字节流带光标定位/屏幕模式，跨尺寸回放必然
@@ -553,6 +851,10 @@ final class SessionStore: ObservableObject {
            let kind = session?.kind, let cmd = resumeCommand(for: kind) {
             autoResume(id: id, cmd: cmd, view: v, started: Date())
         }
+        // 新建任务引导指定的首条命令：同样等提示符就绪再发（复用 autoResume）。
+        if let cmd = pendingStarter.removeValue(forKey: id) {
+            autoResume(id: id, cmd: cmd, view: v, started: Date())
+        }
         return v
     }
 
@@ -599,7 +901,7 @@ final class SessionStore: ObservableObject {
         let hadOutput = ds?.lastFeed != nil
         let silent = ds?.lastFeed.map { now.timeIntervalSince($0) >= quiet } ?? false
         if (hadOutput && silent) || now.timeIntervalSince(started) >= maxWait {
-            view.send(txt: cmd + "\r")
+            view.sendProgrammatic(txt: cmd + "\r")   // 恢复命令是系统动作，不广播
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, weak view] in
@@ -663,8 +965,12 @@ final class SessionStore: ObservableObject {
         // 正常用过的 shell（存活超过阈值）即便非零退出也保留，用户可能想
         // 看最后的输出。历史快照仍在磁盘，重建时会回放。
         if failed, let started = ds?.startedAt, Date().timeIntervalSince(started) < 1.5 {
-            views[id]?.removeFromSuperview()
-            views.removeValue(forKey: id)
+            let name = sessions.first(where: { $0.id == id })?.name ?? id
+            Diagnostics.shared.log(.error, "会话「\(name)」启动失败（shell 在 \(String(format: "%.1f", Date().timeIntervalSince(started)))s 内退出，退出码 \(code.map(String.init) ?? "?")）；已重置，下次打开会重建。")
+            if let dead = views.removeValue(forKey: id) {   // 原子摘除：先出字典再离屏，避免悬挂引用
+                dead.removeFromSuperview()
+                bumpViewsRevision()
+            }
             det.removeValue(forKey: id)
         }
         let st: SessionStatus = (code ?? 0) == 0 ? .done : .error
@@ -740,7 +1046,10 @@ final class SessionStore: ObservableObject {
         for (id, v) in views {
             guard v.process?.running == true,
                   let dir = processCwd(pid: v.process?.shellPid ?? 0) else { continue }
-            if liveCwd[id] != dir { liveCwd[id] = dir; cwdDirty = true }
+            if liveCwd[id] != dir {
+                liveCwd[id] = dir; cwdDirty = true
+                autoNameFromCwd(id, dir: dir)   // 目录变化时尝试用项目名命名任务
+            }
         }
         // ps 全表 fork+exec 不便宜：5s 一次足以跟上 claude/ssh 的启停。
         if tick % 5 == 0 { reclassifyTypes() }
@@ -816,7 +1125,11 @@ final class SessionStore: ObservableObject {
         guard prev != status || sessions[i].phase != phase else { return }
         sessions[i].status = status
         sessions[i].phase = phase
-        persistSessions()
+        // 不在此落盘：status/phase 是运行态，loadPersisted 启动时一律重置为
+        // idle/nil，持久化它们毫无意义。而活跃 agent 每秒翻好几次状态
+        //（running⇄thinking⇄working），原先每翻一次就全量重写 sessions.json，
+        // 是写放大的主源。结构性字段（name/kind/host/cwd/层级）各有自己的
+        // 落盘点（reclassify / autoNameFromCwd / cwd 采样 / 增删会话），不受影响。
         // 非聚焦会话完成/出错 → 侧栏未读亮点（聚焦中的会话用户正看着，不标）。
         let finished = (status == .done && (prev == .running || prev == .waiting)) || status == .error
         if finished, id != activeId { unread.insert(id) }
@@ -875,9 +1188,9 @@ final class SessionStore: ObservableObject {
         sessions = list
         restoredIds = Set(list.map { $0.id }) // 这批是恢复的，agent 会话重开预填 resume
         for s in list where s.cwd != nil { liveCwd[s.id] = s.cwd } // 落盘前先沿用上次目录
-        activeId = list.last?.id
-        if let a = activeId { panes = [a] }
+        restoreLayout() // 恢复上次分屏布局（pane id + 轴向），失败回落单 pane
         persistSessions() // 归位后的状态立即落盘，避免磁盘上残留旧 running 状态
+        gcOrphanScrollback() // 清理崩溃残留的孤儿回看文件（仅成功解码后跑）
     }
 
     /// 落盘前把最近采样到的工作目录并入会话快照（liveCwd 不入 @Published）。
@@ -902,6 +1215,27 @@ final class SessionStore: ObservableObject {
     private func saveScrollback(_ id: String, _ data: Data) {
         ioQueue.async {
             try? data.write(to: DataDir.scrollbackFile(id), options: .atomic)
+        }
+    }
+
+    /// 启动期清理孤儿回看文件：崩溃/异常退出会留下没有对应会话的
+    /// scrollback-<id>.bin，永久占盘。枚举数据目录，删除 id 不在当前会话集里的。
+    /// 仅在 sessions.json 成功解码后调用（liveIds 真实有效）——读损坏时宁可漏删
+    /// 也不误删历史。整段在 ioQueue 上跑，不碰主线程。
+    private func gcOrphanScrollback() {
+        let liveIds = Set(sessions.map { $0.id })
+        ioQueue.async {
+            let fm = FileManager.default
+            guard let entries = try? fm.contentsOfDirectory(
+                at: DataDir.url, includingPropertiesForKeys: nil) else { return }
+            for url in entries {
+                let name = url.lastPathComponent
+                guard name.hasPrefix("scrollback-"), name.hasSuffix(".bin") else { continue }
+                let id = String(name.dropFirst("scrollback-".count).dropLast(".bin".count))
+                if !liveIds.contains(id) {
+                    try? fm.removeItem(at: url)
+                }
+            }
         }
     }
 

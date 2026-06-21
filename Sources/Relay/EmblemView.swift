@@ -26,7 +26,7 @@ struct EmblemView: NSViewRepresentable {
     let phase: DisplayPhase
     var size: CGFloat = 18
 
-    func makeNSView(context: Context) -> EmblemBackingView { EmblemBackingView() }
+    func makeNSView(context: Context) -> EmblemBackingView { EmblemBackingView(frame: .zero) }
 
     func updateNSView(_ v: EmblemBackingView, context: Context) {
         v.configure(kind: kind, phase: phase, size: size)
@@ -49,11 +49,64 @@ final class EmblemBackingView: NSView {
     /// 该周期内的相对时刻（keyTimes = 帧号/120）。
     private static let loopDur: Double = 4
 
+    /// 系统「减弱动效」开关：开启时整树构建后剥离全部动画，只留静态终态。
+    private static var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // 用户在系统设置里改「减弱动效」时实时重建（重建会按当前开关决定是否加动画）。
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(reduceMotionChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not supported") }
+
+    deinit { NSWorkspace.shared.notificationCenter.removeObserver(self) }
+
+    @objc private func reduceMotionChanged() { rebuild() }
+
     func configure(kind: WindowType, phase: DisplayPhase, size: CGFloat) {
+        // 无障碍标签始终跟随状态更新（即便几何无变化，VoiceOver 也要读到最新阶段）。
+        updateAccessibility(kind: kind, phase: phase)
         let cfg = (kind, phase, size)
         if let c = current, c == cfg { return }
         current = cfg
         rebuild()
+    }
+
+    /// VoiceOver：把徽标读成「类型 · 阶段」（如「Claude · 等待输入」），
+    /// 否则它只是一团无标签的图层。
+    private func updateAccessibility(kind: WindowType, phase: DisplayPhase) {
+        setAccessibilityElement(true)
+        setAccessibilityRole(.image)
+        let k: String
+        switch kind {
+        case .claude: k = "Claude"
+        case .codex: k = "Codex"
+        case .shell: k = "本地终端"
+        case .ssh: k = "SSH"
+        }
+        let p: String
+        switch phase {
+        case .working: p = "工作中"
+        case .thinking: p = "思考中"
+        case .waiting: p = "等待输入"
+        case .done: p = "已完成"
+        case .error: p = "出错"
+        case .idle: p = "空闲"
+        }
+        setAccessibilityLabel("\(k) · \(p)")
+    }
+
+    /// 递归剥离图层树上的全部动画。预排的 once/loop/keyframe 动画移除后，
+    /// 各层回落到 model 值（即动画终态：done 角标满尺寸、对勾画全、工作态
+    /// 粒子隐去），正是「减弱动效」想要的静止画面。
+    private static func stripAnimations(_ l: CALayer) {
+        l.removeAllAnimations()
+        l.sublayers?.forEach { stripAnimations($0) }
     }
 
     /// CALayer 持有的是构建时解析的静态 CGColor —— Theme 动态色必须在
@@ -67,6 +120,7 @@ final class EmblemBackingView: NSView {
         guard let (kind, phase, size) = current else { return }
         effectiveAppearance.performAsCurrentDrawingAppearance {
             buildTree(kind: kind, phase: phase, size: size)
+            if Self.reduceMotion, let root = layer { Self.stripAnimations(root) }
         }
     }
 

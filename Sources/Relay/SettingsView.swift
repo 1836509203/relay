@@ -1,214 +1,228 @@
-// 设置（⌘,）：主题（含明暗跟随）/ 字体 / 字号 / 光标 / 背景透明毛玻璃 /
-// 行高 / 内边距 / 回看 / 渲染器，改动即时生效并持久化。
+// 设置（⌘,）：cmux 式左侧分区导航 + 右侧分组卡片。全中文。
+// 分区/设置行的元数据集中在 SettingsSections.swift（extension SettingsView）里定义，
+// 本文件只负责外壳渲染、搜索、绑定与动作。改动即时生效并持久化（bind → applySettings）。
+import AppKit
 import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var store = SessionStore.shared
+    @State private var selection: String = "appearance"
+    @State private var query: String = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("终端外观")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(Theme.fg0)
-
-            themeSection
-            fontSection
-            cursorSection
-            backgroundSection
-            layoutSection
-            scrollbackSection
-            gpuSection
-            updateSection
-
+        HStack(spacing: 0) {
+            sidebar
             Divider()
-
-            Text("快捷键：⌘T 新建 · ⌘W 关闭 · ⌘D 分屏 · ⌘F 搜索 · ⌘K 清屏 · ⌘1-9 切换")
-                .font(.system(size: 10.5))
-                .foregroundColor(Theme.fg3)
+            content
         }
-        .padding(20)
-        .frame(width: 440)
+        .frame(minWidth: 720, idealWidth: 880, maxWidth: .infinity,
+               minHeight: 460, idealHeight: 600, maxHeight: .infinity)
         .background(Theme.bg1)
     }
 
-    // MARK: - 分区
+    // MARK: - 左侧分区导航
 
-    private var themeSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("配色主题").font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Toggle("跟随系统明暗（自动切换到配对的亮/暗款）", isOn: followBinding)
-                .toggleStyle(.switch).font(.system(size: 12))
-            Picker("", selection: themeBinding) {
-                Section("暗色") {
-                    ForEach(TerminalTheme.all.filter { !$0.isLight }) { t in
-                        Text(t.name).tag(t.id)
-                    }
-                }
-                Section("亮色") {
-                    ForEach(TerminalTheme.all.filter { $0.isLight }) { t in
-                        Text(t.name).tag(t.id)
-                    }
-                }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .frame(maxWidth: 280, alignment: .leading)
-            themeSwatch
-        }
-    }
-
-    private var fontSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("字体").font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Picker("", selection: fontBinding) {
-                ForEach(TerminalTheme.availableFonts(), id: \.id) { f in
-                    Text(f.label).tag(f.id)
-                }
-            }
-            .labelsHidden()
-            .frame(maxWidth: 280, alignment: .leading)
-            Text("字号  \(Int(store.settings.fontSize)) pt")
-                .font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Slider(value: sizeBinding, in: 9...24, step: 1).frame(maxWidth: 280)
-        }
-    }
-
-    private var cursorSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("光标").font(.system(size: 11)).foregroundColor(Theme.fg2)
-            HStack(spacing: 10) {
-                Picker("", selection: cursorShapeBinding) {
-                    Text("█ 块").tag("block")
-                    Text("▏竖线").tag("bar")
-                    Text("▁ 下划线").tag("underline")
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 200)
-                Toggle("闪烁", isOn: cursorBlinkBinding)
-                    .toggleStyle(.checkbox).font(.system(size: 12))
-            }
-        }
-    }
-
-    private var backgroundSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("背景不透明度  \(Int(store.settings.bgOpacity * 100))%")
-                .font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Slider(value: opacityBinding, in: 0.7...1.0, step: 0.01).frame(maxWidth: 280)
-            Text("毛玻璃模糊  \(store.settings.bgBlur)")
-                .font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Slider(value: blurBinding, in: 0...40, step: 1).frame(maxWidth: 280)
-                .disabled(store.settings.bgOpacity >= 0.999)
-            if store.settings.bgOpacity >= 0.999 {
-                Text("毛玻璃需要不透明度低于 100% 才可见")
-                    .font(.system(size: 10)).foregroundColor(Theme.fg3)
-            }
-        }
-    }
-
-    private var layoutSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("行高微调  +\(store.settings.lineSpacing, specifier: "%.1f") pt")
-                .font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Slider(value: lineSpacingBinding, in: 0...4, step: 0.5).frame(maxWidth: 280)
-            Text("字距微调  \(store.settings.letterSpacing, specifier: "%.2f") pt（负值收紧，中文加倍）")
-                .font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Slider(value: letterSpacingBinding, in: -1.0...1.0, step: 0.25).frame(maxWidth: 280)
-            Text("终端内边距  \(Int(store.settings.padding)) pt")
-                .font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Slider(value: paddingBinding, in: 0...20, step: 1).frame(maxWidth: 280)
-        }
-    }
-
-    private var scrollbackSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("回看行数（对新建会话生效；行数越大每会话内存越高）")
-                .font(.system(size: 11)).foregroundColor(Theme.fg2)
-            Picker("", selection: scrollbackBinding) {
-                ForEach([500, 1000, 2000, 5000, 10000], id: \.self) { n in
-                    Text("\(n)").tag(n)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 280)
-        }
-    }
-
-    private var gpuSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Toggle("GPU 渲染（Metal · ProMotion 高刷）", isOn: gpuBinding)
-                .toggleStyle(.switch)
-                .font(.system(size: 12))
-            Text("显著增加内存占用（约 +150MB）；默认的 CPU 渲染滚动同样流畅")
-                .font(.system(size: 10))
-                .foregroundColor(Theme.fg3)
-        }
-    }
-
-    private var updateSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 10) {
-                Toggle("自动检查更新", isOn: bind(\.autoUpdateCheck))
-                    .toggleStyle(.switch)
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11)).foregroundColor(Theme.fg3)
+                TextField("搜索设置", text: $query)
+                    .textFieldStyle(.plain)
                     .font(.system(size: 12))
-                Button("立即检查") { Updater.check(interactive: true) }
-                    .font(.system(size: 11))
+                if !query.isEmpty {
+                    Button { query = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11)).foregroundColor(Theme.fg3)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
-            Text("当前版本 \(Updater.currentVersion) · 发现新版本时通过系统通知提醒")
-                .font(.system(size: 10))
-                .foregroundColor(Theme.fg3)
+            .padding(.horizontal, 9).padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 7).fill(Theme.bg2))
+            .padding(10)
+
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(sections) { sec in sidebarRow(sec) }
+                }
+                .padding(.horizontal, 8)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(width: 212)
+        .background(Theme.bg0)
+    }
+
+    private func sidebarRow(_ sec: SettingsSection) -> some View {
+        let active = selection == sec.id && query.isEmpty
+        return Button {
+            query = ""
+            selection = sec.id
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: sec.icon).font(.system(size: 13)).frame(width: 20)
+                Text(sec.title)
+                    .font(.system(size: 12.5, weight: active ? .semibold : .regular))
+                Spacer(minLength: 0)
+            }
+            .foregroundColor(active ? Color.accentColor : Theme.fg0)
+            .padding(.horizontal, 9).padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 7)
+                .fill(active ? Color.accentColor.opacity(0.15) : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 右侧内容
+
+    private var content: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                if query.isEmpty {
+                    if let sec = sections.first(where: { $0.id == selection }) {
+                        sectionHeader(sec.title)
+                        ForEach(Array(sec.groups.enumerated()), id: \.offset) { _, g in
+                            groupCard(g)
+                        }
+                    }
+                } else {
+                    searchResults
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder private var searchResults: some View {
+        let q = query.lowercased()
+        let hits: [SettingsRow] = sections.flatMap { sec in
+            // 分区名命中则该分区全部行算命中（按分区名搜索是最自然的行为，
+            // 如搜「终端」「窗口」「排版」应直达该分区，而非靠逐行手填关键词）。
+            let sectionHit = sec.title.lowercased().contains(q)
+            return sec.groups.flatMap(\.rows).filter { row in
+                sectionHit
+                || row.title.lowercased().contains(q)
+                || (row.subtitle?.lowercased().contains(q) ?? false)
+                || row.keywords.lowercased().contains(q)
+            }
+        }
+        if hits.isEmpty {
+            Text("没有匹配「\(query)」的设置")
+                .font(.system(size: 12)).foregroundColor(Theme.fg3)
+        } else {
+            sectionHeader("搜索结果")
+            groupCard(SettingsGroup(header: nil, rows: hits))
         }
     }
 
-    // MARK: - 部件
+    private func sectionHeader(_ t: String) -> some View {
+        Text(t).font(.system(size: 17, weight: .bold)).foregroundColor(Theme.fg0)
+    }
 
-    /// 当前生效主题的色板预览：主题背景铺底，前景字样 + ANSI 七彩小方块。
-    private var themeSwatch: some View {
-        let t = TerminalTheme.by(id: store.effectiveThemeId)
-        return HStack(spacing: 5) {
-            Text("Aa").font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundColor(Color(hex: t.fg))
-            ForEach(1..<8, id: \.self) { i in
-                RoundedRectangle(cornerRadius: 2.5)
-                    .fill(Color(hex: t.ansi[i]))
-                    .frame(width: 14, height: 14)
+    private func groupCard(_ g: SettingsGroup) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let h = g.header {
+                Text(h).font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Theme.fg2)
+                    .padding(.bottom, 6).padding(.leading, 2)
+            }
+            VStack(spacing: 0) {
+                ForEach(Array(g.rows.enumerated()), id: \.element.id) { idx, row in
+                    if idx > 0 { Divider().overlay(Theme.line) }
+                    rowView(row)
+                }
+            }
+            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.bg2.opacity(0.55)))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.line, lineWidth: 1))
+        }
+    }
+
+    @ViewBuilder private func rowView(_ row: SettingsRow) -> some View {
+        switch row.layout {
+        case .trailing:
+            HStack(alignment: .center, spacing: 12) {
+                rowLabel(row)
+                Spacer(minLength: 8)
+                row.control
+            }
+            .padding(.horizontal, 14).padding(.vertical, 11)
+        case .below:
+            VStack(alignment: .leading, spacing: 9) {
+                rowLabel(row)
+                row.control
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14).padding(.vertical, 11)
+        }
+    }
+
+    private func rowLabel(_ row: SettingsRow) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(row.title).font(.system(size: 12.5)).foregroundColor(Theme.fg0)
+            if let s = row.subtitle {
+                Text(s).font(.system(size: 10.5)).foregroundColor(Theme.fg3)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color(hex: t.bg)))
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.line, lineWidth: 1))
     }
 
     // MARK: - 绑定（set 即 applySettings：生效 + 持久化）
 
-    private func bind<T>(_ keyPath: WritableKeyPath<AppSettings, T>) -> Binding<T> {
+    func bind<T>(_ kp: WritableKeyPath<AppSettings, T>) -> Binding<T> {
         Binding(
-            get: { store.settings[keyPath: keyPath] },
-            set: { store.settings[keyPath: keyPath] = $0; store.applySettings() }
+            get: { store.settings[keyPath: kp] },
+            set: { store.settings[keyPath: kp] = $0; store.applySettings() }
         )
     }
 
-    private var themeBinding: Binding<String> { bind(\.theme) }
-    private var followBinding: Binding<Bool> { bind(\.followSystemTheme) }
-    private var fontBinding: Binding<String> { bind(\.fontName) }
-    private var sizeBinding: Binding<Double> { bind(\.fontSize) }
-    private var cursorShapeBinding: Binding<String> { bind(\.cursorShape) }
-    private var cursorBlinkBinding: Binding<Bool> { bind(\.cursorBlink) }
-    private var opacityBinding: Binding<Double> { bind(\.bgOpacity) }
-    private var lineSpacingBinding: Binding<Double> { bind(\.lineSpacing) }
-    private var letterSpacingBinding: Binding<Double> { bind(\.letterSpacing) }
-    private var paddingBinding: Binding<Double> { bind(\.padding) }
-    private var scrollbackBinding: Binding<Int> { bind(\.scrollback) }
-    private var gpuBinding: Binding<Bool> { bind(\.gpuRender) }
+    // MARK: - 动作
 
-    /// blur 是 Int，Slider 要 Double：单独桥一层。
-    private var blurBinding: Binding<Double> {
-        Binding(
-            get: { Double(store.settings.bgBlur) },
-            set: { store.settings.bgBlur = Int($0); store.applySettings() }
-        )
+    func confirmReset() {
+        let a = NSAlert()
+        a.messageText = "恢复默认设置？"
+        a.informativeText = "将重置所有外观与行为选项（任务模板会保留）。"
+        a.addButton(withTitle: "恢复默认")
+        a.addButton(withTitle: "取消")
+        if a.runModal() == .alertFirstButtonReturn { resetSettings() }
     }
+
+    private func resetSettings() {
+        var s = AppSettings()
+        s.taskTemplates = store.settings.taskTemplates   // 不动用户数据
+        store.settings = s
+        store.applySettings()
+    }
+
+    func revealDataDir() {
+        NSWorkspace.shared.activateFileViewerSelecting([DataDir.url])
+    }
+}
+
+// MARK: - 元数据模型
+
+enum SettingsRowLayout { case trailing, below }
+
+struct SettingsRow: Identifiable {
+    let id: String
+    let title: String
+    var subtitle: String? = nil
+    var keywords: String = ""
+    var layout: SettingsRowLayout = .trailing
+    let control: AnyView
+}
+
+struct SettingsGroup {
+    var header: String? = nil
+    let rows: [SettingsRow]
+}
+
+struct SettingsSection: Identifiable {
+    let id: String
+    let icon: String
+    let title: String
+    let groups: [SettingsGroup]
 }

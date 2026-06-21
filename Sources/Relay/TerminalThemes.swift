@@ -13,17 +13,16 @@ struct TerminalTheme: Identifiable {
     /// ANSI 0-15
     let ansi: [UInt32]
 
-    // 列表顺序＝设置页菜单顺序（再按 isLight 分组成「暗色/亮色」两节）。
-    // 先 Relay 自家与苹果原生（Xcode / Apple 终端经典 / 石墨 / 深海），
-    // 再社区精品（夜枭 / 东京夜 / 玫瑰松 / Ayu / Dracula…），最后亮色组。
+    // 16 款公认经典：暗色 12（Relay 自家 + Xcode 暗 + iTerm2 默认纯黑 + Dracula/Nord/
+    // Solarized/Gruvbox/One Dark/东京夜/Monokai/Everforest/Catppuccin Mocha）+ 亮色 4
+    // （Catppuccin Latte/Xcode 亮/Solarized 亮/Gruvbox 亮）。relay-dark 与
+    // catppuccin-latte 是默认值，必须保留。
     static let all: [TerminalTheme] = [
         // 暗色
-        relayDark, xcodeDark, applePro, spacegray, ocean,
-        nightOwl, tokyoNight, rosePine, ayuMirage,
-        dracula, nord, oneDark, gruvboxDark, solarizedDark, catppuccinMocha,
+        relayDark, xcodeDark, itermDefault, dracula, nord, solarizedDark,
+        gruvboxDark, oneDark, tokyoNight, monokai, everforestDark, catppuccinMocha,
         // 亮色
-        light, xcodeLight, appleBasic, novel,
-        tokyoNightDay, rosePineDawn, ayuLight, catppuccinLatte,
+        catppuccinLatte, xcodeLight, solarizedLight, gruvboxLight,
     ]
 
     static let relayDark = TerminalTheme(
@@ -34,17 +33,6 @@ struct TerminalTheme: Identifiable {
             0x6FA8DC, 0xA99BD9, 0x7FB8B0, 0xC2C0B6,
             0x5C6273, 0xE08C8C, 0xB5D193, 0xE8C078,
             0x8FC1ED, 0xC3B7E8, 0x9AD3CB, 0xE8E6E1,
-        ]
-    )
-
-    static let light = TerminalTheme(
-        id: "light", name: "明亮",
-        bg: 0xFAFAF7, fg: 0x1F2328, caret: 0xB07D2B,
-        ansi: [
-            0x24292F, 0xCF222E, 0x116329, 0x9A6700,
-            0x0969DA, 0x8250DF, 0x1B7C83, 0x6E7781,
-            0x57606A, 0xA40E26, 0x044F1E, 0x633C01,
-            0x0550AE, 0x622CBC, 0x12616A, 0x24292F,
         ]
     )
 
@@ -126,9 +114,56 @@ struct TerminalTheme: Identifiable {
         ]
     )
 
-    // MARK: - 苹果原生风
+    static let tokyoNight = TerminalTheme(
+        id: "tokyo-night", name: "东京夜",
+        bg: 0x1A1B26, fg: 0xC0CAF5, caret: 0xC0CAF5,
+        ansi: [
+            0x15161E, 0xF7768E, 0x9ECE6A, 0xE0AF68,
+            0x7AA2F7, 0xBB9AF7, 0x7DCFFF, 0xA9B1D6,
+            0x414868, 0xF7768E, 0x9ECE6A, 0xE0AF68,
+            0x7AA2F7, 0xBB9AF7, 0x7DCFFF, 0xC0CAF5,
+        ]
+    )
 
-    // Xcode 官方源码编辑器主题（Apple 开发者最熟悉的暗/亮配色）。
+    // Monokai 经典（Sublime）：灰底 + 高饱和亮粉/青绿/黄。
+    static let monokai = TerminalTheme(
+        id: "monokai", name: "Monokai",
+        bg: 0x272822, fg: 0xF8F8F2, caret: 0xF8F8F0,
+        ansi: [
+            0x272822, 0xF92672, 0xA6E22E, 0xF4BF75,
+            0x66D9EF, 0xAE81FF, 0xA1EFE4, 0xF8F8F2,
+            0x75715E, 0xF92672, 0xA6E22E, 0xF4BF75,
+            0x66D9EF, 0xAE81FF, 0xA1EFE4, 0xF9F8F5,
+        ]
+    )
+
+    // Solarized 亮色（Ethan Schoonover 官方）。正文/光标用 base01 #586E75
+    // （非 base00），对米底 4.99:1 过 WCAG AA。
+    static let solarizedLight = TerminalTheme(
+        id: "solarized-light", name: "Solarized 亮色",
+        bg: 0xFDF6E3, fg: 0x586E75, caret: 0x586E75,
+        ansi: [
+            0x073642, 0xDC322F, 0x859900, 0xB58900,
+            0x268BD2, 0xD33682, 0x2AA198, 0xEEE8D5,
+            0x002B36, 0xCB4B16, 0x586E75, 0x657B83,
+            0x839496, 0x6C71C4, 0x93A1A1, 0xFDF6E3,
+        ]
+    )
+
+    // Gruvbox 亮色（morhetz）。ANSI 0-7 取 faded/dark 暗色系（浅底可读），
+    // 「黑」压成 #3C3836（原 port 把黑设成底色 → 白底不可见）。
+    static let gruvboxLight = TerminalTheme(
+        id: "gruvbox-light", name: "Gruvbox 亮色",
+        bg: 0xFBF1C7, fg: 0x3C3836, caret: 0x3C3836,
+        ansi: [
+            0x3C3836, 0x9D0006, 0x79740E, 0xB57614,
+            0x076678, 0x8F3F71, 0x427B58, 0x7C6F64,
+            0x928374, 0xCC241D, 0x98971A, 0xD79921,
+            0x458588, 0xB16286, 0x689D6A, 0x3C3836,
+        ]
+    )
+
+    // Apple Xcode 官方源码编辑器配色（Xcode/Swift 生态最熟悉的暗/亮，跟随系统时配对）。
     static let xcodeDark = TerminalTheme(
         id: "xcode-dark", name: "Xcode 暗色",
         bg: 0x292A30, fg: 0xDFDFE0, caret: 0xDFDFE0,
@@ -152,150 +187,29 @@ struct TerminalTheme: Identifiable {
         ]
     )
 
-    // Apple 终端 .app 经典描述文件「Pro」（黑底）。光标从原版 #4D4D4D
-    // 提亮到浅灰，黑底上才看得见。
-    static let applePro = TerminalTheme(
-        id: "apple-pro", name: "Apple 经典",
-        bg: 0x000000, fg: 0xF2F2F2, caret: 0xC7C7C7,
+    // Everforest 暗色（sainnhe）：低饱和暖森林绿，护眼，与 Catppuccin 同属耐看派。
+    static let everforestDark = TerminalTheme(
+        id: "everforest-dark", name: "Everforest 暗色",
+        bg: 0x2D353B, fg: 0xD3C6AA, caret: 0xD3C6AA,
         ansi: [
-            0x000000, 0x990000, 0x00A600, 0x999900,
-            0x2009DB, 0xB200B2, 0x00A6B2, 0xBFBFBF,
-            0x666666, 0xE50000, 0x00D900, 0xE5E500,
-            0x0000FF, 0xE500E5, 0x00E5E5, 0xE5E5E5,
+            0x343F44, 0xE67E80, 0xA7C080, 0xDBBC7F,
+            0x7FBBB3, 0xD699B6, 0x83C092, 0xD3C6AA,
+            0x868D80, 0xE67E80, 0xA7C080, 0xDBBC7F,
+            0x7FBBB3, 0xD699B6, 0x83C092, 0x9DA9A0,
         ]
     )
 
-    // Apple 终端 .app 经典「Basic」（白底）。
-    static let appleBasic = TerminalTheme(
-        id: "apple-basic", name: "Apple 基础",
-        bg: 0xFFFFFF, fg: 0x000000, caret: 0x7F7F7F,
+    // iTerm2 出厂默认 profile（纯黑 #000000 底 + 浅灰 #C7C7C7 字 + 标志性暗蓝/品红
+    // ANSI）。即终端老用户最熟悉的"iTerm2 那种纯黑"。注意 ANSI 0(黑)=底色，黑字落黑底
+    // 不可见——这是 iTerm2 默认的原貌，照搬不改。
+    static let itermDefault = TerminalTheme(
+        id: "iterm-default", name: "iTerm2 默认（纯黑）",
+        bg: 0x000000, fg: 0xC7C7C7, caret: 0xC7C7C7,
         ansi: [
-            0x000000, 0x990000, 0x00A600, 0x999900,
-            0x0000B2, 0xB200B2, 0x00A6B2, 0xBFBFBF,
-            0x666666, 0xE50000, 0x00D900, 0xBFBF00,
-            0x0000FF, 0xE500E5, 0x00D8D8, 0xE5E5E5,
-        ]
-    )
-
-    // Apple 终端 .app 经典「Ocean」（深蓝底）。光标提亮到白色。
-    static let ocean = TerminalTheme(
-        id: "ocean", name: "深海",
-        bg: 0x224FBC, fg: 0xFFFFFF, caret: 0xFFFFFF,
-        ansi: [
-            0x000000, 0xE64C4C, 0x00A600, 0x999900,
-            0x0000B2, 0xD826D8, 0x00A6B2, 0xBFBFBF,
-            0x808080, 0xFF1A1A, 0x00D900, 0xE5E500,
-            0x7373FF, 0xE500E5, 0x00E5E5, 0xE5E5E5,
-        ]
-    )
-
-    // Apple 终端 .app 经典「Novel」（米色护眼纸张，适合长时间阅读）。
-    static let novel = TerminalTheme(
-        id: "novel", name: "小说",
-        bg: 0xDFDBC3, fg: 0x3B2322, caret: 0x73635A,
-        ansi: [
-            0x000000, 0xCC0000, 0x009600, 0xD06B00,
-            0x0000CC, 0xCC00CC, 0x0087CC, 0xA6A6A6,
-            0x808080, 0xCC0000, 0x009600, 0xD06B00,
-            0x0000CC, 0xCC00CC, 0x0087CC, 0xFFFFFF,
-        ]
-    )
-
-    // macOS 太空灰质感的中性暗色（Spacegray）。
-    static let spacegray = TerminalTheme(
-        id: "spacegray", name: "石墨",
-        bg: 0x20242D, fg: 0xB3B8C3, caret: 0xB3B8C3,
-        ansi: [
-            0x000000, 0xB04B57, 0x87B379, 0xE5C179,
-            0x7D8FA4, 0xA47996, 0x85A7A5, 0xB3B8C3,
-            0x4C4C4C, 0xB04B57, 0x87B379, 0xE5C179,
-            0x7D8FA4, 0xA47996, 0x85A7A5, 0xFFFFFF,
-        ]
-    )
-
-    // MARK: - 社区精品（macOS 上同样耐看）
-
-    // Night Owl：深海军蓝底 + 紫光标。
-    static let nightOwl = TerminalTheme(
-        id: "night-owl", name: "夜枭",
-        bg: 0x011627, fg: 0xD6DEEB, caret: 0x7E57C2,
-        ansi: [
-            0x011627, 0xEF5350, 0x22DA6E, 0xADDB67,
-            0x82AAFF, 0xC792EA, 0x21C7A8, 0xFFFFFF,
-            0x575656, 0xEF5350, 0x22DA6E, 0xFFEB95,
-            0x82AAFF, 0xC792EA, 0x7FDBCA, 0xFFFFFF,
-        ]
-    )
-
-    static let tokyoNight = TerminalTheme(
-        id: "tokyo-night", name: "东京夜",
-        bg: 0x1A1B26, fg: 0xC0CAF5, caret: 0xC0CAF5,
-        ansi: [
-            0x15161E, 0xF7768E, 0x9ECE6A, 0xE0AF68,
-            0x7AA2F7, 0xBB9AF7, 0x7DCFFF, 0xA9B1D6,
-            0x414868, 0xF7768E, 0x9ECE6A, 0xE0AF68,
-            0x7AA2F7, 0xBB9AF7, 0x7DCFFF, 0xC0CAF5,
-        ]
-    )
-
-    static let tokyoNightDay = TerminalTheme(
-        id: "tokyo-night-day", name: "东京日",
-        // 底色较原版 #E1E2E7 提亮半档：原版正文蓝对底仅 4.52（贴 AA 线、偏灰），
-        // 抬底后整组对比同步上升，保留招牌蓝字。
-        bg: 0xEAEBF0, fg: 0x3760BF, caret: 0x3760BF,
-        // 原 port 的「黑」(#E9E9ED) 浅到白底看不见 → 覆盖为东京日的深蓝灰。
-        ansi: [
-            0x343B58, 0xF52A65, 0x587539, 0x8C6C3E,
-            0x2E7DE9, 0x9854F1, 0x007197, 0x6172B0,
-            0xA1A6C5, 0xF52A65, 0x587539, 0x8C6C3E,
-            0x2E7DE9, 0x9854F1, 0x007197, 0x3760BF,
-        ]
-    )
-
-    static let rosePine = TerminalTheme(
-        id: "rose-pine", name: "玫瑰松",
-        bg: 0x191724, fg: 0xE0DEF4, caret: 0xE0DEF4,
-        ansi: [
-            0x26233A, 0xEB6F92, 0x31748F, 0xF6C177,
-            0x9CCFD8, 0xC4A7E7, 0xEBBCBA, 0xE0DEF4,
-            0x6E6A86, 0xEB6F92, 0x31748F, 0xF6C177,
-            0x9CCFD8, 0xC4A7E7, 0xEBBCBA, 0xE0DEF4,
-        ]
-    )
-
-    static let rosePineDawn = TerminalTheme(
-        id: "rose-pine-dawn", name: "玫瑰松·黎明",
-        bg: 0xFAF4ED, fg: 0x575279, caret: 0x575279,
-        // 原 port 的「黑」(#F2E9E1) 几乎与底色同 → 覆盖为正文深色。
-        ansi: [
-            0x575279, 0xB4637A, 0x286983, 0xEA9D34,
-            0x56949F, 0x907AA9, 0xD7827E, 0x575279,
-            0x9893A5, 0xB4637A, 0x286983, 0xEA9D34,
-            0x56949F, 0x907AA9, 0xD7827E, 0x575279,
-        ]
-    )
-
-    static let ayuMirage = TerminalTheme(
-        id: "ayu-mirage", name: "Ayu 薄雾",
-        bg: 0x1F2430, fg: 0xCCCAC2, caret: 0xFFCC66,
-        ansi: [
-            0x171B24, 0xED8274, 0x87D96C, 0xFACC6E,
-            0x6DCBFA, 0xDABAFA, 0x90E1C6, 0xC7C7C7,
-            0x686868, 0xF28779, 0xD5FF80, 0xFFD173,
-            0x73D0FF, 0xDFBFFF, 0x95E6CB, 0xFFFFFF,
-        ]
-    )
-
-    static let ayuLight = TerminalTheme(
-        id: "ayu-light", name: "Ayu 亮色",
-        // 光标从原版亮橙 #FFAA33（近白底对比仅 1.8，难定位）压深一档，
-        // 保留 Ayu 暖橙身份的同时白底可见。
-        bg: 0xF8F9FA, fg: 0x5C6166, caret: 0xE6900A,
-        ansi: [
-            0x000000, 0xEA6C6D, 0x6CBF43, 0xECA944,
-            0x3199E1, 0x9E75C7, 0x46BA94, 0xBABABA,
-            0x686868, 0xF07171, 0x86B300, 0xF2AE49,
-            0x399EE6, 0xA37ACC, 0x4CBF99, 0xD1D1D1,
+            0x000000, 0xC91B00, 0x00C200, 0xC7C400,
+            0x0225C7, 0xCA30C7, 0x00C5C7, 0xC7C7C7,
+            0x686868, 0xFF6E67, 0x5FFA68, 0xFFFC67,
+            0x6871FF, 0xFF77FF, 0x60FDFF, 0xFFFFFF,
         ]
     )
 
@@ -307,37 +221,6 @@ struct TerminalTheme: Identifiable {
     var isLight: Bool {
         let r = Double((bg >> 16) & 0xFF), g = Double((bg >> 8) & 0xFF), b = Double(bg & 0xFF)
         return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.5
-    }
-
-    /// 明暗配对：跟随系统时，用户只选一个主题，系统切到另一侧外观时
-    /// 自动换到配对款（官方亮暗对优先，无配对的暗色日间统一用 Latte）。
-    static func counterpart(of id: String, wantLight: Bool) -> String {
-        let t = by(id: id)
-        if t.isLight == wantLight { return t.id }
-        switch id {
-        case "catppuccin-mocha": return "catppuccin-latte"
-        case "catppuccin-latte": return "catppuccin-mocha"
-        case "relay-dark": return "light"
-        case "light": return "relay-dark"
-        case "xcode-dark": return "xcode-light"
-        case "xcode-light": return "xcode-dark"
-        case "apple-pro": return "apple-basic"
-        case "apple-basic": return "apple-pro"
-        case "tokyo-night": return "tokyo-night-day"
-        case "tokyo-night-day": return "tokyo-night"
-        case "rose-pine": return "rose-pine-dawn"
-        case "rose-pine-dawn": return "rose-pine"
-        case "ayu-mirage": return "ayu-light"
-        case "ayu-light": return "ayu-mirage"
-        case "ocean": return "novel"          // 深蓝夜 ↔ 米色纸张：苹果氛围一对
-        case "novel": return "ocean"
-        case "spacegray": return "catppuccin-latte"   // 冷灰暗 → 冷灰白，调性更贴（单向，无亮色对）
-        case "night-owl": return "tokyo-night-day"    // 深海军蓝 → 冷灰蓝亮色（单向）
-        // 无显式配对时：暗色款日间回退 Catppuccin Latte，亮色款夜间回退 relay-dark。
-        // 单向配对不会丢失用户选择 —— effectiveThemeId 始终从稳定的 settings.theme
-        // 纯函数推导，系统切回主题原生那一侧时上方 isLight==wantLight 直接原样返回。
-        default: return wantLight ? "catppuccin-latte" : "relay-dark"
-        }
     }
 
     /// 应用配色与字体到一个终端视图。bgAlpha<1 = 半透明模式：终端自身
