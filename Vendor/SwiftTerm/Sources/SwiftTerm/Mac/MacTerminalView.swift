@@ -622,10 +622,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func linefeed(source: Terminal) {
-        // Preserve manual selection while output is streaming when mouse reporting is disabled.
-        if allowMouseReporting {
-            selection.selectNone()
-        }
+        // Relay patch: 不再因「程序开了鼠标上报」就在每个换行清掉选区。
+        // 现在普通拖拽默认本地划选（见 mouseReportingRequested），用户要从流式
+        // 输出的 Claude Code/Codex 里选词复制；若每来一行就 selectNone()，刚选中的
+        // 文字会被瞬间抹掉，等于选不了。键入时 keyDown 已会清选区，故这里保留选区
+        // 不会和「输入即清」冲突——只保住用户主动划下、尚未输入覆盖的那次选择。
     }
     
     /// This vaiable controls whether mouse events are sent to the application running under the
@@ -2132,15 +2133,16 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
     
-    /// 终端通用约定：按住 Shift / Option / ⌘ 时，临时绕过鼠标上报
-    /// （mouse reporting），改走本地手势。这样即使 TUI（vim/tmux/
-    /// Claude Code/Codex 等）开启了鼠标追踪，用户仍可：Shift/Option 选中复制，
-    /// ⌘ 点击打开屏幕里的文件路径（见 mouseUp 的 ⌘-click 分支）。⌘ 是 GUI 修饰键，
-    /// 本就不该把点击泄漏给 TUI，对应 iTerm2 ⌘-click 语义历史的本地手势约定。
+    /// Relay patch（鼠标选择优先）：本产品是 AI agent 终端，从运行中的
+    /// Claude Code/Codex 里划选、复制输出是高频核心动作。因此反转了终端的
+    /// 默认优先级——普通拖拽 **始终做本地划选**，即使 TUI（vim/tmux/
+    /// Claude Code/Codex 等）开了鼠标追踪。只有按住 ⌥(Option) 拖拽，才把鼠标
+    /// 交还给程序（mouse reporting），让其自身的点击/拖拽 UI 仍可用。
+    /// ⇧ 走本地选区扩展、⌘ 走链接/路径点击（见 mouseUp 的 ⌘-click 分支），
+    /// 二者都不转发给程序。返回 true 表示「这一手势要交给程序上报」。
     @inline(__always)
-    func mouseReportingBypassed(with event: NSEvent) -> Bool {
-        let f = event.modifierFlags
-        return f.contains(.shift) || f.contains(.option) || f.contains(.command)
+    func mouseReportingRequested(with event: NSEvent) -> Bool {
+        return event.modifierFlags.contains(.option)
     }
 
     /// Relay patch: ⌘-click 命中的「裸文件路径」回调（非 URL，与 OSC 8 超链接分开）。
@@ -2192,11 +2194,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     public override func mouseDown(with event: NSEvent) {
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() && !mouseReportingBypassed(with: event) {
+        if allowMouseReporting && terminal.mouseMode.sendButtonPress() && mouseReportingRequested(with: event) {
             sharedMouseEvent(with: event)
             return
         }
-        
+
         let hit = calculateMouseHit(with: event).grid
         
         switch event.clickCount {
@@ -2244,7 +2246,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             onRequestOpenLocalPath?(token)
             return
         }
-        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() && !mouseReportingBypassed(with: event) {
+        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() && mouseReportingRequested(with: event) {
             sharedMouseEvent(with: event)
             return
         }
@@ -2261,7 +2263,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let displayBuffer = terminal.displayBuffer
         let mouseHit = calculateMouseHit(with: event)
         let hit = mouseHit.grid
-        if allowMouseReporting && !mouseReportingBypassed(with: event) {
+        if allowMouseReporting && mouseReportingRequested(with: event) {
             if terminal.mouseMode.sendMotionEvent() {
                 let flags = encodeMouseEvent(with: event)
                 let screenRow = max (0, min (displayBuffer.rows - 1, hit.row - displayBuffer.yDisp))
@@ -2423,8 +2425,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             reportLink(at: hit.grid)
         }
         updateHoverLink(at: hit.grid)
-        
-        if terminal.mouseMode.sendMotionEvent() {
+
+        // Relay patch: 悬停上报同样只在按住 ⌥ 时才转发给程序，与拖拽一致——
+        // 不按 ⌥ 时程序完全拿不到鼠标，终端这边专心做本地划选/链接悬停。
+        if terminal.mouseMode.sendMotionEvent() && mouseReportingRequested(with: event) {
             let flags = encodeMouseEvent(with: event, overwriteRelease: true)
             terminal.sendMotion(buttonFlags: flags, x: hit.grid.col, y: hit.grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
