@@ -250,7 +250,16 @@ final class SessionStore: ObservableObject {
             Diagnostics.shared.log(.warn, "起始目录不可用（\(cwd)），任务起在 home，首命令将在 home 执行。")
         }
         if let cmd = starter?.trimmingCharacters(in: .whitespacesAndNewlines), !cmd.isEmpty {
-            pendingStarter[s.id] = cmd
+            // claude 支持启动期指定会话 id：生成 uuid 注入 `--session-id`，并把 id 落盘
+            // 到本会话，重开时据此 `--resume <id>` 精确续接（见 resumeCommand）。codex
+            // 无对应入参，自定义命令也不擅改 —— 原样发送，恢复时回落 cwd 过滤的 --last。
+            if cmd == "claude", let i = sessions.firstIndex(where: { $0.id == s.id }) {
+                let sid = UUID().uuidString.lowercased()
+                sessions[i].agentSessionId = sid
+                pendingStarter[s.id] = "claude --session-id \(sid)"
+            } else {
+                pendingStarter[s.id] = cmd
+            }
         }
         show(s.id)
         persistSessions()
@@ -848,7 +857,7 @@ final class SessionStore: ObservableObject {
         // 不用固定延时——login shell 启动慢会在提示符出现前误执行残缺命令；
         // 改由 autoResume 等「shell 已输出且静默一小段」再发，并有超时兜底。
         if restoredIds.remove(id) != nil,
-           let kind = session?.kind, let cmd = resumeCommand(for: kind) {
+           let session, let cmd = resumeCommand(for: session) {
             autoResume(id: id, cmd: cmd, view: v, started: Date())
         }
         // 新建任务引导指定的首条命令：同样等提示符就绪再发（复用 autoResume）。
@@ -878,12 +887,40 @@ final class SessionStore: ObservableObject {
     }
 
     /// 恢复 agent 会话要执行的 resume 命令（不含回车；autoResume 发送时补 \r）。
-    private func resumeCommand(for kind: WindowType) -> String? {
-        switch kind {
-        case .claude: return "claude --continue"
-        case .codex: return "codex resume --last"
-        default: return nil
+    /// claude：有落盘的 agentSessionId 且该会话文件仍在 → `--resume <id>` 精确续到
+    /// 本标签那次对话；否则回落 `--continue`（取该 cwd 最近一次）。codex 无启动期
+    /// 指定 id 的入参，走 `resume --last`（codex 自身已按 cwd 过滤）。
+    /// 注：按 kind 分发是有意的——claude 退出后 applyReclassify 会把 kind 降级回
+    /// .shell，此时即便 agentSessionId 在盘上也不自动续。意图是「只续退出 Relay 时
+    /// 仍在跑的 agent」（那才是‘进行中的任务’）；用户已结束的 claude 标签按 shell
+    /// 恢复，不擅自重新拉起 claude。
+    private func resumeCommand(for session: Session) -> String? {
+        switch session.kind {
+        case .claude:
+            if let sid = session.agentSessionId, claudeSessionExists(id: sid) {
+                return "claude --resume \(sid)"
+            }
+            return "claude --continue"
+        case .codex:
+            return "codex resume --last"
+        default:
+            return nil
         }
+    }
+
+    /// claude 会话是否仍可恢复：在 `~/.claude/projects/` 各项目目录下找 `<id>.jsonl`。
+    /// id 是 Relay 用 `--session-id` 注入的 UUID，全局唯一，按文件名扫描即命中——
+    /// 不去复刻 claude 的 cwd→目录名编码（实测它把 '/'、'.'、'_'、空格等所有非字母
+    /// 数字字符都换成 '-'，还会先解析符号链接；自拼 slug 极易漏判而静默退化为
+    /// --continue）。找不到（id 失效/被清/跨机）→ 回落 --continue，避免 `--resume
+    /// <失效id>` 在 shell 留报错死提示符。projects 目录数量级几十到几百，扫描成本可忽略。
+    private func claudeSessionExists(id: String) -> Bool {
+        let projects = FileManager.default.homeDirectoryForCurrentUser.path + "/.claude/projects"
+        guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: projects) else { return false }
+        for d in dirs where FileManager.default.fileExists(atPath: "\(projects)/\(d)/\(id).jsonl") {
+            return true
+        }
+        return false
     }
 
     /// 恢复的 agent 会话自动继续：轮询等「提示符就绪」——shell 已产生过输出、

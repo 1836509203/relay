@@ -48,6 +48,11 @@ struct Session: Identifiable, Codable, Equatable {
     /// 上次的工作目录（proc_pidinfo 读子 shell cwd 落盘）；重开时在此目录启动
     /// shell。旧版 sessions.json 缺此 key → nil → 回落 home。
     var cwd: String?
+    /// claude 会话 id：新建 claude 会话时以 `claude --session-id <uuid>` 指定并落盘，
+    /// 重开时据此 `claude --resume <id>` 精确续到本标签那次对话——而非 `--continue`
+    /// 取"最近一次"导致同目录多标签续错。codex 无启动期指定 id 的入参，仍走 cwd
+    /// 过滤的 `resume --last`。旧版 sessions.json 缺此 key → nil → 回落 --continue。
+    var agentSessionId: String?
 }
 
 /// 侧栏显示用的派生阶段。
