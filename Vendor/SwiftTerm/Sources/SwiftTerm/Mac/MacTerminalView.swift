@@ -2428,12 +2428,74 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if event.deltaY == 0 {
             return
         }
-        flashScroller()
         let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
-        if event.deltaY > 0 {
+        let goingUp = event.deltaY > 0
+
+        // Relay patch: alternate-screen scroll. Fullscreen apps (vim, less,
+        // htop, man, …) run on the alternate buffer, which has no scrollback —
+        // local scrollUp/scrollDown are no-ops there, so the wheel did nothing.
+        // Match iTerm2/Terminal.app/Ghostty and forward the gesture to the app:
+        //   • app enabled mouse tracking (e.g. `vim` with `set mouse=a`) →
+        //     send the wheel as SGR/X10 mouse reports (buttons 4/5);
+        //   • otherwise → "alternate scroll mode": send cursor Up/Down keys
+        //     (respecting DECCKM), so a plain `vim`/`less` scrolls its content.
+        // A held modifier (shift/option/command) keeps falling through to the
+        // local path, consistent with mouseReportingBypassed elsewhere.
+        if terminal.isDisplayBufferAlternate && !mouseReportingBypassed(with: event) {
+            // Discrete notched wheels report one tick at a time (velocity 1);
+            // give them the xterm `alternateScroll` convention of ~3 lines per
+            // notch so vim/less scroll at the expected pace. Trackpads/Magic
+            // Mouse (precise deltas) already stream smoothly, so keep their
+            // velocity-based count to avoid over-accelerating the app.
+            let lines = event.hasPreciseScrollingDeltas ? velocity : max (velocity, 3)
+            if allowMouseReporting && terminal.mouseMode != .off {
+                sendAlternateMouseWheel(up: goingUp, lines: lines, event: event)
+            } else {
+                sendAlternateScrollKeys(up: goingUp, lines: lines)
+            }
+            return
+        }
+
+        flashScroller()
+        if goingUp {
             scrollUp (lines: velocity)
         } else {
             scrollDown(lines: velocity)
+        }
+    }
+
+    // Relay patch: cap how many line-events one physical gesture forwards to the
+    // app, so a fast trackpad flick (velocity up to `rows`) can't flood it.
+    private static let alternateScrollLineCap = 10
+
+    /// Relay patch: alternate-scroll — translate the wheel into cursor Up/Down
+    /// key presses for apps that don't track the mouse (default `vim`, `less`,
+    /// `man`). Honors DECCKM (applicationCursor) like real keystrokes do.
+    private func sendAlternateScrollKeys(up: Bool, lines: Int) {
+        let seq = up
+            ? (terminal.applicationCursor ? EscapeSequences.moveUpApp : EscapeSequences.moveUpNormal)
+            : (terminal.applicationCursor ? EscapeSequences.moveDownApp : EscapeSequences.moveDownNormal)
+        let count = max (1, min (lines, Self.alternateScrollLineCap))
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(seq.count * count)
+        for _ in 0..<count { bytes.append(contentsOf: seq) }
+        send(bytes)
+    }
+
+    /// Relay patch: send the wheel as mouse-button reports (button 4 = up,
+    /// 5 = down) for apps that enabled mouse tracking, so e.g. `vim` with
+    /// `set mouse=a` scrolls. One report per line, capped like the key path.
+    private func sendAlternateMouseWheel(up: Bool, lines: Int, event: NSEvent) {
+        let displayBuffer = terminal.displayBuffer
+        let hit = calculateMouseHit(with: event)
+        let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
+        let flags = event.modifierFlags
+        let buttonFlags = terminal.encodeButton(
+            button: up ? 4 : 5, release: false,
+            shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+        let count = max (1, min (lines, Self.alternateScrollLineCap))
+        for _ in 0..<count {
+            terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
     }
 
