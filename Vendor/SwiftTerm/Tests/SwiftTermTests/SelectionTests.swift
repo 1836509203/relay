@@ -122,6 +122,32 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.encodeScrollWheelEvent(deltaY: -1, modifierFlags: []) == 65)
         #expect(view.encodeScrollWheelEvent(deltaY: 1, modifierFlags: [.option]) == 72)
     }
+
+    @Test func testForwardedScrollWheelUsesModerateAcceleration() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+
+        #expect(view.forwardedScrollWheelSteps(forNormalizedDelta: 1) == 1)
+        #expect(view.forwardedScrollWheelSteps(forNormalizedDelta: 4) == 2)
+        #expect(view.forwardedScrollWheelSteps(forNormalizedDelta: 12) == 3)
+    }
+
+    @Test func testLocalScrollWheelUsesModerateAcceleration() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+
+        #expect(view.localScrollWheelLines(forNormalizedDelta: 1) == 1)
+        #expect(view.localScrollWheelLines(forNormalizedDelta: 2) == 2)
+        #expect(view.localScrollWheelLines(forNormalizedDelta: 5) == 4)
+        #expect(view.localScrollWheelLines(forNormalizedDelta: 12) == 6)
+    }
+
+    @Test func testPreciseScrollDeltaNormalizesByCellHeight() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delta = view.normalizedScrollWheelDelta(deltaY: 100,
+                                                   scrollingDeltaY: view.cellDimension.height * 2,
+                                                   hasPreciseScrollingDeltas: true)
+
+        #expect(delta == 2)
+    }
 #endif
 
     @Test func testSelectedTextSurvivesScrollbackRecycleUntilTrimmed() {

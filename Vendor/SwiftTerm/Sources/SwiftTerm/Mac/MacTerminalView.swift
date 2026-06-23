@@ -2135,14 +2135,52 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     private func sendScrollWheelEvent (with event: NSEvent)
     {
+        let delta = normalizedScrollWheelDelta(deltaY: event.deltaY,
+                                               scrollingDeltaY: event.scrollingDeltaY,
+                                               hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas)
         let displayBuffer = terminal.displayBuffer
         let hit = calculateMouseHit(with: event)
-        let buttonFlags = encodeScrollWheelEvent(deltaY: event.deltaY, modifierFlags: event.modifierFlags)
+        let buttonFlags = encodeScrollWheelEvent(deltaY: delta, modifierFlags: event.modifierFlags)
         let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
-        let steps = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
+        let steps = forwardedScrollWheelSteps(forNormalizedDelta: delta)
         for _ in 0..<steps {
             terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
+    }
+
+    func normalizedScrollWheelDelta (deltaY: CGFloat, scrollingDeltaY: CGFloat, hasPreciseScrollingDeltas: Bool) -> CGFloat
+    {
+        if hasPreciseScrollingDeltas && scrollingDeltaY != 0 {
+            return scrollingDeltaY / max (cellDimension.height, 1)
+        }
+        return deltaY
+    }
+
+    func localScrollWheelLines (forNormalizedDelta delta: CGFloat) -> Int
+    {
+        let magnitude = abs (delta)
+        if magnitude >= 10 {
+            return 6
+        }
+        if magnitude >= 5 {
+            return 4
+        }
+        if magnitude >= 2 {
+            return 2
+        }
+        return 1
+    }
+
+    func forwardedScrollWheelSteps (forNormalizedDelta delta: CGFloat) -> Int
+    {
+        let magnitude = abs (delta)
+        if magnitude >= 10 {
+            return 3
+        }
+        if magnitude >= 4 {
+            return 2
+        }
+        return 1
     }
     
     private var autoScrollDelta = 0
@@ -2466,7 +2504,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     public override func scrollWheel(with event: NSEvent) {
-        if event.deltaY == 0 {
+        let delta = normalizedScrollWheelDelta(deltaY: event.deltaY,
+                                               scrollingDeltaY: event.scrollingDeltaY,
+                                               hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas)
+        if delta == 0 {
             return
         }
         if shouldForwardScrollWheelToApplication(modifierFlags: event.modifierFlags) {
@@ -2474,8 +2515,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
         flashScroller()
-        let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
-        if event.deltaY > 0 {
+        let velocity = localScrollWheelLines(forNormalizedDelta: delta)
+        if delta > 0 {
             scrollUp (lines: velocity)
         } else {
             scrollDown(lines: velocity)
