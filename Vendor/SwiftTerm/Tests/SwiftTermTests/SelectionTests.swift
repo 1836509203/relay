@@ -76,7 +76,42 @@ final class SelectionTests: TerminalDelegate {
         view.scrollTo(row: 1)
         #expect(view.calculateMouseHit(at: CGPoint(x: 0, y: 10)).grid.row == 1)
     }
+
+    @Test func testFeedDoesNotClearSelectionWhileMouseReportingAllowed() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.allowMouseReporting = true
+        view.feed(text: "Claude output line\nCodex output line\n")
+
+        view.selection.startSelection(row: 0, col: 0)
+        view.selection.dragExtend(row: 0, col: 6)
+        #expect(view.selection.active)
+        #expect(view.getSelection() == "Claude")
+
+        view.feed(text: "streaming update\n")
+
+        #expect(view.selection.active)
+        #expect(view.getSelection() == "Claude")
+    }
 #endif
+
+    @Test func testSelectedTextSurvivesScrollbackRecycleUntilTrimmed() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal(cols: 12, rows: 2, scrollback: 2)
+        let selection = SelectionService(terminal: terminal)
+        terminal.feed(text: "zero\r\none\r\ntwo")
+
+        selection.setSelection(start: Position(col: 0, row: 1), end: Position(col: 3, row: 1))
+        #expect(selection.getSelectedText() == "one")
+
+        terminal.feed(text: "\r\nthree\r\nfour")
+
+        #expect(selection.active)
+        #expect(selection.getSelectedText() == "one")
+
+        terminal.feed(text: "\r\nfive")
+        selection.synchronizeWithBufferTop()
+
+        #expect(!selection.active)
+    }
 
     // MARK: - Selection Tests Ported from Ghostty
 

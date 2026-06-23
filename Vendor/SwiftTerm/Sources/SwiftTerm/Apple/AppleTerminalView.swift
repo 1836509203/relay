@@ -870,6 +870,7 @@ extension TerminalView {
     
     /// Returns the selection range for the specified row, if any.
     func selectedColumnsRange(row: Int, cols: Int) -> Range<Int>? {
+        selection.synchronizeWithBufferTop()
         guard let selection = self.selection, selection.active else {
             return nil
         }
@@ -1767,19 +1768,32 @@ extension TerminalView {
     // The code below is intended to not repaint too often, which can produce flicker, for example
     // when the user refreshes the display, and this repains the screen, as dispatch delivers data
     // in blocks of 1024 bytes, which is not enough to cover the whole screen, so this delays
-    // the update for a 1/600th of a second.
+    // the update until the next display frame.
     //
     // It is also cheap, so should be called when new data has been posted or received.
+    private func displayFrameDelayNanoseconds() -> UInt64 {
+        #if os(macOS)
+        #if canImport(MetalKit)
+        if metalView != nil {
+            let screenFPS = window?.screen?.maximumFramesPerSecond
+                ?? NSScreen.main?.maximumFramesPerSecond
+                ?? 60
+            let fps = max(60, min(screenFPS, 120))
+            return UInt64(1_000_000_000 / fps)
+        }
+        #endif
+        #endif
+        return UInt64(1_000_000_000 / 60)
+    }
+
     func queuePendingDisplay ()
     {
         // throttle
         if !pendingDisplay {
-            let fps60 = 16670000
-            // let fps30 = 16670000*2
-            let fpsDelay = fps60
+            let fpsDelay = displayFrameDelayNanoseconds()
             pendingDisplay = true
             DispatchQueue.main.asyncAfter(
-                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
+                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + fpsDelay),
                 execute: updateDisplay)
         }
     }
@@ -1797,11 +1811,10 @@ extension TerminalView {
             return
         }
         if !pendingMetalDisplay {
-            let fps60 = 16670000
-            let fpsDelay = fps60
+            let fpsDelay = displayFrameDelayNanoseconds()
             pendingMetalDisplay = true
             DispatchQueue.main.asyncAfter(
-                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay))) { [weak self] in
+                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + fpsDelay)) { [weak self] in
                     guard let self else { return }
                     self.pendingMetalDisplay = false
                     self.metalView?.setNeedsDisplay(self.metalView?.bounds ?? .zero)
@@ -1969,15 +1982,23 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
+#if os(macOS)
+        // Relay patch: keep user selections while agent TUIs stream output.
+        // MacTerminalView routes plain dragging to local selection even when the
+        // app enabled mouse reporting; clearing here made Claude/Codex erase the
+        // selection on the next PTY chunk.
+#else
         // Preserve manual selection while output is streaming when mouse reporting is disabled.
         if allowMouseReporting {
             selection.active = false
         }
+#endif
         startDisplayUpdates()
     }
     
     func feedFinish ()
     {
+        selection.synchronizeWithBufferTop()
         suspendDisplayUpdates ()
         queuePendingDisplay()
     }
@@ -2016,6 +2037,7 @@ extension TerminalView {
     public func changeScrollback (_ newScrollback: Int?)
     {
         terminal.changeScrollback(newScrollback)
+        selection.synchronizeWithBufferTop()
         updateScroller()
         terminalDelegate?.scrolled(source: self, position: scrollPosition)
         queuePendingDisplay()
@@ -2318,7 +2340,8 @@ extension TerminalView {
     /// Set to true if the selection is active, false otherwise
     public var selectionActive: Bool {
         get {
-            selection.active
+            selection.synchronizeWithBufferTop()
+            return selection.active
         }
     }
     
@@ -2326,6 +2349,7 @@ extension TerminalView {
     /// Returns the contents of the selection, if active, or nil otherwise
     public func getSelection () -> String?
     {
+        selection.synchronizeWithBufferTop()
         if selection.active {
             return selection.getSelectedText()
         }

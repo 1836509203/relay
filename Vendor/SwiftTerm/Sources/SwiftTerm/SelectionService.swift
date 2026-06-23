@@ -22,8 +22,9 @@ class SelectionService: CustomDebugStringConvertible {
         _active = false
         start = Position(col: 0, row: 0)
         end = Position(col: 0, row: 0)
-        pivot = Position(col: 0, row: 0)
+        pivot = nil
         hasSelectionRange = false
+        observedLinesTop = terminal.displayBuffer.linesTop
     }
     
     /**
@@ -70,6 +71,53 @@ class SelectionService: CustomDebugStringConvertible {
      * Used to track the pivot point when selection in iOS-style selection
      */
     public var pivot: Position? 
+    private var observedLinesTop: Int
+
+    private func rememberCurrentBufferTop() {
+        observedLinesTop = terminal.displayBuffer.linesTop
+    }
+
+    /// Keeps selection row coordinates aligned with the current display buffer.
+    /// When scrollback recycles rows from the top, logical buffer indices shift
+    /// down; selections that still exist must shift with them, while selections
+    /// touching recycled content are no longer safe to copy.
+    public func synchronizeWithBufferTop() {
+        let currentLinesTop = terminal.displayBuffer.linesTop
+        let trimmedRows = currentLinesTop - observedLinesTop
+
+        if trimmedRows == 0 {
+            return
+        }
+
+        observedLinesTop = currentLinesTop
+
+        guard active else {
+            return
+        }
+
+        guard trimmedRows > 0 else {
+            selectNone()
+            return
+        }
+
+        let firstSelectedRow = min(start.row, end.row)
+        if firstSelectedRow < trimmedRows {
+            selectNone()
+            return
+        }
+
+        start.row -= trimmedRows
+        end.row -= trimmedRows
+        if var currentPivot = pivot {
+            if currentPivot.row < trimmedRows {
+                selectNone()
+                return
+            }
+            currentPivot.row -= trimmedRows
+            pivot = currentPivot
+        }
+        terminal.tdel?.selectionChanged(source: terminal)
+    }
 
     /**
      * Returns the selection ending point in buffer coordinates
@@ -90,8 +138,10 @@ class SelectionService: CustomDebugStringConvertible {
      */
     public func startSelection (row: Int, col: Int)
     {
+        synchronizeWithBufferTop()
         setSoftStart(row: row, col: col)
         selectionMode = .character
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
         
@@ -103,6 +153,7 @@ class SelectionService: CustomDebugStringConvertible {
      * Sets the selection, this is validated against the
      */
     public func setSelection (start: Position, end: Position) {
+        synchronizeWithBufferTop()
         let buffer = terminal.displayBuffer
         let sclamped = clamp (buffer, start)
         let eclamped = clamp (buffer, end)
@@ -110,6 +161,7 @@ class SelectionService: CustomDebugStringConvertible {
         self.start = sclamped
         self.end = eclamped
         
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
     
@@ -118,9 +170,11 @@ class SelectionService: CustomDebugStringConvertible {
      */
     public func startSelection ()
     {
+        synchronizeWithBufferTop()
         end = start
         selectingRows = false
         selectionMode = .character
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
     
@@ -145,8 +199,10 @@ class SelectionService: CustomDebugStringConvertible {
      * The locoation is buffer-relative
      */
     public func setSoftStart (bufferPosition: Position) {
+        synchronizeWithBufferTop()
         start = bufferPosition
         end = bufferPosition
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
     
@@ -181,6 +237,7 @@ class SelectionService: CustomDebugStringConvertible {
      * The bufferPosition is buffer-relative
      */
     public func shiftExtend (bufferPosition newEnd: Position) {
+        synchronizeWithBufferTop()
         var adjustedNewEnd = newEnd
         
         // If we're in word selection mode, extend to word boundaries
@@ -207,6 +264,7 @@ class SelectionService: CustomDebugStringConvertible {
         }
         end = adjustedNewEnd
         
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
     
@@ -229,6 +287,7 @@ class SelectionService: CustomDebugStringConvertible {
      * The position is buffer-relative, for screen relative, use `pivotExtend(row:col:)`
      */
     public func pivotExtend (bufferPosition: Position) {
+        synchronizeWithBufferTop()
         guard let pivot = pivot else {
             return
         }
@@ -253,6 +312,7 @@ class SelectionService: CustomDebugStringConvertible {
             end = pivot
         }
         
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
     
@@ -270,6 +330,7 @@ class SelectionService: CustomDebugStringConvertible {
      * The position is in buffer coordinates
      */
     public func dragExtend (bufferPosition: Position) {
+        synchronizeWithBufferTop()
         var adjustedEnd = bufferPosition
         
         // If we're in word selection mode, extend to word boundaries
@@ -279,6 +340,7 @@ class SelectionService: CustomDebugStringConvertible {
         }
         
         end = adjustedEnd
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
     
@@ -287,12 +349,14 @@ class SelectionService: CustomDebugStringConvertible {
      */
     public func selectAll ()
     {
+        synchronizeWithBufferTop()
         // Relay patch: bound by count, not maxLength — copying the selection
         // walks every row in range, and the CircularList subscript
         // materializes empty slots, inflating an idle 10k-scrollback
         // buffer by ~30MB on a single ⌘A.
         start = Position(col: 0, row: 0)
         end = Position(col: terminal.cols-1, row: max (terminal.displayBuffer.lines.count - 1, 0))
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
     
@@ -312,10 +376,12 @@ class SelectionService: CustomDebugStringConvertible {
      */
     public func select(row: Int)
     {
+        synchronizeWithBufferTop()
         start = Position(col: 0, row: row)
         end = Position(col: terminal.cols-1, row: row)
         selectingRows = true
         selectionMode = .row
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
 
@@ -492,6 +558,7 @@ class SelectionService: CustomDebugStringConvertible {
      */
     public func selectWordOrExpression (at uncheckedPosition: Position, in buffer: Buffer)
     {
+        synchronizeWithBufferTop()
 //        let position = Position(
 //            col: max (min (uncheckedPosition.col, buffer.cols-1), 0),
 //            row: max (min (uncheckedPosition.row, buffer.rows-1+buffer.yDisp), buffer.yDisp))
@@ -523,6 +590,7 @@ class SelectionService: CustomDebugStringConvertible {
             end = position
         }
         selectionMode = .word
+        rememberCurrentBufferTop()
         setActiveAndNotify()
     }
     
@@ -538,6 +606,10 @@ class SelectionService: CustomDebugStringConvertible {
     }
     
     public func getSelectedText () -> String {
+        synchronizeWithBufferTop()
+        guard active else {
+            return ""
+        }
         let (min, max) = if Position.compare(start, end) == .before {
             (start, end)
         } else {
