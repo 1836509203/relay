@@ -2118,6 +2118,32 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
         terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
     }
+
+    func encodeScrollWheelEvent (deltaY: CGFloat, modifierFlags: NSEvent.ModifierFlags) -> Int
+    {
+        let button = deltaY > 0 ? 4 : 5
+        return terminal.encodeButton(button: button, release: false, shift: modifierFlags.contains(.shift), meta: modifierFlags.contains(.option), control: modifierFlags.contains(.control))
+    }
+
+    func shouldForwardScrollWheelToApplication (modifierFlags: NSEvent.ModifierFlags) -> Bool
+    {
+        guard allowMouseReporting && terminal.mouseMode.sendButtonPress() else {
+            return false
+        }
+        return terminal.isDisplayBufferAlternate || mouseReportingRequested(modifierFlags: modifierFlags)
+    }
+
+    private func sendScrollWheelEvent (with event: NSEvent)
+    {
+        let displayBuffer = terminal.displayBuffer
+        let hit = calculateMouseHit(with: event)
+        let buttonFlags = encodeScrollWheelEvent(deltaY: event.deltaY, modifierFlags: event.modifierFlags)
+        let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
+        let steps = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
+        for _ in 0..<steps {
+            terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+        }
+    }
     
     private var autoScrollDelta = 0
     // Callback from when the mouseDown autoscrolling timer goes off
@@ -2142,7 +2168,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// 二者都不转发给程序。返回 true 表示「这一手势要交给程序上报」。
     @inline(__always)
     func mouseReportingRequested(with event: NSEvent) -> Bool {
-        return event.modifierFlags.contains(.option)
+        return mouseReportingRequested(modifierFlags: event.modifierFlags)
+    }
+
+    @inline(__always)
+    func mouseReportingRequested(modifierFlags: NSEvent.ModifierFlags) -> Bool {
+        return modifierFlags.contains(.option)
     }
 
     /// Relay patch: ⌘-click 命中的「裸文件路径」回调（非 URL，与 OSC 8 超链接分开）。
@@ -2436,6 +2467,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     public override func scrollWheel(with event: NSEvent) {
         if event.deltaY == 0 {
+            return
+        }
+        if shouldForwardScrollWheelToApplication(modifierFlags: event.modifierFlags) {
+            sendScrollWheelEvent(with: event)
             return
         }
         flashScroller()

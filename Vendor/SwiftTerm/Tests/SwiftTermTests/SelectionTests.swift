@@ -7,6 +7,9 @@
 
 import Foundation
 import Testing
+#if os(macOS)
+import AppKit
+#endif
 
 @testable import SwiftTerm
 
@@ -91,6 +94,33 @@ final class SelectionTests: TerminalDelegate {
 
         #expect(view.selection.active)
         #expect(view.getSelection() == "Claude")
+    }
+
+    @Test func testScrollWheelStaysLocalInNormalBufferByDefault() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.allowMouseReporting = true
+        view.feed(text: "\u{1b}[?1000h")
+
+        #expect(!view.terminal.isDisplayBufferAlternate)
+        #expect(!view.shouldForwardScrollWheelToApplication(modifierFlags: []))
+    }
+
+    @Test func testScrollWheelForwardsInAlternateBufferWithMouseTracking() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.allowMouseReporting = true
+        view.feed(text: "\u{1b}[?1049h\u{1b}[?1000h")
+
+        #expect(view.terminal.isDisplayBufferAlternate)
+        #expect(view.shouldForwardScrollWheelToApplication(modifierFlags: []))
+    }
+
+    @Test func testScrollWheelEncodesXtermWheelButtons() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1b}[?1000h")
+
+        #expect(view.encodeScrollWheelEvent(deltaY: 1, modifierFlags: []) == 64)
+        #expect(view.encodeScrollWheelEvent(deltaY: -1, modifierFlags: []) == 65)
+        #expect(view.encodeScrollWheelEvent(deltaY: 1, modifierFlags: [.option]) == 72)
     }
 #endif
 
