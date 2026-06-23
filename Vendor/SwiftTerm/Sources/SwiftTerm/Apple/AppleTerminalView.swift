@@ -1926,21 +1926,23 @@ extension TerminalView {
         userScrolling = false
     }
     
-    public func scrollTo (row: Int, notifyAccessibility: Bool = true)
+    public func scrollTo (row: Int, notifyAccessibility: Bool = true, immediateDisplay: Bool = true)
     {
         let displayBuffer = terminal.displayBuffer
         if row != displayBuffer.yDisp {
             terminal.setViewYDisp (row)
-            
-            // tell the terminal we want to refresh all the rows
             terminal.refresh (startRow: 0, endRow: terminal.rows)
-            
-            // do the display update
-            updateDisplay (notifyAccessibility: notifyAccessibility)
-            //selectionView.notifyScrolled(source: terminal)
-            terminalDelegate?.scrolled (source: self, position: scrollPosition)
-            updateScroller()
-            setNeedsDisplay(frame)
+            if immediateDisplay {
+                updateDisplay (notifyAccessibility: notifyAccessibility)
+                terminalDelegate?.scrolled (source: self, position: scrollPosition)
+                updateScroller()
+                setNeedsDisplay(frame)
+            } else {
+                #if os(macOS)
+                scrollerRefreshPending = true
+                #endif
+                queuePendingDisplay()
+            }
         }
     }
     
@@ -1965,18 +1967,18 @@ extension TerminalView {
     }
 
     /// Scrolls up the content of the terminal the specified number of lines
-    public func scrollUp (lines: Int)
+    public func scrollUp (lines: Int, immediateDisplay: Bool = true)
     {
         let newPosition = max (terminal.displayBuffer.yDisp - lines, 0)
-        scrollTo (row: newPosition)
+        scrollTo (row: newPosition, immediateDisplay: immediateDisplay)
     }
     
     /// Scrolls down the content of the terminal the specified number of lines
-    public func scrollDown (lines: Int)
+    public func scrollDown (lines: Int, immediateDisplay: Bool = true)
     {
         let displayBuffer = terminal.displayBuffer
         let newPosition = max (0, min (displayBuffer.yDisp + lines, displayBuffer.lines.count - displayBuffer.rows))
-        scrollTo (row: newPosition)
+        scrollTo (row: newPosition, immediateDisplay: immediateDisplay)
     }
       
     func feedPrepare()

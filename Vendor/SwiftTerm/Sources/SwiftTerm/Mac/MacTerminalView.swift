@@ -2179,9 +2179,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     func scrollWheelAccelerationFactor (forGestureEnergy energy: CGFloat, forwardingToApplication: Bool) -> CGFloat
     {
-        let start: CGFloat = forwardingToApplication ? 2.6 : 3.2
-        let end: CGFloat = forwardingToApplication ? 8.0 : 10.0
-        let maxBoost: CGFloat = forwardingToApplication ? 0.9 : 1.35
+        let start: CGFloat = forwardingToApplication ? 3.5 : 4.5
+        let end: CGFloat = forwardingToApplication ? 10.0 : 13.0
+        let maxBoost: CGFloat = forwardingToApplication ? 0.65 : 0.85
         let t = min (max ((energy - start) / max (end - start, 0.001), 0), 1)
         let smooth = t * t * (3 - 2 * t)
         return 1 + smooth * maxBoost
@@ -2192,8 +2192,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                                forwardingToApplication: Bool) -> CGFloat
     {
         if hasPreciseScrollingDeltas {
-            let scale: CGFloat = forwardingToApplication ? 0.28 : 0.38
-            let cap: CGFloat = forwardingToApplication ? 1.8 : 4.0
+            let scale: CGFloat = forwardingToApplication ? 0.45 : 0.9
+            let cap: CGFloat = forwardingToApplication ? 2.0 : 4.0
             return min (magnitude * scale, cap)
         }
         let scale: CGFloat = forwardingToApplication ? 0.55 : 0.65
@@ -2580,9 +2580,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                                      eventTimestamp: event.timestamp,
                                      forwardingToApplication: false)
         if lines > 0 {
-            scrollUp (lines: lines)
+            scrollUp (lines: lines, immediateDisplay: false)
         } else if lines < 0 {
-            scrollDown(lines: -lines)
+            scrollDown(lines: -lines, immediateDisplay: false)
         }
     }
 

@@ -129,7 +129,7 @@ final class SelectionTests: TerminalDelegate {
         var early = 0
         var late = 0
         for i in 0..<16 {
-            let steps = view.scrollWheelUnits(forNormalizedDelta: 2,
+            let steps = view.scrollWheelUnits(forNormalizedDelta: 1,
                                               hasPreciseScrollingDeltas: true,
                                               eventTimestamp: 1 + Double(i) * 0.04,
                                               forwardingToApplication: true)
@@ -155,22 +155,6 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
                                       hasPreciseScrollingDeltas: true,
                                       eventTimestamp: 1.08,
-                                      forwardingToApplication: false) == 0)
-        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
-                                      hasPreciseScrollingDeltas: true,
-                                      eventTimestamp: 1.12,
-                                      forwardingToApplication: false) == 0)
-        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
-                                      hasPreciseScrollingDeltas: true,
-                                      eventTimestamp: 1.16,
-                                      forwardingToApplication: false) == 0)
-        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
-                                      hasPreciseScrollingDeltas: true,
-                                      eventTimestamp: 1.20,
-                                      forwardingToApplication: false) == 0)
-        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
-                                      hasPreciseScrollingDeltas: true,
-                                      eventTimestamp: 1.24,
                                       forwardingToApplication: false) == 1)
     }
 
@@ -180,7 +164,7 @@ final class SelectionTests: TerminalDelegate {
         var early = 0
         var late = 0
         for i in 0..<16 {
-            let lines = view.scrollWheelUnits(forNormalizedDelta: 2,
+            let lines = view.scrollWheelUnits(forNormalizedDelta: 1,
                                               hasPreciseScrollingDeltas: true,
                                               eventTimestamp: 1 + Double(i) * 0.04,
                                               forwardingToApplication: false)
@@ -190,6 +174,17 @@ final class SelectionTests: TerminalDelegate {
 
         #expect(early <= 3)
         #expect(late > early)
+    }
+
+    @Test func testDeferredScrollQueuesDisplayForFramePacing() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: (0..<80).map { "line \($0)" }.joined(separator: "\n"))
+        view.updateDisplay()
+
+        view.scrollTo(row: 10, immediateDisplay: false)
+
+        #expect(view.terminal.displayBuffer.yDisp == 10)
+        #expect(view.pendingDisplay)
     }
 
     @Test func testScrollWheelAccelerationResetsAfterPauseAndDirectionChange() {
