@@ -123,21 +123,93 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.encodeScrollWheelEvent(deltaY: 1, modifierFlags: [.option]) == 72)
     }
 
-    @Test func testForwardedScrollWheelUsesModerateAcceleration() {
+    @Test func testForwardedScrollWheelAccumulatesThenAccelerates() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
 
-        #expect(view.forwardedScrollWheelSteps(forNormalizedDelta: 1) == 1)
-        #expect(view.forwardedScrollWheelSteps(forNormalizedDelta: 4) == 2)
-        #expect(view.forwardedScrollWheelSteps(forNormalizedDelta: 12) == 3)
+        var early = 0
+        var late = 0
+        for i in 0..<16 {
+            let steps = view.scrollWheelUnits(forNormalizedDelta: 2,
+                                              hasPreciseScrollingDeltas: true,
+                                              eventTimestamp: 1 + Double(i) * 0.04,
+                                              forwardingToApplication: true)
+            if i < 4 { early += steps }
+            if i >= 12 { late += steps }
+        }
+
+        #expect(early <= 2)
+        #expect(late > early)
     }
 
-    @Test func testLocalScrollWheelUsesModerateAcceleration() {
+    @Test func testLocalPreciseScrollWheelAccumulatesSmallDeltas() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
 
-        #expect(view.localScrollWheelLines(forNormalizedDelta: 1) == 1)
-        #expect(view.localScrollWheelLines(forNormalizedDelta: 2) == 2)
-        #expect(view.localScrollWheelLines(forNormalizedDelta: 5) == 4)
-        #expect(view.localScrollWheelLines(forNormalizedDelta: 12) == 6)
+        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 1,
+                                      forwardingToApplication: false) == 0)
+        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 1.04,
+                                      forwardingToApplication: false) == 0)
+        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 1.08,
+                                      forwardingToApplication: false) == 0)
+        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 1.12,
+                                      forwardingToApplication: false) == 0)
+        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 1.16,
+                                      forwardingToApplication: false) == 0)
+        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 1.20,
+                                      forwardingToApplication: false) == 0)
+        #expect(view.scrollWheelUnits(forNormalizedDelta: 0.4,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 1.24,
+                                      forwardingToApplication: false) == 1)
+    }
+
+    @Test func testLocalScrollWheelAccelerationBuildsDuringContinuousGesture() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+
+        var early = 0
+        var late = 0
+        for i in 0..<16 {
+            let lines = view.scrollWheelUnits(forNormalizedDelta: 2,
+                                              hasPreciseScrollingDeltas: true,
+                                              eventTimestamp: 1 + Double(i) * 0.04,
+                                              forwardingToApplication: false)
+            if i < 4 { early += lines }
+            if i >= 12 { late += lines }
+        }
+
+        #expect(early <= 3)
+        #expect(late > early)
+    }
+
+    @Test func testScrollWheelAccelerationResetsAfterPauseAndDirectionChange() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+
+        for i in 0..<12 {
+            _ = view.scrollWheelUnits(forNormalizedDelta: 1,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 1 + Double(i) * 0.04,
+                                      forwardingToApplication: false)
+        }
+
+        #expect(view.scrollWheelUnits(forNormalizedDelta: 1,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 2.0,
+                                      forwardingToApplication: false) == 0)
+        #expect(view.scrollWheelUnits(forNormalizedDelta: -1,
+                                      hasPreciseScrollingDeltas: true,
+                                      eventTimestamp: 2.04,
+                                      forwardingToApplication: false) == 0)
     }
 
     @Test func testPreciseScrollDeltaNormalizesByCellHeight() {

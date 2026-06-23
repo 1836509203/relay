@@ -2138,12 +2138,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let delta = normalizedScrollWheelDelta(deltaY: event.deltaY,
                                                scrollingDeltaY: event.scrollingDeltaY,
                                                hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas)
+        let steps = scrollWheelUnits(forNormalizedDelta: delta,
+                                     hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
+                                     eventTimestamp: event.timestamp,
+                                     forwardingToApplication: true)
+        if steps == 0 {
+            return
+        }
         let displayBuffer = terminal.displayBuffer
         let hit = calculateMouseHit(with: event)
         let buttonFlags = encodeScrollWheelEvent(deltaY: delta, modifierFlags: event.modifierFlags)
         let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
-        let steps = forwardedScrollWheelSteps(forNormalizedDelta: delta)
-        for _ in 0..<steps {
+        for _ in 0..<abs(steps) {
             terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
     }
@@ -2156,31 +2162,85 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return deltaY
     }
 
-    func localScrollWheelLines (forNormalizedDelta delta: CGFloat) -> Int
+    private var scrollWheelLastTimestamp: TimeInterval = 0
+    private var scrollWheelDirection: CGFloat = 0
+    private var scrollWheelGestureEnergy: CGFloat = 0
+    private var localScrollWheelRemainder: CGFloat = 0
+    private var forwardedScrollWheelRemainder: CGFloat = 0
+
+    func resetScrollWheelAcceleration ()
     {
-        let magnitude = abs (delta)
-        if magnitude >= 10 {
-            return 6
-        }
-        if magnitude >= 5 {
-            return 4
-        }
-        if magnitude >= 2 {
-            return 2
-        }
-        return 1
+        scrollWheelLastTimestamp = 0
+        scrollWheelDirection = 0
+        scrollWheelGestureEnergy = 0
+        localScrollWheelRemainder = 0
+        forwardedScrollWheelRemainder = 0
     }
 
-    func forwardedScrollWheelSteps (forNormalizedDelta delta: CGFloat) -> Int
+    func scrollWheelAccelerationFactor (forGestureEnergy energy: CGFloat, forwardingToApplication: Bool) -> CGFloat
     {
-        let magnitude = abs (delta)
-        if magnitude >= 10 {
-            return 3
+        let start: CGFloat = forwardingToApplication ? 2.6 : 3.2
+        let end: CGFloat = forwardingToApplication ? 8.0 : 10.0
+        let maxBoost: CGFloat = forwardingToApplication ? 0.9 : 1.35
+        let t = min (max ((energy - start) / max (end - start, 0.001), 0), 1)
+        let smooth = t * t * (3 - 2 * t)
+        return 1 + smooth * maxBoost
+    }
+
+    func scrollWheelBaseUnits (forNormalizedMagnitude magnitude: CGFloat,
+                               hasPreciseScrollingDeltas: Bool,
+                               forwardingToApplication: Bool) -> CGFloat
+    {
+        if hasPreciseScrollingDeltas {
+            let scale: CGFloat = forwardingToApplication ? 0.28 : 0.38
+            let cap: CGFloat = forwardingToApplication ? 1.8 : 4.0
+            return min (magnitude * scale, cap)
         }
-        if magnitude >= 4 {
-            return 2
+        let scale: CGFloat = forwardingToApplication ? 0.55 : 0.65
+        let cap: CGFloat = forwardingToApplication ? 2.5 : 5.0
+        return max (1, min (magnitude * scale, cap))
+    }
+
+    func scrollWheelUnits (forNormalizedDelta delta: CGFloat,
+                           hasPreciseScrollingDeltas: Bool,
+                           eventTimestamp: TimeInterval,
+                           forwardingToApplication: Bool) -> Int
+    {
+        if delta == 0 {
+            return 0
         }
-        return 1
+
+        let direction: CGFloat = delta > 0 ? 1 : -1
+        let elapsed = scrollWheelLastTimestamp > 0 ? max (0, eventTimestamp - scrollWheelLastTimestamp) : .greatestFiniteMagnitude
+        let sameGesture = elapsed < 0.22 && direction == scrollWheelDirection
+        if !sameGesture {
+            scrollWheelGestureEnergy = 0
+            localScrollWheelRemainder = 0
+            forwardedScrollWheelRemainder = 0
+        }
+
+        let base = scrollWheelBaseUnits(forNormalizedMagnitude: abs (delta),
+                                        hasPreciseScrollingDeltas: hasPreciseScrollingDeltas,
+                                        forwardingToApplication: forwardingToApplication)
+        let decay = sameGesture ? max (0, 1 - CGFloat (elapsed / 0.65)) : 0
+        scrollWheelGestureEnergy = min (scrollWheelGestureEnergy * decay + base, 18)
+        let accelerated = base * scrollWheelAccelerationFactor(forGestureEnergy: scrollWheelGestureEnergy,
+                                                               forwardingToApplication: forwardingToApplication)
+
+        var remainder = (forwardingToApplication ? forwardedScrollWheelRemainder : localScrollWheelRemainder)
+        remainder += accelerated * direction
+        let whole = Int (remainder.rounded(.towardZero))
+        if whole != 0 {
+            remainder -= CGFloat (whole)
+        }
+        if forwardingToApplication {
+            forwardedScrollWheelRemainder = remainder
+        } else {
+            localScrollWheelRemainder = remainder
+        }
+        scrollWheelDirection = direction
+        scrollWheelLastTimestamp = eventTimestamp
+        return whole
     }
     
     private var autoScrollDelta = 0
@@ -2515,14 +2575,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
         flashScroller()
-        let velocity = localScrollWheelLines(forNormalizedDelta: delta)
-        if delta > 0 {
-            scrollUp (lines: velocity)
-        } else {
-            scrollDown(lines: velocity)
+        let lines = scrollWheelUnits(forNormalizedDelta: delta,
+                                     hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
+                                     eventTimestamp: event.timestamp,
+                                     forwardingToApplication: false)
+        if lines > 0 {
+            scrollUp (lines: lines)
+        } else if lines < 0 {
+            scrollDown(lines: -lines)
         }
     }
-    
+
     private func calcScrollingVelocity (delta: Int) -> Int
     {
         if delta > 9 {
