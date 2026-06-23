@@ -2167,6 +2167,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private var scrollWheelGestureEnergy: CGFloat = 0
     private var localScrollWheelRemainder: CGFloat = 0
     private var forwardedScrollWheelRemainder: CGFloat = 0
+    private static var statScrollEvents = 0
+    private static var statScrollLines = 0
+    private static var statScrollImmediate = 0
+    private static var statScrollLastPrint: UInt64 = 0
 
     func resetScrollWheelAcceleration ()
     {
@@ -2579,10 +2583,24 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                                      hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
                                      eventTimestamp: event.timestamp,
                                      forwardingToApplication: false)
+        let immediateDisplay = lines != 0
+        if TerminalView.displayStatsOn {
+            Self.statScrollEvents += 1
+            Self.statScrollLines += abs(lines)
+            if immediateDisplay {
+                Self.statScrollImmediate += 1
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now - Self.statScrollLastPrint > 2_000_000_000 {
+                Self.statScrollLastPrint = now
+                FileHandle.standardError.write(Data(
+                    "[scrollstat] events=\(Self.statScrollEvents) lines=\(Self.statScrollLines) immediate=\(Self.statScrollImmediate)\n".utf8))
+            }
+        }
         if lines > 0 {
-            scrollUp (lines: lines, immediateDisplay: false)
+            scrollUp (lines: lines, immediateDisplay: immediateDisplay)
         } else if lines < 0 {
-            scrollDown(lines: -lines, immediateDisplay: false)
+            scrollDown(lines: -lines, immediateDisplay: immediateDisplay)
         }
     }
 

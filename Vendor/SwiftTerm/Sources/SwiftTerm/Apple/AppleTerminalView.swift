@@ -1936,7 +1936,6 @@ extension TerminalView {
                 updateDisplay (notifyAccessibility: notifyAccessibility)
                 terminalDelegate?.scrolled (source: self, position: scrollPosition)
                 updateScroller()
-                setNeedsDisplay(frame)
             } else {
                 #if os(macOS)
                 scrollerRefreshPending = true
