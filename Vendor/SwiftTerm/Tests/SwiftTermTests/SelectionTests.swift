@@ -215,6 +215,44 @@ final class SelectionTests: TerminalDelegate {
 
         #expect(delta == 2)
     }
+
+    @Test func testSelectionAutoScrollDeltaUsesEdgesAndDirection() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: (0..<80).map { "line \($0)" }.joined(separator: "\n"))
+
+        #expect(view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: view.bounds.midY)) == 0)
+
+        view.selection.startSelection(row: 0, col: 0)
+        #expect(view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: view.bounds.midY)) == 0)
+
+        let bottomDelta = view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: 0))
+        let topDelta = view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: view.bounds.height))
+        #expect(bottomDelta > 0)
+        #expect(topDelta < 0)
+
+        let farBottomDelta = view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: -view.cellDimension.height * 8))
+        #expect(farBottomDelta > bottomDelta)
+        #expect(farBottomDelta <= 4)
+    }
+
+    @Test func testSelectionAutoScrollStepMovesViewportAndSelection() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: (0..<120).map { "line \($0)" }.joined(separator: "\n"))
+        view.scrollTo(row: 10)
+        view.selection.startSelection(row: 0, col: 0)
+
+        let bottomPoint = CGPoint(x: 20, y: 0)
+        let oldYDisp = view.terminal.displayBuffer.yDisp
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint))
+        #expect(view.terminal.displayBuffer.yDisp == oldYDisp + 2)
+        #expect(view.selection.end.row >= view.terminal.displayBuffer.yDisp)
+
+        let topPoint = CGPoint(x: 20, y: view.bounds.height)
+        let scrolledYDisp = view.terminal.displayBuffer.yDisp
+        #expect(view.performSelectionAutoScroll(delta: -2, point: topPoint))
+        #expect(view.terminal.displayBuffer.yDisp == scrolledYDisp - 2)
+        #expect(view.selection.end.row == view.terminal.displayBuffer.yDisp)
+    }
 #endif
 
     @Test func testSelectedTextSurvivesScrollbackRecycleUntilTrimmed() {
