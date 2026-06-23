@@ -18,13 +18,28 @@ enum Updater {
 
     // MARK: - 检查
 
+    private static func uncachedURL(_ string: String) -> URL? {
+        guard var components = URLComponents(string: string) else { return nil }
+        var items = components.queryItems ?? []
+        items.append(URLQueryItem(name: "relay_cache_bust", value: String(Int(Date().timeIntervalSince1970))))
+        components.queryItems = items
+        return components.url
+    }
+
+    private static func releaseRequest(url: URL, method: String = "GET") -> URLRequest {
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15)
+        req.httpMethod = method
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        req.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        return req
+    }
+
     /// interactive=true（菜单触发）：任何结果都弹对话框；
     /// false（启动/定时后台）：仅发现新版时发系统通知，其余静默。
     static func check(interactive: Bool) {
-        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else { return }
-        var req = URLRequest(url: url)
+        guard let url = uncachedURL("https://api.github.com/repos/\(repo)/releases/latest") else { return }
+        var req = releaseRequest(url: url)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.timeoutInterval = 15
         URLSession.shared.dataTask(with: req) { data, resp, err in
             DispatchQueue.main.async {
                 guard let http = resp as? HTTPURLResponse, http.statusCode == 200, let data,
@@ -57,9 +72,7 @@ enum Updater {
     /// GitHub 固定格式构造，发布说明拿不到（留空）。
     private static func checkViaRedirect(interactive: Bool, apiError: Error?) {
         guard let url = URL(string: "https://github.com/\(repo)/releases/latest") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "HEAD"
-        req.timeoutInterval = 15
+        let req = releaseRequest(url: url, method: "HEAD")
         URLSession.shared.dataTask(with: req) { _, resp, err in
             DispatchQueue.main.async {
                 guard let final = resp?.url, final.pathComponents.dropLast().last == "tag",
