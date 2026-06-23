@@ -94,9 +94,9 @@ struct TaskTemplate: Codable, Identifiable, Equatable {
 }
 
 struct AppSettings: Codable {
-    /// 默认 12：claude 等 agent TUI 的状态条按终端列数自适应（≥~115 列才
-    /// 合并成一行），13pt 在常规窗口宽度下列数卡在阈值边缘。
-    var fontSize: Double = 12
+    /// 默认 10：优先保证 agent/TUI 的信息密度。12-13pt 在常规窗口下
+    /// 纵向行数和横向列数都会明显下降，slash 菜单等内容只剩约一半容量。
+    var fontSize: Double = 10
     /// "system" = 系统等宽（SF Mono），否则为字体族名。
     var fontName: String = "system"
     var theme: String = "relay-dark"
@@ -126,7 +126,9 @@ struct AppSettings: Codable {
     var lineSpacing: Double = 0
     /// 字距微调（pt，加到格宽上，负值收紧；Ghostty adjust-cell-width。
     /// 中文占 2 格，收紧量是英文的两倍——正好抵消 2 格网格的中文空隙）。
-    var letterSpacing: Double = 0
+    var letterSpacing: Double = -0.25
+    /// 设置迁移版本。v2 把一度保存下来的“大字/大间距”组合迁回紧凑密度。
+    var densityVersion: Int = 2
     /// 侧边栏显隐（Safari 式收起/展开，标签条左侧按钮切换）。
     var sidebarVisible: Bool = true
     /// 侧边栏宽度（pt，可拖拽右缘分隔条调整，持久化）。
@@ -147,7 +149,8 @@ struct AppSettings: Codable {
     init() {}
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        fontSize = (try? c.decode(Double.self, forKey: .fontSize)) ?? 12
+        densityVersion = (try? c.decode(Int.self, forKey: .densityVersion)) ?? 1
+        fontSize = (try? c.decode(Double.self, forKey: .fontSize)) ?? 10
         fontName = (try? c.decode(String.self, forKey: .fontName)) ?? "system"
         theme = (try? c.decode(String.self, forKey: .theme)) ?? "relay-dark"
         scrollback = (try? c.decode(Int.self, forKey: .scrollback)) ?? 2000
@@ -160,7 +163,7 @@ struct AppSettings: Codable {
         cursorBlink = (try? c.decode(Bool.self, forKey: .cursorBlink)) ?? true
         padding = (try? c.decode(Double.self, forKey: .padding)) ?? 0
         lineSpacing = (try? c.decode(Double.self, forKey: .lineSpacing)) ?? 0
-        letterSpacing = (try? c.decode(Double.self, forKey: .letterSpacing)) ?? 0
+        letterSpacing = (try? c.decode(Double.self, forKey: .letterSpacing)) ?? -0.25
         sidebarVisible = (try? c.decode(Bool.self, forKey: .sidebarVisible)) ?? true
         sidebarWidth = (try? c.decode(Double.self, forKey: .sidebarWidth)) ?? 232
         autoUpdateCheck = (try? c.decode(Bool.self, forKey: .autoUpdateCheck)) ?? true
@@ -169,6 +172,21 @@ struct AppSettings: Codable {
         confirmMultilinePaste = (try? c.decode(Bool.self, forKey: .confirmMultilinePaste)) ?? true
         taskTemplates = (try? c.decode([TaskTemplate].self, forKey: .taskTemplates)) ?? []
         defaultNewTaskStarter = (try? c.decode(String.self, forKey: .defaultNewTaskStarter)) ?? ""
+        migrateDensityIfNeeded()
+    }
+
+    private mutating func migrateDensityIfNeeded() {
+        guard densityVersion < 2 else { return }
+        if fontName == "system",
+           fontSize >= 12.5,
+           lineSpacing >= 1,
+           padding >= 8 {
+            fontSize = 10
+            lineSpacing = 0
+            padding = 0
+            letterSpacing = -0.25
+        }
+        densityVersion = 2
     }
 }
 
