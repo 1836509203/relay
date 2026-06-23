@@ -1,7 +1,6 @@
 // ⌘F 终端内容搜索：跳转/高亮走 SwiftTerm 内置 SearchEngine
-//（findNext/findPrevious 自带结果选中高亮 + 滚动定位，且接受 SearchOptions
-// 控制大小写/正则/全词）；匹配总数内置引擎不暴露，仍用 getScrollInvariantLine
-// 自己扫一遍计数——计数口径与引擎对齐（同一套 SearchOptions 编译的谓词）。
+//（findNext/findPrevious 自带结果选中高亮 + 滚动定位）；匹配总数
+// 内置引擎不暴露，仍用 getScrollInvariantLine 自己扫一遍计数。
 import SwiftUI
 import SwiftTerm
 
@@ -10,16 +9,7 @@ struct SearchBar: View {
     @State private var query = ""
     @State private var matchCount = 0
     @State private var current = 0
-    @State private var caseSensitive = false
-    @State private var useRegex = false
-    @State private var wholeWord = false
-    @State private var invalidRegex = false
     @FocusState private var focused: Bool
-
-    /// 当前开关编译出的引擎检索选项。
-    private var options: SearchOptions {
-        SearchOptions(caseSensitive: caseSensitive, regex: useRegex, wholeWord: wholeWord)
-    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -33,15 +23,9 @@ struct SearchBar: View {
                 .focused($focused)
                 .onSubmit { jump(1) }
                 .onChange(of: query) { _ in research() }
-
-            // 检索开关：大小写 / 正则 / 全词。改动即重搜。
-            toggle("Aa", on: $caseSensitive, help: "区分大小写")
-            toggle(".*", on: $useRegex, help: "正则表达式")
-            toggle("W", on: $wholeWord, help: "全字匹配")
-
-            Text(countLabel)
+            Text(matchCount == 0 ? (query.isEmpty ? "" : "无匹配") : "\(current + 1)/\(matchCount)")
                 .font(.system(size: 10.5).monospacedDigit())
-                .foregroundColor(invalidRegex ? Theme.red : Theme.fg2)
+                .foregroundColor(Theme.fg2)
                 .frame(minWidth: 52, alignment: .trailing)
             Button { jump(-1) } label: { Image(systemName: "chevron.up").font(.system(size: 10, weight: .semibold)) }
                 .buttonStyle(.plain).foregroundColor(Theme.fg2)
@@ -62,28 +46,6 @@ struct SearchBar: View {
         .onExitCommand { closeBar() }
     }
 
-    /// 紧凑的检索开关按钮：开启时高亮 + 衬底，关闭时弱化。
-    private func toggle(_ label: String, on: Binding<Bool>, help: String) -> some View {
-        Button { on.wrappedValue.toggle(); research() } label: {
-            Text(label)
-                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                .foregroundColor(on.wrappedValue ? Theme.bg0 : Theme.fg3)
-                .frame(width: 22, height: 18)
-                .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(on.wrappedValue ? Theme.termAccent : Color.clear)
-                )
-        }
-        .buttonStyle(.plain)
-        .help(help)
-    }
-
-    private var countLabel: String {
-        if invalidRegex { return "正则无效" }
-        if matchCount == 0 { return query.isEmpty ? "" : "无匹配" }
-        return "\(current + 1)/\(matchCount)"
-    }
-
     private func closeBar() {
         store.searchVisible = false
         if let v = store.activeView {
@@ -92,7 +54,7 @@ struct SearchBar: View {
         }
     }
 
-    /// query / 开关变化：重数匹配总行数 + 定位到最后一个匹配（最新输出附近，
+    /// query 变化：重数匹配总行数 + 定位到最后一个匹配（最新输出附近，
     /// 从底部往上找第一个 = 最后一处，更符合回看直觉）。
     /// 总数扫描用 getScrollInvariantLine —— getLine 只覆盖可见视口；
     /// 行号是会话起算的绝对值，必须用 scrollInvariantRowRange（长会话
@@ -100,22 +62,20 @@ struct SearchBar: View {
     private func research() {
         matchCount = 0
         current = 0
-        invalidRegex = false
         guard let v = store.activeView else { return }
         v.clearSearch()
-        guard !query.isEmpty else { return }
-        guard let predicate = makePredicate() else {
-            invalidRegex = true   // 正则非法：不检索，红字提示
-            return
-        }
+        let q = query.lowercased()
+        guard !q.isEmpty else { return }
         let t = v.getTerminal()
         for row in t.scrollInvariantRowRange {
             guard let line = t.getScrollInvariantLine(row: row) else { continue }
             let text = line.translateToString(
                 trimRight: true, skipNullCellsFollowingWide: true, characterProvider: plainCell)
-            if predicate(text) { matchCount += 1 }
+            if text.lowercased().contains(q) {
+                matchCount += 1
+            }
         }
-        if matchCount > 0, v.findPrevious(query, options: options) {
+        if matchCount > 0, v.findPrevious(query) {
             current = matchCount - 1
         }
     }
@@ -124,26 +84,8 @@ struct SearchBar: View {
     /// current 仅用于计数显示，与引擎同步按同方向回绕递增。
     private func jump(_ delta: Int) {
         guard matchCount > 0, let v = store.activeView else { return }
-        let found = delta > 0 ? v.findNext(query, options: options) : v.findPrevious(query, options: options)
+        let found = delta > 0 ? v.findNext(query) : v.findPrevious(query)
         guard found else { return }
         current = (current + delta + matchCount) % matchCount
-    }
-
-    /// 把当前开关编译成「逐行是否命中」的谓词，使自数计数与引擎口径一致。
-    /// 正则非法返回 nil（调用方据此提示）。非正则/全词时用 contains 快路径。
-    private func makePredicate() -> ((String) -> Bool)? {
-        if useRegex || wholeWord {
-            var pattern = useRegex ? query : NSRegularExpression.escapedPattern(for: query)
-            if wholeWord { pattern = "\\b" + pattern + "\\b" }
-            var ro: NSRegularExpression.Options = []
-            if !caseSensitive { ro.insert(.caseInsensitive) }
-            guard let re = try? NSRegularExpression(pattern: pattern, options: ro) else { return nil }
-            return { s in
-                re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
-            }
-        }
-        if caseSensitive { return { $0.contains(query) } }
-        let lc = query.lowercased()
-        return { $0.lowercased().contains(lc) }
     }
 }

@@ -48,11 +48,6 @@ struct Session: Identifiable, Codable, Equatable {
     /// 上次的工作目录（proc_pidinfo 读子 shell cwd 落盘）；重开时在此目录启动
     /// shell。旧版 sessions.json 缺此 key → nil → 回落 home。
     var cwd: String?
-    /// claude 会话 id：新建 claude 会话时以 `claude --session-id <uuid>` 指定并落盘，
-    /// 重开时据此 `claude --resume <id>` 精确续到本标签那次对话——而非 `--continue`
-    /// 取"最近一次"导致同目录多标签续错。codex 无启动期指定 id 的入参，仍走 cwd
-    /// 过滤的 `resume --last`。旧版 sessions.json 缺此 key → nil → 回落 --continue。
-    var agentSessionId: String?
 }
 
 /// 侧栏显示用的派生阶段。
@@ -83,14 +78,6 @@ func representativeTab(of tabs: [Session]) -> Session? {
         if a.kind.isAgent != b.kind.isAgent { return a.kind.isAgent }
         return a.createdAt < b.createdAt
     }
-}
-
-/// 任务模板：一键起一个预设任务（起始目录 + 首条启动命令）。存进 AppSettings。
-struct TaskTemplate: Codable, Identifiable, Equatable {
-    var id: String
-    var name: String       // 显示名，如「Claude · 本项目」
-    var cwd: String?       // 起始目录；nil = 用默认目录
-    var starter: String?   // 首命令（不含回车）；nil/空 = 纯 shell
 }
 
 struct AppSettings: Codable {
@@ -133,15 +120,6 @@ struct AppSettings: Codable {
     var sidebarWidth: Double = 232
     /// 自动检查更新（启动后台 + 每 24h 查 GitHub Releases，有新版发通知）。
     var autoUpdateCheck: Bool = true
-    /// 选中即复制到剪贴板（默认关：避免选中误覆盖剪贴板，opt-in 用户接受此取舍）。
-    var copyOnSelect: Bool = false
-    /// 多行粘贴前确认（默认开：防止整块多行内容粘进 shell 被逐行自动执行）。
-    var confirmMultilinePaste: Bool = true
-    /// 任务模板库（一键起预设任务：目录 + 启动命令）。随设置持久化。
-    var taskTemplates: [TaskTemplate] = []
-    /// 新建任务引导（⌘⇧N）的默认启动方式：""=纯 Shell / "claude" / "codex"。
-    /// 仅影响引导面板初值；⌘N 即时新建始终是纯 shell。
-    var defaultNewTaskStarter: String = ""
 
     // 旧版本设置文件缺字段时取默认值。
     init() {}
@@ -164,11 +142,6 @@ struct AppSettings: Codable {
         sidebarVisible = (try? c.decode(Bool.self, forKey: .sidebarVisible)) ?? true
         sidebarWidth = (try? c.decode(Double.self, forKey: .sidebarWidth)) ?? 232
         autoUpdateCheck = (try? c.decode(Bool.self, forKey: .autoUpdateCheck)) ?? true
-        // 这两项的自定义解码此前漏了：编码写盘但解码不读 → 每次重启静默重置回默认。
-        copyOnSelect = (try? c.decode(Bool.self, forKey: .copyOnSelect)) ?? false
-        confirmMultilinePaste = (try? c.decode(Bool.self, forKey: .confirmMultilinePaste)) ?? true
-        taskTemplates = (try? c.decode([TaskTemplate].self, forKey: .taskTemplates)) ?? []
-        defaultNewTaskStarter = (try? c.decode(String.self, forKey: .defaultNewTaskStarter)) ?? ""
     }
 }
 
@@ -194,13 +167,4 @@ enum DataDir {
 
     static var sessionsFile: URL { url.appendingPathComponent("sessions.json") }
     static var settingsFile: URL { url.appendingPathComponent("settings.json") }
-    /// 终端区布局（分屏的 pane 会话 id + 轴向）。与 sessions 分开存：布局变更
-    /// 频繁但很小，单独落盘不放大 sessions.json 的写入。
-    static var layoutFile: URL { url.appendingPathComponent("layout.json") }
-}
-
-/// 重启恢复的终端区布局快照。panes 为 1-2 个会话 id；vertical=上下分屏。
-struct LayoutState: Codable {
-    var panes: [String]
-    var vertical: Bool
 }

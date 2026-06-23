@@ -14,19 +14,6 @@ let plainCell: (CharData) -> Character = { $0.isNull ? " " : $0.getCharacter() }
 final class RelayTerminalView: LocalProcessTerminalView {
     var sessionId = ""
 
-    /// 程序化发送进行中（autoResume / IPC 注入 / 清屏 Ctrl+L / 拖入路径等系统动作，
-    /// 非用户击键）。广播模式只镜像真·用户输入；这些动作经同一个 send(data:) 漏斗，
-    /// 故发送期间置位，relayUserInput 据此跳过，避免把系统动作误发到其他会话。
-    private(set) var isProgrammaticSend = false
-
-    /// 程序化文本输入：发送期间屏蔽广播钩子。用户键盘/粘贴不走这里，照常可广播。
-    /// 全程主线程同步执行（send→send(data:)→onUserInput 同步回调），标志窗口精确覆盖。
-    func sendProgrammatic(txt: String) {
-        isProgrammaticSend = true
-        defer { isProgrammaticSend = false }
-        send(txt: txt)
-    }
-
     /// 渲染路径与设置对齐（Metal ⇄ CoreGraphics，可随时切换，buffer 无损）。
     /// 只有挂在窗口里的视图才持有 Metal —— 每套管线/drawable/字形图集
     /// ~160MB，N 个后台会话不该各占一份；detach 时立即释放（setUseMetal(false)
@@ -98,7 +85,7 @@ final class RelayTerminalView: LocalProcessTerminalView {
             return false
         }
         let joined = urls.map { Self.shellEscapePath($0.path) }.joined(separator: " ")
-        sendProgrammatic(txt: joined)   // 拖入路径只进当前会话，不广播
+        send(txt: joined)
         window?.makeFirstResponder(self)
         return true
     }
@@ -107,70 +94,6 @@ final class RelayTerminalView: LocalProcessTerminalView {
     override func bell(source: Terminal) {
         NSSound.beep()
         SessionStore.shared.noteBell(id: sessionId)
-    }
-
-    // MARK: - 选中即复制 / 多行粘贴确认 / 右键菜单
-
-    /// 选区变化：开启「选中即复制」时把选中文本送入剪贴板（默认关，opt-in）。
-    /// copy(_:) 是 SwiftTerm 的 open 方法，内部取 selection.getSelectedText()。
-    override func selectionChanged(source: Terminal) {
-        super.selectionChanged(source: source)
-        if SessionStore.shared.settings.copyOnSelect, selectionActive {
-            copy(self)
-        }
-    }
-
-    /// 多行粘贴前确认：防止整块多行内容粘进 shell 被逐行自动执行（误触灾难）。
-    /// 文件 URL 粘贴（插入路径）与单行粘贴直接放行；只对 ≥2 行纯文本拦一道。
-    private var bypassPasteConfirm = false
-    override func paste(_ sender: Any) {
-        if bypassPasteConfirm { bypassPasteConfirm = false; super.paste(sender); return }
-        let pb = NSPasteboard.general
-        let hasFiles = (pb.readObjects(
-            forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL])?.isEmpty == false
-        if !hasFiles, SessionStore.shared.settings.confirmMultilinePaste,
-           let s = pb.string(forType: .string) {
-            let lineCount = s.trimmingCharacters(in: .newlines).components(separatedBy: "\n").count
-            if lineCount >= 2 {
-                let alert = NSAlert()
-                alert.messageText = "粘贴 \(lineCount) 行内容？"
-                alert.informativeText = "多行内容会被 shell 逐行执行。确认要粘贴吗？"
-                alert.addButton(withTitle: "粘贴")
-                alert.addButton(withTitle: "取消")
-                let confirm: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
-                    guard let self, resp == .alertFirstButtonReturn else { return }
-                    self.bypassPasteConfirm = true
-                    self.paste(sender)
-                }
-                if let w = window {
-                    alert.beginSheetModal(for: w, completionHandler: confirm)
-                } else {
-                    confirm(alert.runModal())
-                }
-                return
-            }
-        }
-        super.paste(sender)
-    }
-
-    /// 终端右键上下文菜单：拷贝/粘贴/全选走 responder 链（first responder 即本视图），
-    /// 清屏/搜索直达对应动作。
-    override func menu(for event: NSEvent) -> NSMenu? {
-        let m = NSMenu()
-        let copyItem = m.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "")
-        copyItem.isEnabled = selectionActive
-        m.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "")
-        m.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "")
-        m.addItem(.separator())
-        m.addItem(withTitle: "搜索…", action: #selector(ctxSearch), keyEquivalent: "").target = self
-        m.addItem(withTitle: "清屏", action: #selector(ctxClear), keyEquivalent: "").target = self
-        return m
-    }
-
-    @objc private func ctxSearch() { SessionStore.shared.searchVisible = true }
-    @objc private func ctxClear() {
-        getTerminal().resetToInitialState()
-        sendProgrammatic(txt: "\u{0C}")   // 清屏是 UI 动作，不广播
     }
 
     // MARK: - ⌘-click 文件路径 → 访达定位
@@ -350,13 +273,7 @@ final class ProcessEvents: LocalProcessTerminalViewDelegate {
 
     func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
     func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
-
-    /// OSC 7「当前目录变更」：比每秒 proc_pidinfo 采样更及时准确，直接更新
-    /// 实时 cwd 并据此自动命名任务（cd 即生效，无需等下一帧采样）。
-    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
-        guard let v = source as? RelayTerminalView, let dir = directory else { return }
-        SessionStore.shared.noteOscCwd(id: v.sessionId, dir: dir)
-    }
+    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
 }
 
 /// AppKit 容器：终端视图作为子视图以 autoresizingMask 始终铺满容器。
