@@ -870,7 +870,6 @@ extension TerminalView {
     
     /// Returns the selection range for the specified row, if any.
     func selectedColumnsRange(row: Int, cols: Int) -> Range<Int>? {
-        selection.synchronizeWithBufferTop()
         guard let selection = self.selection, selection.active else {
             return nil
         }
@@ -1768,32 +1767,19 @@ extension TerminalView {
     // The code below is intended to not repaint too often, which can produce flicker, for example
     // when the user refreshes the display, and this repains the screen, as dispatch delivers data
     // in blocks of 1024 bytes, which is not enough to cover the whole screen, so this delays
-    // the update until the next display frame.
+    // the update for a 1/600th of a second.
     //
     // It is also cheap, so should be called when new data has been posted or received.
-    private func displayFrameDelayNanoseconds() -> UInt64 {
-        #if os(macOS)
-        #if canImport(MetalKit)
-        if metalView != nil {
-            let screenFPS = window?.screen?.maximumFramesPerSecond
-                ?? NSScreen.main?.maximumFramesPerSecond
-                ?? 60
-            let fps = max(60, min(screenFPS, 120))
-            return UInt64(1_000_000_000 / fps)
-        }
-        #endif
-        #endif
-        return UInt64(1_000_000_000 / 60)
-    }
-
     func queuePendingDisplay ()
     {
         // throttle
         if !pendingDisplay {
-            let fpsDelay = displayFrameDelayNanoseconds()
+            let fps60 = 16670000
+            // let fps30 = 16670000*2
+            let fpsDelay = fps60
             pendingDisplay = true
             DispatchQueue.main.asyncAfter(
-                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + fpsDelay),
+                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
                 execute: updateDisplay)
         }
     }
@@ -1811,10 +1797,11 @@ extension TerminalView {
             return
         }
         if !pendingMetalDisplay {
-            let fpsDelay = displayFrameDelayNanoseconds()
+            let fps60 = 16670000
+            let fpsDelay = fps60
             pendingMetalDisplay = true
             DispatchQueue.main.asyncAfter(
-                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + fpsDelay)) { [weak self] in
+                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay))) { [weak self] in
                     guard let self else { return }
                     self.pendingMetalDisplay = false
                     self.metalView?.setNeedsDisplay(self.metalView?.bounds ?? .zero)
@@ -1926,22 +1913,21 @@ extension TerminalView {
         userScrolling = false
     }
     
-    public func scrollTo (row: Int, notifyAccessibility: Bool = true, immediateDisplay: Bool = true)
+    public func scrollTo (row: Int, notifyAccessibility: Bool = true)
     {
         let displayBuffer = terminal.displayBuffer
         if row != displayBuffer.yDisp {
             terminal.setViewYDisp (row)
+
+            // tell the terminal we want to refresh all the rows
             terminal.refresh (startRow: 0, endRow: terminal.rows)
-            if immediateDisplay {
-                updateDisplay (notifyAccessibility: notifyAccessibility)
-                terminalDelegate?.scrolled (source: self, position: scrollPosition)
-                updateScroller()
-            } else {
-                #if os(macOS)
-                scrollerRefreshPending = true
-                #endif
-                queuePendingDisplay()
-            }
+
+            // do the display update
+            updateDisplay (notifyAccessibility: notifyAccessibility)
+            //selectionView.notifyScrolled(source: terminal)
+            terminalDelegate?.scrolled (source: self, position: scrollPosition)
+            updateScroller()
+            setNeedsDisplay(frame)
         }
     }
     
@@ -1966,40 +1952,32 @@ extension TerminalView {
     }
 
     /// Scrolls up the content of the terminal the specified number of lines
-    public func scrollUp (lines: Int, immediateDisplay: Bool = true)
+    public func scrollUp (lines: Int)
     {
         let newPosition = max (terminal.displayBuffer.yDisp - lines, 0)
-        scrollTo (row: newPosition, immediateDisplay: immediateDisplay)
+        scrollTo (row: newPosition)
     }
     
     /// Scrolls down the content of the terminal the specified number of lines
-    public func scrollDown (lines: Int, immediateDisplay: Bool = true)
+    public func scrollDown (lines: Int)
     {
         let displayBuffer = terminal.displayBuffer
         let newPosition = max (0, min (displayBuffer.yDisp + lines, displayBuffer.lines.count - displayBuffer.rows))
-        scrollTo (row: newPosition, immediateDisplay: immediateDisplay)
+        scrollTo (row: newPosition)
     }
       
     func feedPrepare()
     {
         search.invalidate()
-#if os(macOS)
-        // Relay patch: keep user selections while agent TUIs stream output.
-        // MacTerminalView routes plain dragging to local selection even when the
-        // app enabled mouse reporting; clearing here made Claude/Codex erase the
-        // selection on the next PTY chunk.
-#else
         // Preserve manual selection while output is streaming when mouse reporting is disabled.
         if allowMouseReporting {
             selection.active = false
         }
-#endif
         startDisplayUpdates()
     }
     
     func feedFinish ()
     {
-        selection.synchronizeWithBufferTop()
         suspendDisplayUpdates ()
         queuePendingDisplay()
     }
@@ -2038,7 +2016,6 @@ extension TerminalView {
     public func changeScrollback (_ newScrollback: Int?)
     {
         terminal.changeScrollback(newScrollback)
-        selection.synchronizeWithBufferTop()
         updateScroller()
         terminalDelegate?.scrolled(source: self, position: scrollPosition)
         queuePendingDisplay()
@@ -2341,8 +2318,7 @@ extension TerminalView {
     /// Set to true if the selection is active, false otherwise
     public var selectionActive: Bool {
         get {
-            selection.synchronizeWithBufferTop()
-            return selection.active
+            selection.active
         }
     }
     
@@ -2350,7 +2326,6 @@ extension TerminalView {
     /// Returns the contents of the selection, if active, or nil otherwise
     public func getSelection () -> String?
     {
-        selection.synchronizeWithBufferTop()
         if selection.active {
             return selection.getSelectedText()
         }

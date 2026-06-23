@@ -333,7 +333,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             NotificationCenter.default.removeObserver (resignMainObserver)
         }
         progressReportTimer?.invalidate()
-        selectionAutoScrollTimer?.invalidate()
     }
     
     func setupFocusNotification() {
@@ -2119,248 +2118,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
         terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
     }
-
-    func encodeScrollWheelEvent (deltaY: CGFloat, modifierFlags: NSEvent.ModifierFlags) -> Int
-    {
-        let button = deltaY > 0 ? 4 : 5
-        return terminal.encodeButton(button: button, release: false, shift: modifierFlags.contains(.shift), meta: modifierFlags.contains(.option), control: modifierFlags.contains(.control))
-    }
-
-    func shouldForwardScrollWheelToApplication (modifierFlags: NSEvent.ModifierFlags) -> Bool
-    {
-        guard allowMouseReporting && terminal.mouseMode.sendButtonPress() else {
-            return false
-        }
-        return terminal.isDisplayBufferAlternate || mouseReportingRequested(modifierFlags: modifierFlags)
-    }
-
-    private func sendScrollWheelEvent (with event: NSEvent)
-    {
-        let delta = normalizedScrollWheelDelta(deltaY: event.deltaY,
-                                               scrollingDeltaY: event.scrollingDeltaY,
-                                               hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas)
-        let steps = scrollWheelUnits(forNormalizedDelta: delta,
-                                     hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
-                                     eventTimestamp: event.timestamp,
-                                     forwardingToApplication: true)
-        if steps == 0 {
-            return
-        }
-        let displayBuffer = terminal.displayBuffer
-        let hit = calculateMouseHit(with: event)
-        let buttonFlags = encodeScrollWheelEvent(deltaY: delta, modifierFlags: event.modifierFlags)
-        let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
-        for _ in 0..<abs(steps) {
-            terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
-        }
-    }
-
-    func normalizedScrollWheelDelta (deltaY: CGFloat, scrollingDeltaY: CGFloat, hasPreciseScrollingDeltas: Bool) -> CGFloat
-    {
-        if hasPreciseScrollingDeltas && scrollingDeltaY != 0 {
-            return scrollingDeltaY / max (cellDimension.height, 1)
-        }
-        return deltaY
-    }
-
-    private var scrollWheelLastTimestamp: TimeInterval = 0
-    private var scrollWheelDirection: CGFloat = 0
-    private var scrollWheelGestureEnergy: CGFloat = 0
-    private var localScrollWheelRemainder: CGFloat = 0
-    private var forwardedScrollWheelRemainder: CGFloat = 0
-    private static var statScrollEvents = 0
-    private static var statScrollLines = 0
-    private static var statScrollImmediate = 0
-    private static var statScrollLastPrint: UInt64 = 0
-
-    func resetScrollWheelAcceleration ()
-    {
-        scrollWheelLastTimestamp = 0
-        scrollWheelDirection = 0
-        scrollWheelGestureEnergy = 0
-        localScrollWheelRemainder = 0
-        forwardedScrollWheelRemainder = 0
-    }
-
-    func scrollWheelAccelerationFactor (forGestureEnergy energy: CGFloat, forwardingToApplication: Bool) -> CGFloat
-    {
-        let start: CGFloat = forwardingToApplication ? 3.5 : 4.5
-        let end: CGFloat = forwardingToApplication ? 10.0 : 13.0
-        let maxBoost: CGFloat = forwardingToApplication ? 0.65 : 0.85
-        let t = min (max ((energy - start) / max (end - start, 0.001), 0), 1)
-        let smooth = t * t * (3 - 2 * t)
-        return 1 + smooth * maxBoost
-    }
-
-    func scrollWheelBaseUnits (forNormalizedMagnitude magnitude: CGFloat,
-                               hasPreciseScrollingDeltas: Bool,
-                               forwardingToApplication: Bool) -> CGFloat
-    {
-        if hasPreciseScrollingDeltas {
-            let scale: CGFloat = forwardingToApplication ? 0.45 : 0.9
-            let cap: CGFloat = forwardingToApplication ? 2.0 : 4.0
-            return min (magnitude * scale, cap)
-        }
-        let scale: CGFloat = forwardingToApplication ? 0.55 : 0.65
-        let cap: CGFloat = forwardingToApplication ? 2.5 : 5.0
-        return max (1, min (magnitude * scale, cap))
-    }
-
-    func scrollWheelUnits (forNormalizedDelta delta: CGFloat,
-                           hasPreciseScrollingDeltas: Bool,
-                           eventTimestamp: TimeInterval,
-                           forwardingToApplication: Bool) -> Int
-    {
-        if delta == 0 {
-            return 0
-        }
-
-        let direction: CGFloat = delta > 0 ? 1 : -1
-        let elapsed = scrollWheelLastTimestamp > 0 ? max (0, eventTimestamp - scrollWheelLastTimestamp) : .greatestFiniteMagnitude
-        let sameGesture = elapsed < 0.22 && direction == scrollWheelDirection
-        if !sameGesture {
-            scrollWheelGestureEnergy = 0
-            localScrollWheelRemainder = 0
-            forwardedScrollWheelRemainder = 0
-        }
-
-        let base = scrollWheelBaseUnits(forNormalizedMagnitude: abs (delta),
-                                        hasPreciseScrollingDeltas: hasPreciseScrollingDeltas,
-                                        forwardingToApplication: forwardingToApplication)
-        let decay = sameGesture ? max (0, 1 - CGFloat (elapsed / 0.65)) : 0
-        scrollWheelGestureEnergy = min (scrollWheelGestureEnergy * decay + base, 18)
-        let accelerated = base * scrollWheelAccelerationFactor(forGestureEnergy: scrollWheelGestureEnergy,
-                                                               forwardingToApplication: forwardingToApplication)
-
-        var remainder = (forwardingToApplication ? forwardedScrollWheelRemainder : localScrollWheelRemainder)
-        remainder += accelerated * direction
-        let whole = Int (remainder.rounded(.towardZero))
-        if whole != 0 {
-            remainder -= CGFloat (whole)
-        }
-        if forwardingToApplication {
-            forwardedScrollWheelRemainder = remainder
-        } else {
-            localScrollWheelRemainder = remainder
-        }
-        scrollWheelDirection = direction
-        scrollWheelLastTimestamp = eventTimestamp
-        return whole
-    }
     
     private var autoScrollDelta = 0
-    private var selectionAutoScrollTimer: Timer?
-    private var selectionAutoScrollPoint: CGPoint = .zero
-
-    func selectionAutoScrollVelocity (distanceFromEdge: CGFloat) -> Int
-    {
-        let cellHeight = max(cellDimension?.height ?? 1, 1)
-        let cellDistance = max(1, Int(ceil(distanceFromEdge / cellHeight)))
-        switch cellDistance {
-        case 0...1:
-            return 1
-        case 2...3:
-            return 2
-        case 4...6:
-            return 3
-        default:
-            return 4
-        }
-    }
-
-    func selectionAutoScrollDelta (for point: CGPoint) -> Int
-    {
-        guard selection?.active == true, terminal.displayBuffer.rows > 0 else {
-            return 0
-        }
-        let edgeInset = max((cellDimension?.height ?? 1) * 1.5, 24)
-        if point.y < edgeInset {
-            return selectionAutoScrollVelocity(distanceFromEdge: edgeInset - point.y)
-        }
-        if point.y > bounds.height - edgeInset {
-            return -selectionAutoScrollVelocity(distanceFromEdge: point.y - (bounds.height - edgeInset))
-        }
-        return 0
-    }
-
-    private func selectionPosition (for point: CGPoint) -> Position
-    {
-        let displayBuffer = terminal.displayBuffer
-        let cellWidth = max(cellDimension.width, 1)
-        let cellHeight = max(cellDimension.height, 1)
-        let x = min(max(point.x, 0), max(bounds.width - 1, 0))
-        let y = min(max(point.y, 0), max(bounds.height - 1, 0))
-        let col = min(max(0, Int(x / cellWidth)), terminal.cols - 1)
-        let screenRow = Int((bounds.height - y) / cellHeight)
-        let clampedScreenRow = min(max(0, screenRow), max(0, displayBuffer.rows - 1))
-        let maxRow = max(0, displayBuffer.lines.count - 1)
-        let row = min(max(0, displayBuffer.yDisp + clampedScreenRow), maxRow)
-        return Position(col: col, row: row)
-    }
-
-    private func ensureSelectionAutoScrollTimer ()
-    {
-        guard selectionAutoScrollTimer == nil else {
-            return
-        }
-        let timer = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] timer in
-            self?.scrollingTimerElapsed(source: timer)
-        }
-        selectionAutoScrollTimer = timer
-        RunLoop.main.add(timer, forMode: .eventTracking)
-        RunLoop.main.add(timer, forMode: .common)
-    }
-
-    private func stopSelectionAutoScroll ()
-    {
-        autoScrollDelta = 0
-        selectionAutoScrollTimer?.invalidate()
-        selectionAutoScrollTimer = nil
-    }
-
-    private func updateSelectionAutoScroll (at point: CGPoint)
-    {
-        selectionAutoScrollPoint = point
-        autoScrollDelta = selectionAutoScrollDelta(for: point)
-        if autoScrollDelta == 0 {
-            stopSelectionAutoScroll()
-        } else {
-            ensureSelectionAutoScrollTimer()
-        }
-    }
-
-    @discardableResult
-    func performSelectionAutoScroll (delta: Int, point: CGPoint) -> Bool
-    {
-        guard selection.active, delta != 0 else {
-            return false
-        }
-
-        let oldYDisp = terminal.displayBuffer.yDisp
-        let oldEnd = selection.end
-        if delta < 0 {
-            scrollUp(lines: -delta)
-        } else {
-            scrollDown(lines: delta)
-        }
-
-        selection.dragExtend(bufferPosition: selectionPosition(for: point))
-        didSelectionDrag = true
-        return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
-    }
-
     // Callback from when the mouseDown autoscrolling timer goes off
     private func scrollingTimerElapsed (source: Timer)
     {
-        guard selection.active, autoScrollDelta != 0 else {
-            stopSelectionAutoScroll()
+        if autoScrollDelta == 0 {
             return
         }
-
-        let changed = performSelectionAutoScroll(delta: autoScrollDelta, point: selectionAutoScrollPoint)
-        autoScrollDelta = selectionAutoScrollDelta(for: selectionAutoScrollPoint)
-        if changed {
-            setNeedsDisplay(bounds)
+        if autoScrollDelta < 0 {
+            scrollUp(lines: autoScrollDelta * -1)
+        } else {
+            scrollUp(lines: autoScrollDelta)
         }
     }
     
@@ -2373,12 +2142,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// 二者都不转发给程序。返回 true 表示「这一手势要交给程序上报」。
     @inline(__always)
     func mouseReportingRequested(with event: NSEvent) -> Bool {
-        return mouseReportingRequested(modifierFlags: event.modifierFlags)
-    }
-
-    @inline(__always)
-    func mouseReportingRequested(modifierFlags: NSEvent.ModifierFlags) -> Bool {
-        return modifierFlags.contains(.option)
+        return event.modifierFlags.contains(.option)
     }
 
     /// Relay patch: ⌘-click 命中的「裸文件路径」回调（非 URL，与 OSC 8 超链接分开）。
@@ -2430,7 +2194,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     public override func mouseDown(with event: NSEvent) {
-        stopSelectionAutoScroll()
         if allowMouseReporting && terminal.mouseMode.sendButtonPress() && mouseReportingRequested(with: event) {
             sharedMouseEvent(with: event)
             return
@@ -2470,7 +2233,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var didSelectionDrag: Bool = false
     
     public override func mouseUp(with event: NSEvent) {
-        stopSelectionAutoScroll()
         let hit = calculateMouseHit(with: event).grid
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
@@ -2499,11 +2261,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     public override func mouseDragged(with event: NSEvent) {
         let displayBuffer = terminal.displayBuffer
-        let point = convert(event.locationInWindow, from: nil)
-        let mouseHit = calculateMouseHit(at: point)
+        let mouseHit = calculateMouseHit(with: event)
         let hit = mouseHit.grid
         if allowMouseReporting && mouseReportingRequested(with: event) {
-            stopSelectionAutoScroll()
             if terminal.mouseMode.sendMotionEvent() {
                 let flags = encodeMouseEvent(with: event)
                 let screenRow = max (0, min (displayBuffer.rows - 1, hit.row - displayBuffer.yDisp))
@@ -2516,15 +2276,22 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             }
         }
 
-        let selectionHit = selectionPosition(for: point)
         if selection.active {
-            selection.dragExtend(bufferPosition: selectionHit)
+            selection.dragExtend(bufferPosition: Position(col: hit.col, row: hit.row))
         } else {
-            selection.setSoftStart(bufferPosition: selectionHit)
+            selection.setSoftStart(bufferPosition: Position(col: hit.col, row: hit.row))
             selection.startSelection()
         }
         didSelectionDrag = true
-        updateSelectionAutoScroll(at: point)
+        autoScrollDelta = 0
+        let screenRow = hit.row - displayBuffer.yDisp
+        if selection.active {
+            if screenRow <= 0 {
+                autoScrollDelta = calcScrollingVelocity(delta: screenRow * -1) * -1
+            } else if screenRow >= displayBuffer.rows {
+                autoScrollDelta = calcScrollingVelocity(delta: screenRow - displayBuffer.rows)
+            }
+        }
         setNeedsDisplay(bounds)
     }
     
@@ -2668,40 +2435,30 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     public override func scrollWheel(with event: NSEvent) {
-        let delta = normalizedScrollWheelDelta(deltaY: event.deltaY,
-                                               scrollingDeltaY: event.scrollingDeltaY,
-                                               hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas)
-        if delta == 0 {
-            return
-        }
-        if shouldForwardScrollWheelToApplication(modifierFlags: event.modifierFlags) {
-            sendScrollWheelEvent(with: event)
+        if event.deltaY == 0 {
             return
         }
         flashScroller()
-        let lines = scrollWheelUnits(forNormalizedDelta: delta,
-                                     hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
-                                     eventTimestamp: event.timestamp,
-                                     forwardingToApplication: false)
-        let immediateDisplay = lines != 0
-        if TerminalView.displayStatsOn {
-            Self.statScrollEvents += 1
-            Self.statScrollLines += abs(lines)
-            if immediateDisplay {
-                Self.statScrollImmediate += 1
-            }
-            let now = DispatchTime.now().uptimeNanoseconds
-            if now - Self.statScrollLastPrint > 2_000_000_000 {
-                Self.statScrollLastPrint = now
-                FileHandle.standardError.write(Data(
-                    "[scrollstat] events=\(Self.statScrollEvents) lines=\(Self.statScrollLines) immediate=\(Self.statScrollImmediate)\n".utf8))
-            }
+        let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
+        if event.deltaY > 0 {
+            scrollUp (lines: velocity)
+        } else {
+            scrollDown(lines: velocity)
         }
-        if lines > 0 {
-            scrollUp (lines: lines, immediateDisplay: immediateDisplay)
-        } else if lines < 0 {
-            scrollDown(lines: -lines, immediateDisplay: immediateDisplay)
+    }
+
+    private func calcScrollingVelocity (delta: Int) -> Int
+    {
+        if delta > 9 {
+            return max (terminal.rows, 20)
         }
+        if delta > 5 {
+            return 10
+        }
+        if delta > 1 {
+            return 3
+        }
+        return 1
     }
 
     public override func resetCursorRects() {
