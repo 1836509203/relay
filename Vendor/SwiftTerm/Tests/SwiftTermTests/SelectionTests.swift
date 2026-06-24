@@ -76,6 +76,68 @@ final class SelectionTests: TerminalDelegate {
         view.scrollTo(row: 1)
         #expect(view.calculateMouseHit(at: CGPoint(x: 0, y: 10)).grid.row == 1)
     }
+
+    // Relay regression: 拖拽到视口上/下边缘时，选区应靠自动滚动继续扩展。
+    // 此前大回滚撤掉了驱动自动滚动的 timer（4ff44c1），此处守住其行为。
+    @Test func testSelectionAutoScrollDeltaUsesEdgesAndDirection() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: (0..<80).map { "line \($0)" }.joined(separator: "\n"))
+
+        #expect(view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: view.bounds.midY)) == 0)
+
+        view.selection.startSelection(row: 0, col: 0)
+        #expect(view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: view.bounds.midY)) == 0)
+
+        let bottomDelta = view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: 0))
+        let topDelta = view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: view.bounds.height))
+        #expect(bottomDelta > 0)
+        #expect(topDelta < 0)
+
+        let farBottomDelta = view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: -view.cellDimension.height * 8))
+        #expect(farBottomDelta > bottomDelta)
+        #expect(farBottomDelta <= 4)
+    }
+
+    @Test func testSelectionAutoScrollStepMovesViewportAndSelection() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: (0..<120).map { "line \($0)" }.joined(separator: "\n"))
+        view.scrollTo(row: 10)
+        view.selection.startSelection(row: 0, col: 0)
+
+        let bottomPoint = CGPoint(x: 20, y: 0)
+        let oldYDisp = view.terminal.displayBuffer.yDisp
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint))
+        #expect(view.terminal.displayBuffer.yDisp == oldYDisp + 2)
+        #expect(view.selection.end.row >= view.terminal.displayBuffer.yDisp)
+
+        let topPoint = CGPoint(x: 20, y: view.bounds.height)
+        let scrolledYDisp = view.terminal.displayBuffer.yDisp
+        #expect(view.performSelectionAutoScroll(delta: -2, point: topPoint))
+        #expect(view.terminal.displayBuffer.yDisp == scrolledYDisp - 2)
+        #expect(view.selection.end.row == view.terminal.displayBuffer.yDisp)
+    }
+
+    // Relay regression: 守护"驱动自动滚动的 timer 接线"本身，而非仅叶子数学函数。
+    // 4ff44c1 被回滚时，恰恰是这个 timer 没人驱动；上面两个测试只覆盖叶子函数，
+    // 即便接线再次被撤掉也照样通过。此测试要求：边缘点武装 timer、中间点解除。
+    @Test func testUpdateSelectionAutoScrollArmsTimerAtEdgeOnly() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: (0..<120).map { "line \($0)" }.joined(separator: "\n"))
+        view.scrollTo(row: 10)
+        view.selection.startSelection(row: 0, col: 0)
+
+        // 视口中间：不应武装
+        view.updateSelectionAutoScroll(at: CGPoint(x: 20, y: view.bounds.midY))
+        #expect(view.selectionAutoScrollIsActive == false)
+
+        // 底部边缘：应武装 timer（这正是回滚时丢掉的驱动）
+        view.updateSelectionAutoScroll(at: CGPoint(x: 20, y: 0))
+        #expect(view.selectionAutoScrollIsActive == true)
+
+        // 回到中间：应解除并清理 timer
+        view.updateSelectionAutoScroll(at: CGPoint(x: 20, y: view.bounds.midY))
+        #expect(view.selectionAutoScrollIsActive == false)
+    }
 #endif
 
     // MARK: - Selection Tests Ported from Ghostty
