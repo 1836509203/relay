@@ -138,6 +138,28 @@ final class SelectionTests: TerminalDelegate {
         view.updateSelectionAutoScroll(at: CGPoint(x: 20, y: view.bounds.midY))
         #expect(view.selectionAutoScrollIsActive == false)
     }
+
+    @Test func testSelectionAutoScrollForAlternateScreenSendsScrollInput() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1049h")
+        #expect(view.terminal.isDisplayBufferAlternate == true)
+
+        view.selection.startSelection(row: max(view.terminal.rows - 2, 0), col: 0)
+        let bottomPoint = CGPoint(x: 20, y: 0)
+        let oldYDisp = view.terminal.displayBuffer.yDisp
+
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint))
+        #expect(view.terminal.displayBuffer.yDisp == oldYDisp)
+        #expect(delegate.sent.isEmpty == false)
+
+        delegate.sent.removeAll()
+        view.feed(text: "\u{1B}[?1000h")
+        #expect(view.terminal.mouseMode != .off)
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint))
+        #expect(delegate.sent.isEmpty == false)
+    }
 #endif
 
     // MARK: - Selection Tests Ported from Ghostty
@@ -381,3 +403,22 @@ final class SelectionTests: TerminalDelegate {
         #expect(selection.end.col == 3)
     }
 }
+
+#if os(macOS)
+final class CapturingTerminalViewDelegate: TerminalViewDelegate {
+    var sent: [UInt8] = []
+
+    func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {}
+    func setTerminalTitle(source: TerminalView, title: String) {}
+    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+    func send(source: TerminalView, data: ArraySlice<UInt8>) {
+        sent.append(contentsOf: data)
+    }
+    func scrolled(source: TerminalView, position: Double) {}
+    func requestOpenLink(source: TerminalView, link: String, params: [String : String]) {}
+    func bell(source: TerminalView) {}
+    func clipboardCopy(source: TerminalView, content: Data) {}
+    func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
+    func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
+}
+#endif

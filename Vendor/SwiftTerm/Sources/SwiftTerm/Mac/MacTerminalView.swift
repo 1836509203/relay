@@ -2208,6 +2208,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return false
         }
 
+        if terminal.isDisplayBufferAlternate {
+            sendAlternateSelectionScroll(delta: delta, point: point)
+            selection.dragExtend(bufferPosition: selectionPosition(for: point))
+            didSelectionDrag = true
+            return true
+        }
+
         let oldYDisp = terminal.displayBuffer.yDisp
         let oldEnd = selection.end
         if delta < 0 {
@@ -2219,6 +2226,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         selection.dragExtend(bufferPosition: selectionPosition(for: point))
         didSelectionDrag = true
         return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
+    }
+
+    private func sendAlternateSelectionScroll (delta: Int, point: CGPoint)
+    {
+        let lines = max(1, min(abs(delta), Self.alternateScrollLineCap))
+        let goingUp = delta < 0
+        if allowMouseReporting && terminal.mouseMode != .off {
+            sendAlternateMouseWheel(up: goingUp, lines: lines, at: point, modifierFlags: [])
+        } else {
+            sendAlternateScrollKeys(up: goingUp, lines: lines)
+        }
     }
 
     // Callback from when the mouseDown autoscrolling timer goes off
@@ -2606,13 +2624,16 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// 5 = down) for apps that enabled mouse tracking, so e.g. `vim` with
     /// `set mouse=a` scrolls. One report per line, capped like the key path.
     private func sendAlternateMouseWheel(up: Bool, lines: Int, event: NSEvent) {
+        sendAlternateMouseWheel(up: up, lines: lines, at: convert(event.locationInWindow, from: nil), modifierFlags: event.modifierFlags)
+    }
+
+    private func sendAlternateMouseWheel(up: Bool, lines: Int, at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         let displayBuffer = terminal.displayBuffer
-        let hit = calculateMouseHit(with: event)
+        let hit = calculateMouseHit(at: point)
         let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
-        let flags = event.modifierFlags
         let buttonFlags = terminal.encodeButton(
             button: up ? 4 : 5, release: false,
-            shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+            shift: modifierFlags.contains(.shift), meta: modifierFlags.contains(.option), control: modifierFlags.contains(.control))
         let count = max (1, min (lines, Self.alternateScrollLineCap))
         for _ in 0..<count {
             terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
