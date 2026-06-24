@@ -1770,13 +1770,32 @@ extension TerminalView {
     // the update for a 1/600th of a second.
     //
     // It is also cheap, so should be called when new data has been posted or received.
+#if os(macOS)
+    // Relay patch: redraw cadence target = the active display's refresh rate so
+    // ProMotion (up to 120Hz) is honored instead of a fixed 60fps. Read live on
+    // every schedule, so moving the window between a 120Hz built-in panel and a
+    // 60Hz external display adapts automatically. Clamped to >=60 (never slower
+    // than before); falls back to 60 when the view is off-screen.
+    // Apple: NSScreen.maximumFramesPerSecond (macOS 12+).
+    var displayRefreshIntervalNanos: Int {
+        let hz = max (60, window?.screen?.maximumFramesPerSecond
+                          ?? NSScreen.main?.maximumFramesPerSecond ?? 60)
+        return 1_000_000_000 / hz
+    }
+#endif
+
     func queuePendingDisplay ()
     {
         // throttle
         if !pendingDisplay {
-            let fps60 = 16670000
-            // let fps30 = 16670000*2
-            let fpsDelay = fps60
+            // Relay patch: 60fps for the CoreGraphics path and non-macOS; the
+            // Metal path follows the display (ProMotion). MetalTerminalRenderer
+            // does a plain next-vsync present(), so this dispatch interval is
+            // the only frame-rate gate.
+            var fpsDelay = 16_670_000
+            #if canImport(MetalKit) && os(macOS)
+            if metalView != nil { fpsDelay = displayRefreshIntervalNanos }
+            #endif
             pendingDisplay = true
             DispatchQueue.main.asyncAfter(
                 deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
@@ -1797,8 +1816,12 @@ extension TerminalView {
             return
         }
         if !pendingMetalDisplay {
-            let fps60 = 16670000
-            let fpsDelay = fps60
+            // Relay patch: follow the display's refresh rate (ProMotion).
+            #if os(macOS)
+            let fpsDelay = displayRefreshIntervalNanos
+            #else
+            let fpsDelay = 16_670_000
+            #endif
             pendingMetalDisplay = true
             DispatchQueue.main.asyncAfter(
                 deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay))) { [weak self] in
