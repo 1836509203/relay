@@ -93,9 +93,13 @@ final class SelectionTests: TerminalDelegate {
         #expect(bottomDelta > 0)
         #expect(topDelta < 0)
 
+        // 拖到窗口外越远滚得越快；速度曲线封顶 16 行/帧，长日志快进也不会失控。
         let farBottomDelta = view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: -view.cellDimension.height * 8))
         #expect(farBottomDelta > bottomDelta)
-        #expect(farBottomDelta <= 4)
+        #expect(farBottomDelta <= 16)
+
+        let veryFarDelta = view.selectionAutoScrollDelta(for: CGPoint(x: 20, y: -view.cellDimension.height * 40))
+        #expect(veryFarDelta == 16)
     }
 
     @Test func testSelectionAutoScrollStepMovesViewportAndSelection() {
@@ -139,7 +143,10 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.selectionAutoScrollIsActive == false)
     }
 
-    @Test func testSelectionAutoScrollForAlternateScreenSendsScrollInput() {
+    // Relay 行为变更：全屏程序（备用屏，如 Claude Code/vim/less）没有终端回看缓冲，
+    // 转发滚轮只会让程序重绘、选区锚定的格子内容随之错位 → 选不准。改为在备用屏里
+    // 不自动滚动，划选锁定在可见屏内、保证精准（与 iTerm2/Terminal.app 一致）。
+    @Test func testSelectionAutoScrollDisabledOnAlternateScreen() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let delegate = CapturingTerminalViewDelegate()
         view.terminalDelegate = delegate
@@ -148,17 +155,17 @@ final class SelectionTests: TerminalDelegate {
 
         view.selection.startSelection(row: max(view.terminal.rows - 2, 0), col: 0)
         let bottomPoint = CGPoint(x: 20, y: 0)
+
+        // 边缘点也不应武装 timer / 产生自动滚动 delta
+        #expect(view.selectionAutoScrollDelta(for: bottomPoint) == 0)
+        view.updateSelectionAutoScroll(at: bottomPoint)
+        #expect(view.selectionAutoScrollIsActive == false)
+
+        // 即便被直接以非 0 delta 调用，也不转发滚轮、不改 yDisp（防御性兜底）
         let oldYDisp = view.terminal.displayBuffer.yDisp
-
-        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint))
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == false)
         #expect(view.terminal.displayBuffer.yDisp == oldYDisp)
-        #expect(delegate.sent.isEmpty == false)
-
-        delegate.sent.removeAll()
-        view.feed(text: "\u{1B}[?1000h")
-        #expect(view.terminal.mouseMode != .off)
-        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint))
-        #expect(delegate.sent.isEmpty == false)
+        #expect(delegate.sent.isEmpty == true)
     }
 #endif
 

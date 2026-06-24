@@ -2120,6 +2120,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private var autoScrollDelta = 0
     private var selectionAutoScrollTimer: Timer?
     private var selectionAutoScrollPoint: CGPoint = .zero
+    // mouseDown 记录的选区锚点：保证拖拽划选从「真正按下的格子」开始，而非拖动第一帧的采样点。
+    private var pendingSelectionAnchor: Position?
 
     // 测试钩子：选区自动滚动 timer 是否处于武装状态。守护"驱动自动滚动的 timer 接线"。
     var selectionAutoScrollIsActive: Bool { selectionAutoScrollTimer != nil }
@@ -2128,21 +2130,30 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     {
         let cellHeight = max(cellDimension?.height ?? 1, 1)
         let cellDistance = max(1, Int(ceil(distanceFromEdge / cellHeight)))
+        // 越往窗口外拖，滚得越快——长日志里靠近边缘是精修、拖远是快进，不会"像卡住"。
         switch cellDistance {
         case 0...1:
             return 1
         case 2...3:
             return 2
         case 4...6:
-            return 3
-        default:
             return 4
+        case 7...12:
+            return 8
+        default:
+            return 16
         }
     }
 
     func selectionAutoScrollDelta (for point: CGPoint) -> Int
     {
         guard selection?.active == true, terminal.displayBuffer.rows > 0 else {
+            return 0
+        }
+        // 全屏程序（备用屏，如 Claude Code/vim/less）没有终端回看缓冲，转发滚轮只会让
+        // 程序重绘、选区锚定的格子内容随之错位 → 选不准。这里直接不自动滚动，让划选锁定
+        // 在可见屏内、保证精准（与 iTerm2/Terminal.app 在全屏程序里的行为一致）。
+        if terminal.isDisplayBufferAlternate {
             return 0
         }
         let edgeInset = max((cellDimension?.height ?? 1) * 1.5, 24)
@@ -2204,15 +2215,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     @discardableResult
     func performSelectionAutoScroll (delta: Int, point: CGPoint) -> Bool
     {
-        guard selection.active, delta != 0 else {
+        // 备用屏（全屏程序）不参与划选自动滚动：selectionAutoScrollDelta 在 alt 屏恒返回 0，
+        // timer 不会武装，正常情况下不会带非 0 delta 进来。此处防御性兜底——alt 屏里
+        // scrollUp/scrollDown 本就是 no-op（canScroll=false），只扩展选区到当前点，不转发滚轮。
+        guard selection.active, delta != 0, !terminal.isDisplayBufferAlternate else {
             return false
-        }
-
-        if terminal.isDisplayBufferAlternate {
-            sendAlternateSelectionScroll(delta: delta, point: point)
-            selection.dragExtend(bufferPosition: selectionPosition(for: point))
-            didSelectionDrag = true
-            return true
         }
 
         let oldYDisp = terminal.displayBuffer.yDisp
@@ -2226,17 +2233,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         selection.dragExtend(bufferPosition: selectionPosition(for: point))
         didSelectionDrag = true
         return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
-    }
-
-    private func sendAlternateSelectionScroll (delta: Int, point: CGPoint)
-    {
-        let lines = max(1, min(abs(delta), Self.alternateScrollLineCap))
-        let goingUp = delta < 0
-        if allowMouseReporting && terminal.mouseMode != .off {
-            sendAlternateMouseWheel(up: goingUp, lines: lines, at: point, modifierFlags: [])
-        } else {
-            sendAlternateScrollKeys(up: goingUp, lines: lines)
-        }
     }
 
     // Callback from when the mouseDown autoscrolling timer goes off
@@ -2331,16 +2327,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
 
+        let point = convert(event.locationInWindow, from: nil)
         let hit = calculateMouseHit(with: event).grid
-        
+
         switch event.clickCount {
         case 1:
-            if selection.active == true {
-                if event.modifierFlags.contains(.shift) {
-                    selection.shiftExtend(bufferPosition: Position(col: hit.col, row: hit.row))
-                } else {
-                    selection.active = false
-                }
+            if selection.active == true && event.modifierFlags.contains(.shift) {
+                selection.shiftExtend(bufferPosition: selectionPosition(for: point))
+            } else {
+                // 清掉旧选区，并把「按下的格子」记为锚点：随后的拖拽划选从这里开始，
+                // 而不是从拖动第一帧的采样点开始，否则选区起点会偏出最多一个字符。
+                if selection.active { selection.active = false }
+                pendingSelectionAnchor = selectionPosition(for: point)
             }
         case 2:
             let displayBuffer = terminal.displayBuffer
@@ -2366,6 +2364,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     public override func mouseUp(with event: NSEvent) {
         stopSelectionAutoScroll()
+        pendingSelectionAnchor = nil
         let hit = calculateMouseHit(with: event).grid
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
@@ -2415,9 +2414,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if selection.active {
             selection.dragExtend(bufferPosition: selectionHit)
         } else {
-            selection.setSoftStart(bufferPosition: selectionHit)
+            // 起点用 mouseDown 记录的锚点（真正按下的格子），缺省回退到当前点。
+            let anchor = pendingSelectionAnchor ?? selectionHit
+            selection.setSoftStart(bufferPosition: anchor)
             selection.startSelection()
+            selection.dragExtend(bufferPosition: selectionHit)
         }
+        pendingSelectionAnchor = nil
         didSelectionDrag = true
         updateSelectionAutoScroll(at: point)
         setNeedsDisplay(bounds)
