@@ -336,10 +336,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func zoomOut(_ sender: Any?) { SessionStore.shared.zoom(-1) }
     @objc private func zoomReset(_ sender: Any?) { SessionStore.shared.zoom(0) }
 
-    /// ⌘↑/⌘↓：滚动回看到顶/底。toPosition 0=最旧、1=最新；备用屏(canScroll=false)时
-    /// 内部 clamp 到 0 为无害空操作，不影响全屏 TUI。
-    @objc private func scrollToTop(_ sender: Any?) { SessionStore.shared.activeView?.scroll(toPosition: 0) }
-    @objc private func scrollToBottom(_ sender: Any?) { SessionStore.shared.activeView?.scroll(toPosition: 1) }
+    /// ⌘↑/⌘↓：跳到顶/底。Mac 无独立 Home/End 键，这两个快捷键是它们的替代。
+    /// · 主屏：滚动 Relay 自己的回看缓冲（toPosition 0=最旧、1=最新）。
+    /// · 备用屏（Claude Code/codex 等全屏 TUI）：Relay 没有回看可滚，原来是无害空操作，
+    ///   于是「滚到底部」在 Claude Code 里毫无反应、形同虚设。现改为把 Ctrl+Home / Ctrl+End
+    ///   转发给程序本身，触发它内部的「跳到顶部/底部」（即 Claude Code 提示里的 ctrl+End）。
+    private func scrollEdge(toTop: Bool) {
+        guard let v = SessionStore.shared.activeView else { return }
+        if v.getTerminal().isCurrentBufferAlternate {
+            // CSI 1;5 H/F = Ctrl+Home / Ctrl+End，DECCKM 无关，全屏 TUI 通用。
+            let seq: [UInt8] = toTop
+                ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x48]
+                : [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x46]
+            v.send(seq)
+        } else {
+            v.scroll(toPosition: toTop ? 0 : 1)
+        }
+    }
+
+    @objc private func scrollToTop(_ sender: Any?) { scrollEdge(toTop: true) }
+    @objc private func scrollToBottom(_ sender: Any?) { scrollEdge(toTop: false) }
 
     @objc private func selectTask(_ sender: Any?) {
         if let item = sender as? NSMenuItem, let n = Int(item.keyEquivalent) {

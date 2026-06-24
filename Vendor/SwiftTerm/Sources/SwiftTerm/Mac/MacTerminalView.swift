@@ -621,8 +621,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // 全屏 TUI（见 mouseReportingRequested）。备用屏幕里输出会持续刷新换行，
         // 若每个换行都 selectNone()，用户刚从流式 agent 输出里划下的选区会被瞬间
         // 抹掉，等于选不了。故备用屏幕保留选区（键入时 keyDown 已会清选区，不冲突）；
-        // 主屏幕维持原行为：换行入滚动历史时清选区，避免选区坐标随内容上滚而错位。
-        if allowMouseReporting && !terminal.isCurrentBufferAlternate {
+        // 主屏幕维持原行为：换行入滚动历史时清选区，避免选区坐标随内容上滚而错位——
+        // 但拖拽划选进行中（isSelectionDragInProgress）也保留，以支持「下拖自动滚动选中」。
+        if allowMouseReporting && !terminal.isCurrentBufferAlternate && !isSelectionDragInProgress {
             selection.selectNone()
         }
     }
@@ -2123,6 +2124,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // mouseDown 记录的选区锚点：保证拖拽划选从「真正按下的格子」开始，而非拖动第一帧的采样点。
     private var pendingSelectionAnchor: Position?
 
+    // 拖拽划选进行中标志：为 true 时，流式输出（feedPrepare / linefeed）不得清掉选区，
+    // 否则在 Claude Code/codex 等持续刷新的程序里，用户刚划下的选区会被下一帧抹掉，根本选不中。
+    // mouseDragged 置 true，mouseDown / mouseUp 复位。非 private：feedPrepare 在
+    // AppleTerminalView.swift 的同模块扩展里需读取它。
+    var isSelectionDragInProgress = false
+
     // 测试钩子：选区自动滚动 timer 是否处于武装状态。守护"驱动自动滚动的 timer 接线"。
     var selectionAutoScrollIsActive: Bool { selectionAutoScrollTimer != nil }
 
@@ -2330,6 +2337,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let point = convert(event.locationInWindow, from: nil)
         let hit = calculateMouseHit(with: event).grid
 
+        // 新一次按下：拖拽尚未开始，复位标志（真正开始划选时由 mouseDragged 置 true）。
+        isSelectionDragInProgress = false
+
         switch event.clickCount {
         case 1:
             if selection.active == true && event.modifierFlags.contains(.shift) {
@@ -2365,6 +2375,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public override func mouseUp(with event: NSEvent) {
         stopSelectionAutoScroll()
         pendingSelectionAnchor = nil
+        // 拖拽结束：恢复主屏「输出滚动时清选区」的原行为（备用屏由 feedPrepare/linefeed 自身判断保留）。
+        isSelectionDragInProgress = false
         let hit = calculateMouseHit(with: event).grid
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
@@ -2422,6 +2434,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         pendingSelectionAnchor = nil
         didSelectionDrag = true
+        // 标记拖拽划选进行中：在此期间 feedPrepare/linefeed 不会因流式输出清掉选区，
+        // 这是「下拖自动滚动选中」和「Claude Code 里流式划选」能成立的前提。
+        isSelectionDragInProgress = true
         updateSelectionAutoScroll(at: point)
         setNeedsDisplay(bounds)
     }

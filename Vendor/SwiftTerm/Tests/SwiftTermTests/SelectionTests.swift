@@ -167,6 +167,44 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.terminal.displayBuffer.yDisp == oldYDisp)
         #expect(delegate.sent.isEmpty == true)
     }
+
+    // Relay 回归（v0.4.5）：「选不中」的真凶是 feedPrepare 每帧无条件 selection.active=false，
+    // 在备用屏里把用户刚划下的选区瞬间抹掉——之前只放行 linefeed 不够，feedPrepare 仍清。
+    // 备用屏（Claude Code/codex 等全屏 TUI）选区坐标稳定，流式输出绝不应清选区，否则无法复制。
+    @Test func testSelectionSurvivesStreamingOnAlternateScreen() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1B}[?1049h")
+        #expect(view.terminal.isCurrentBufferAlternate == true)
+        #expect(view.allowMouseReporting == true)
+
+        view.selection.startSelection(row: 0, col: 0)
+        view.selection.dragExtend(row: 0, col: 3)
+        #expect(view.selection.active == true)
+
+        // 程序持续刷新（feedPrepare + linefeed 都会触发）；选区必须存活
+        view.feed(text: "streaming\nmore output\n")
+        #expect(view.selection.active == true)
+    }
+
+    // Relay 回归（v0.4.5）：主屏策略——拖拽划选进行中保留选区（支撑「下拖自动滚动选中」），
+    // 拖拽结束后恢复「输出滚动即清选区」的原行为，避免选区坐标随回看上滚而错位。
+    @Test func testSelectionClearPolicyOnMainScreenDuringAndAfterDrag() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: (0..<5).map { "line \($0)" }.joined(separator: "\n"))
+
+        view.selection.startSelection(row: 0, col: 0)
+        view.selection.dragExtend(row: 0, col: 3)
+
+        // 拖拽进行中：流式输出不清选区
+        view.isSelectionDragInProgress = true
+        view.feed(text: "x\ny\n")
+        #expect(view.selection.active == true)
+
+        // 拖拽结束：主屏恢复清除
+        view.isSelectionDragInProgress = false
+        view.feed(text: "z\n")
+        #expect(view.selection.active == false)
+    }
 #endif
 
     // MARK: - Selection Tests Ported from Ghostty

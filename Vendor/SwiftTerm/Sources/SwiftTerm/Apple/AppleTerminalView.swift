@@ -1992,9 +1992,19 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
-        // Preserve manual selection while output is streaming when mouse reporting is disabled.
+        // Relay patch: feedPrepare 每次喂数据都会调用。原实现一律 selection.active=false，
+        // 会在备用屏（Claude Code/codex 等全屏 TUI）里把用户刚划下的选区每帧抹掉——这正是
+        // 之前 linefeed 已放行、选区却仍选不中的真凶。现与 linefeed 对齐：
+        //   · 备用屏：选区坐标稳定，输出刷新不清选区（让用户能选中并复制）；
+        //   · 主屏：维持原行为清选区，但拖拽划选进行中保留，以支持「下拖自动滚动选中」。
         if allowMouseReporting {
+            #if os(macOS)
+            if !terminal.isCurrentBufferAlternate && !isSelectionDragInProgress {
+                selection.active = false
+            }
+            #else
             selection.active = false
+            #endif
         }
         startDisplayUpdates()
     }
