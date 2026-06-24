@@ -278,6 +278,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             add(m, "放大字体", #selector(self.zoomIn(_:)), "+", target: self)
             add(m, "缩小字体", #selector(self.zoomOut(_:)), "-", target: self)
             add(m, "默认字号", #selector(self.zoomReset(_:)), "0", target: self)
+            m.addItem(.separator())
+            // Mac 无独立 End/Home 键，用 ⌘↑/⌘↓ 滚动回看到顶/底（菜单会显示快捷键便于发现）。
+            add(m, "滚动到顶部", #selector(self.scrollToTop(_:)),
+                String(UnicodeScalar(NSUpArrowFunctionKey)!), target: self)
+            add(m, "滚动到底部", #selector(self.scrollToBottom(_:)),
+                String(UnicodeScalar(NSDownArrowFunctionKey)!), target: self)
         }
         menu("窗口") { m in
             add(m, "最小化", #selector(NSWindow.miniaturize(_:)), "m")
@@ -329,6 +335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func zoomIn(_ sender: Any?) { SessionStore.shared.zoom(1) }
     @objc private func zoomOut(_ sender: Any?) { SessionStore.shared.zoom(-1) }
     @objc private func zoomReset(_ sender: Any?) { SessionStore.shared.zoom(0) }
+
+    /// ⌘↑/⌘↓：滚动回看到顶/底。toPosition 0=最旧、1=最新；备用屏(canScroll=false)时
+    /// 内部 clamp 到 0 为无害空操作，不影响全屏 TUI。
+    @objc private func scrollToTop(_ sender: Any?) { SessionStore.shared.activeView?.scroll(toPosition: 0) }
+    @objc private func scrollToBottom(_ sender: Any?) { SessionStore.shared.activeView?.scroll(toPosition: 1) }
 
     @objc private func selectTask(_ sender: Any?) {
         if let item = sender as? NSMenuItem, let n = Int(item.keyEquivalent) {
