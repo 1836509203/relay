@@ -2002,6 +2002,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func selectionChanged(source: Terminal) {
+        if selection != nil, !selection.active {
+            resetAlternateSelectionAutoScrollCapture()
+        }
         #if canImport(MetalKit)
         if metalView != nil {
             let buffer = terminal.displayBuffer
@@ -2058,7 +2061,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     open func copy(_ sender: Any)
     {
         // find the selected range of text in the buffer and put in the clipboard
-        let str = selection.getSelectedText()
+        let str = selectedTextForCopy()
         
         let clipboard = NSPasteboard.general
         clipboard.clearContents()
@@ -2067,6 +2070,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     public override func selectAll(_ sender: Any?)
     {
+        resetAlternateSelectionAutoScrollCapture()
         selectAll ()
     }
     
@@ -2129,6 +2133,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // mouseDragged 置 true，mouseDown / mouseUp 复位。非 private：feedPrepare 在
     // AppleTerminalView.swift 的同模块扩展里需读取它。
     var isSelectionDragInProgress = false
+
+    enum AlternateSelectionAutoScrollDirection {
+        case up
+        case down
+    }
+
+    private var alternateSelectionAutoScrollText: String?
+    private var alternateSelectionAutoScrollDirection: AlternateSelectionAutoScrollDirection?
 
     // 测试钩子：选区自动滚动 timer 是否处于武装状态。守护"驱动自动滚动的 timer 接线"。
     var selectionAutoScrollIsActive: Bool { selectionAutoScrollTimer != nil }
@@ -2223,8 +2235,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if terminal.isDisplayBufferAlternate {
             // 备用屏没有 Relay 自己的回看缓冲。拖到边缘继续划选时，必须把滚动意图交给
             // Claude Code/vim/less 这类 TUI 自己处理，否则 timer 虽在跑，内容永远不会动。
-            sendAlternateSelectionScroll(delta: delta, point: point)
             selection.dragExtend(bufferPosition: selectionPosition(for: point))
+            captureAlternateSelectionAutoScrollText(direction: delta < 0 ? .up : .down)
+            sendAlternateSelectionScroll(delta: delta, point: point)
             didSelectionDrag = true
             return true
         }
@@ -2251,6 +2264,125 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         } else {
             sendAlternateScrollKeys(up: goingUp, lines: lines)
         }
+    }
+
+    func selectedTextForCopy () -> String
+    {
+        if selection.active, let text = alternateSelectionAutoScrollText, !text.isEmpty {
+            return text
+        }
+        return selection.getSelectedText()
+    }
+
+    private func resetAlternateSelectionAutoScrollCapture ()
+    {
+        alternateSelectionAutoScrollText = nil
+        alternateSelectionAutoScrollDirection = nil
+    }
+
+    func updateAlternateSelectionAutoScrollCaptureAfterFeed ()
+    {
+        guard alternateSelectionAutoScrollText != nil else {
+            return
+        }
+        guard selection.active, terminal.isDisplayBufferAlternate,
+              let direction = alternateSelectionAutoScrollDirection else {
+            resetAlternateSelectionAutoScrollCapture()
+            return
+        }
+        guard isSelectionDragInProgress else {
+            return
+        }
+        captureAlternateSelectionAutoScrollText(direction: direction)
+    }
+
+    func captureAlternateSelectionAutoScrollText (direction: AlternateSelectionAutoScrollDirection)
+    {
+        let current = selection.getSelectedText()
+        guard !current.isEmpty else {
+            return
+        }
+        guard let existing = alternateSelectionAutoScrollText else {
+            alternateSelectionAutoScrollText = current
+            alternateSelectionAutoScrollDirection = direction
+            return
+        }
+        guard alternateSelectionAutoScrollDirection == direction else {
+            alternateSelectionAutoScrollText = current
+            alternateSelectionAutoScrollDirection = direction
+            return
+        }
+        alternateSelectionAutoScrollText = mergedAlternateSelectionAutoScrollText(existing: existing, current: current, direction: direction)
+    }
+
+    func mergedAlternateSelectionAutoScrollText (existing: String, current: String, direction: AlternateSelectionAutoScrollDirection) -> String
+    {
+        guard !existing.isEmpty else {
+            return current
+        }
+        guard !current.isEmpty, current != existing else {
+            return existing
+        }
+
+        switch direction {
+        case .down:
+            let overlap = lineAlignedOverlapLength(suffixOf: existing, prefixOf: current)
+            if overlap > 0 {
+                return existing + current.dropFirst(overlap)
+            }
+            return joinedSelectionBlocks(existing, current)
+        case .up:
+            let overlap = lineAlignedOverlapLength(suffixOf: current, prefixOf: existing)
+            if overlap > 0 {
+                return current + existing.dropFirst(overlap)
+            }
+            return joinedSelectionBlocks(current, existing)
+        }
+    }
+
+    private func joinedSelectionBlocks (_ first: String, _ second: String) -> String
+    {
+        if first.isEmpty {
+            return second
+        }
+        if second.isEmpty || first.hasSuffix("\n") || second.hasPrefix("\n") {
+            return first + second
+        }
+        return first + "\n" + second
+    }
+
+    private func lineAlignedOverlapLength (suffixOf left: String, prefixOf right: String) -> Int
+    {
+        let maxOverlap = min(32768, min(left.count, right.count))
+        guard maxOverlap > 0 else {
+            return 0
+        }
+        for length in stride(from: maxOverlap, through: 1, by: -1) {
+            if left.suffix(length).elementsEqual(right.prefix(length)),
+               isLineAlignedSuffix(left, length: length),
+               isLineAlignedPrefix(right, length: length) {
+                return length
+            }
+        }
+        return 0
+    }
+
+    private func isLineAlignedSuffix (_ text: String, length: Int) -> Bool
+    {
+        guard length < text.count else {
+            return true
+        }
+        let start = text.index(text.endIndex, offsetBy: -length)
+        return start == text.startIndex || text[text.index(before: start)] == "\n"
+    }
+
+    private func isLineAlignedPrefix (_ text: String, length: Int) -> Bool
+    {
+        guard length < text.count else {
+            return true
+        }
+        let end = text.index(text.startIndex, offsetBy: length)
+        return end == text.endIndex || text[end] == "\n"
     }
 
     // Callback from when the mouseDown autoscrolling timer goes off
@@ -2353,6 +2485,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         switch event.clickCount {
         case 1:
+            resetAlternateSelectionAutoScrollCapture()
             if selection.active == true && event.modifierFlags.contains(.shift) {
                 selection.shiftExtend(bufferPosition: selectionPosition(for: point))
             } else {
@@ -2362,12 +2495,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 pendingSelectionAnchor = selectionPosition(for: point)
             }
         case 2:
+            resetAlternateSelectionAutoScrollCapture()
             let displayBuffer = terminal.displayBuffer
             selection.selectWordOrExpression(at: Position(col: hit.col, row: hit.row), in: displayBuffer)
             
         default:
             // 3 and higher
             
+            resetAlternateSelectionAutoScrollCapture()
             selection.select(row: hit.row)
         }
         setNeedsDisplay(bounds)

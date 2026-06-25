@@ -173,6 +173,69 @@ final class SelectionTests: TerminalDelegate {
         #expect(delegate.sent.isEmpty == false)
     }
 
+    @Test func testAlternateSelectionAutoScrollMergeKeepsContinuousText() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+
+        let down = view.mergedAlternateSelectionAutoScrollText(
+            existing: "line 1\nline 2\nline 3",
+            current: "line 2\nline 3\nline 4",
+            direction: .down)
+        #expect(down == "line 1\nline 2\nline 3\nline 4")
+
+        let up = view.mergedAlternateSelectionAutoScrollText(
+            existing: "line 2\nline 3\nline 4",
+            current: "line 1\nline 2\nline 3",
+            direction: .up)
+        #expect(up == "line 1\nline 2\nline 3\nline 4")
+
+        let partialCharacterOverlap = view.mergedAlternateSelectionAutoScrollText(
+            existing: "abc",
+            current: "cde",
+            direction: .down)
+        #expect(partialCharacterOverlap == "abc\ncde")
+
+        let singleFullLineOverlap = view.mergedAlternateSelectionAutoScrollText(
+            existing: "a\nx",
+            current: "x\ny",
+            direction: .down)
+        #expect(singleFullLineOverlap == "a\nx\ny")
+    }
+
+    @Test func testAlternateSelectionAutoScrollCopyUsesAccumulatedTextAfterFeed() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
+        #expect(view.terminal.isDisplayBufferAlternate == true)
+
+        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 2))
+        view.captureAlternateSelectionAutoScrollText(direction: .down)
+
+        view.isSelectionDragInProgress = true
+        view.feed(text: "\u{1B}[Hline 2\u{1B}[K\r\nline 3\u{1B}[K\r\nline 4\u{1B}[K")
+
+        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
+
+        view.isSelectionDragInProgress = false
+        view.feed(text: "\u{1B}[Hline 3\u{1B}[K\r\nline 4\u{1B}[K\r\nline 5\u{1B}[K")
+
+        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
+    }
+
+    @Test func testAlternateSelectionAutoScrollCacheClearsForSelectAll() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
+
+        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 1))
+        view.captureAlternateSelectionAutoScrollText(direction: .down)
+        #expect(view.selectedTextForCopy() == "line 1\nline 2")
+
+        view.selectAll(nil)
+
+        #expect(view.selectedTextForCopy() == view.selection.getSelectedText())
+        #expect(view.selectedTextForCopy() != "line 1\nline 2")
+    }
+
     // Relay 回归（v0.4.5）：「选不中」的真凶是 feedPrepare 每帧无条件 selection.active=false，
     // 在备用屏里把用户刚划下的选区瞬间抹掉——之前只放行 linefeed 不够，feedPrepare 仍清。
     // 备用屏（Claude Code/codex 等全屏 TUI）选区坐标稳定，流式输出绝不应清选区，否则无法复制。
