@@ -144,10 +144,11 @@ final class SelectionTests: TerminalDelegate {
     }
 
     // Relay regression: Claude Code/codex run in the alternate screen. It has no Relay
-    // scrollback, so edge-drag selection must forward scroll intent to the TUI itself.
-    // Otherwise the visible selection works, but dragging past the edge never brings in
-    // more content to select.
-    @Test func testSelectionAutoScrollOnAlternateScreenSendsScrollInput() {
+    // scrollback and the selection lives in fixed viewport coordinates, so it cannot grow
+    // past the visible screen. Edge-drag therefore must NOT auto-scroll (matching
+    // iTerm2/Terminal.app in full-screen apps): the timer never arms and nothing is
+    // forwarded to the TUI — drag-selection stays locked to what is visible.
+    @Test func testSelectionAutoScrollLockedToVisibleOnAlternateScreen() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let delegate = CapturingTerminalViewDelegate()
         view.terminalDelegate = delegate
@@ -157,99 +158,16 @@ final class SelectionTests: TerminalDelegate {
         view.selection.startSelection(row: max(view.terminal.rows - 2, 0), col: 0)
         let bottomPoint = CGPoint(x: 20, y: 0)
 
-        #expect(view.selectionAutoScrollDelta(for: bottomPoint) > 0)
+        // 备用屏：边缘不产生自动滚动 delta，timer 不武装
+        #expect(view.selectionAutoScrollDelta(for: bottomPoint) == 0)
         view.updateSelectionAutoScroll(at: bottomPoint)
-        #expect(view.selectionAutoScrollIsActive == true)
+        #expect(view.selectionAutoScrollIsActive == false)
 
+        // 即使强行带非 0 delta 调用，也不滚动、不向程序转发任何字节
         let oldYDisp = view.terminal.displayBuffer.yDisp
-        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == false)
         #expect(view.terminal.displayBuffer.yDisp == oldYDisp)
-        #expect(delegate.sent == EscapeSequences.moveDownNormal + EscapeSequences.moveDownNormal)
-
-        delegate.sent.removeAll()
-        view.feed(text: "\u{1B}[?1000h")
-        #expect(view.terminal.mouseMode != .off)
-        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
-        #expect(delegate.sent.isEmpty == false)
-    }
-
-    @Test func testAlternateSelectionAutoScrollMergeKeepsContinuousText() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-
-        let down = view.mergedAlternateSelectionAutoScrollText(
-            existing: "line 1\nline 2\nline 3",
-            current: "line 2\nline 3\nline 4",
-            direction: .down)
-        #expect(down == "line 1\nline 2\nline 3\nline 4")
-
-        let up = view.mergedAlternateSelectionAutoScrollText(
-            existing: "line 2\nline 3\nline 4",
-            current: "line 1\nline 2\nline 3",
-            direction: .up)
-        #expect(up == "line 1\nline 2\nline 3\nline 4")
-
-        let partialCharacterOverlap = view.mergedAlternateSelectionAutoScrollText(
-            existing: "abc",
-            current: "cde",
-            direction: .down)
-        #expect(partialCharacterOverlap == "abc\ncde")
-
-        let singleFullLineOverlap = view.mergedAlternateSelectionAutoScrollText(
-            existing: "a\nx",
-            current: "x\ny",
-            direction: .down)
-        #expect(singleFullLineOverlap == "a\nx\ny")
-    }
-
-    @Test func testAlternateSelectionAutoScrollCopyUsesAccumulatedTextAfterFeed() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-        view.feed(text: "\u{1B}[?1049h")
-        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
-        #expect(view.terminal.isDisplayBufferAlternate == true)
-
-        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 2))
-        view.isSelectionDragInProgress = true
-        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: 0)
-        #expect(view.performSelectionAutoScroll(delta: 1, point: bottomPoint) == true)
-        view.feed(text: "\u{1B}[Hline 2\u{1B}[K\r\nline 3\u{1B}[K\r\nline 4\u{1B}[K")
-
-        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
-
-        view.isSelectionDragInProgress = false
-        view.feed(text: "\u{1B}[Hline 3\u{1B}[K\r\nline 4\u{1B}[K\r\nline 5\u{1B}[K")
-
-        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
-    }
-
-    @Test func testAlternateSelectionAutoScrollDoesNotCapturePendingFeedAfterDragEnds() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-        view.feed(text: "\u{1B}[?1049h")
-        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
-
-        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 2))
-        view.isSelectionDragInProgress = true
-        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: 0)
-        #expect(view.performSelectionAutoScroll(delta: 1, point: bottomPoint) == true)
-
-        view.isSelectionDragInProgress = false
-        view.feed(text: "\u{1B}[Hline 2\u{1B}[K\r\nline 3\u{1B}[K\r\nline 4\u{1B}[K")
-
-        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3")
-    }
-
-    @Test func testAlternateSelectionAutoScrollCacheClearsForSelectAll() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-        view.feed(text: "\u{1B}[?1049h")
-        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
-
-        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 1))
-        view.captureAlternateSelectionAutoScrollText(direction: .down)
-        #expect(view.selectedTextForCopy() == "line 1\nline 2")
-
-        view.selectAll(nil)
-
-        #expect(view.selectedTextForCopy() == view.selection.getSelectedText())
-        #expect(view.selectedTextForCopy() != "line 1\nline 2")
+        #expect(delegate.sent.isEmpty == true)
     }
 
     // Relay 回归（v0.4.5）：「选不中」的真凶是 feedPrepare 每帧无条件 selection.active=false，
