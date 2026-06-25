@@ -2002,7 +2002,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func selectionChanged(source: Terminal) {
-        if selection != nil, !selection.active {
+        if selection == nil || !selection.active {
+            resetAlternateSelectionAutoScrollCapture()
+        } else if alternateSelectionAutoScrollText != nil, !isSelectionDragInProgress {
             resetAlternateSelectionAutoScrollCapture()
         }
         #if canImport(MetalKit)
@@ -2141,6 +2143,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     private var alternateSelectionAutoScrollText: String?
     private var alternateSelectionAutoScrollDirection: AlternateSelectionAutoScrollDirection?
+    private var alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
 
     // 测试钩子：选区自动滚动 timer 是否处于武装状态。守护"驱动自动滚动的 timer 接线"。
     var selectionAutoScrollIsActive: Bool { selectionAutoScrollTimer != nil }
@@ -2237,6 +2240,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             // Claude Code/vim/less 这类 TUI 自己处理，否则 timer 虽在跑，内容永远不会动。
             selection.dragExtend(bufferPosition: selectionPosition(for: point))
             captureAlternateSelectionAutoScrollText(direction: delta < 0 ? .up : .down)
+            alternateSelectionAutoScrollNeedsCaptureAfterFeed = true
             sendAlternateSelectionScroll(delta: delta, point: point)
             didSelectionDrag = true
             return true
@@ -2268,7 +2272,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     func selectedTextForCopy () -> String
     {
-        if selection.active, let text = alternateSelectionAutoScrollText, !text.isEmpty {
+        if selection.active, terminal.isDisplayBufferAlternate,
+           let text = alternateSelectionAutoScrollText, !text.isEmpty {
             return text
         }
         return selection.getSelectedText()
@@ -2278,11 +2283,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     {
         alternateSelectionAutoScrollText = nil
         alternateSelectionAutoScrollDirection = nil
+        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
     }
 
     func updateAlternateSelectionAutoScrollCaptureAfterFeed ()
     {
-        guard alternateSelectionAutoScrollText != nil else {
+        guard alternateSelectionAutoScrollText != nil, alternateSelectionAutoScrollNeedsCaptureAfterFeed else {
             return
         }
         guard selection.active, terminal.isDisplayBufferAlternate,
@@ -2291,8 +2297,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
         guard isSelectionDragInProgress else {
+            alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
             return
         }
+        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
         captureAlternateSelectionAutoScrollText(direction: direction)
     }
 

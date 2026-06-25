@@ -208,9 +208,9 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.terminal.isDisplayBufferAlternate == true)
 
         view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 2))
-        view.captureAlternateSelectionAutoScrollText(direction: .down)
-
         view.isSelectionDragInProgress = true
+        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: 0)
+        #expect(view.performSelectionAutoScroll(delta: 1, point: bottomPoint) == true)
         view.feed(text: "\u{1B}[Hline 2\u{1B}[K\r\nline 3\u{1B}[K\r\nline 4\u{1B}[K")
 
         #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
@@ -219,6 +219,22 @@ final class SelectionTests: TerminalDelegate {
         view.feed(text: "\u{1B}[Hline 3\u{1B}[K\r\nline 4\u{1B}[K\r\nline 5\u{1B}[K")
 
         #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
+    }
+
+    @Test func testAlternateSelectionAutoScrollDoesNotCapturePendingFeedAfterDragEnds() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
+
+        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 2))
+        view.isSelectionDragInProgress = true
+        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: 0)
+        #expect(view.performSelectionAutoScroll(delta: 1, point: bottomPoint) == true)
+
+        view.isSelectionDragInProgress = false
+        view.feed(text: "\u{1B}[Hline 2\u{1B}[K\r\nline 3\u{1B}[K\r\nline 4\u{1B}[K")
+
+        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3")
     }
 
     @Test func testAlternateSelectionAutoScrollCacheClearsForSelectAll() {
