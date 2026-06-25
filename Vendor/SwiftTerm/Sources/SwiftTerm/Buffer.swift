@@ -185,6 +185,11 @@ public final class Buffer {
     public var savedCharset: [UInt8:String]? = nil
     
     var hasScrollback : Bool
+
+    // Relay patch: 备用屏即便配了 scrollback（用于历史回看 / 连续选中），resize 时也不做
+    // reflow——备用屏内容由全屏程序自管，程序收到 SIGWINCH 会自行重绘，Relay reflow 反而
+    // 会打乱我们保存的历史行。置位后 resize 走与「无 scrollback」完全一致的已验证路径，仅容量更大。
+    var disableReflow = false
     var cols: Int {
         get { _cols }
         set { _cols = newValue }
@@ -402,7 +407,7 @@ public final class Buffer {
     }
     
     public var isReflowEnabled: Bool {
-        return hasScrollback
+        return hasScrollback && !disableReflow
     }
     
     public func resize (newCols : Int, newRows : Int)

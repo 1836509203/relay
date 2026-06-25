@@ -662,9 +662,16 @@ open class Terminal {
         normalBuffer = Buffer(cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: options.scrollback)
         normalBuffer.fillViewportRows()
 
-        // The alt buffer should never have scrollback.
+        // Relay patch: 备用屏也配 scrollback。CC v2/codex 等 AI agent CLI 在备用屏(1049h)里
+        // 用滚动输出（旧行从顶部滚出），标准 alt 屏无 scrollback 会丢弃这些行；但 Relay 的核心
+        // 动作就是从这些历史里划选复制。对齐 iTerm2 "Save lines to scrollback in alternate
+        // screen mode"。PTY 抓包确认 CC=备用屏+鼠标上报；用户 iTerm2 实证可向上滚看历史并连续
+        // 选中，正是 alt-scrollback 的效果。退出备用屏 activateNormalBuffer→clear() 清掉这段
+        // 历史不污染主屏；scroll() 只看 hasScrollback，历史保存逻辑自动生效。
         // See http://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-The-Alternate-Screen-Buffer
-        altBuffer = Buffer (cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: nil)
+        altBuffer = Buffer (cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: options.scrollback)
+        // 备用屏关闭 reflow：见 Buffer.disableReflow 说明。
+        altBuffer.disableReflow = true
         buffer = normalBuffer
 
         cc = CC(send8bit: false)
@@ -5541,6 +5548,15 @@ open class Terminal {
     {
         buffer.yDisp = newValue
         synchronizedOutputBuffer?.yDisp = newValue
+        // Relay patch: 修复 userScrolling 断链。Terminal.userScrolling 在上游全仓从未被写为
+        // true（视图层另有一个同名 userScrolling，但 scroll() 读的是这里这个 Terminal 侧的），
+        // 导致 scroll() 末尾 `if !userScrolling { yDisp = yBase }` 每帧新输出都把视口强制拉回
+        // 底部。备用屏配了 scrollback 后，CC/codex 这类持续刷新的 agent 会让用户向上回看历史/
+        // 查看选区时被每帧弹回底部。这里按视口是否离开底部维护回看态：滚到历史区
+        // (yDisp < yBase) 锁住视口、新输出只在底部累积；滚回底部 (yDisp == yBase) 恢复跟随。
+        // setViewYDisp 是所有滚动路径(scrollTo/scrollUp/scrollDown/pageUp/pageDown/拖动条)的
+        // 唯一收口，故在此一处维护即可全覆盖、零回归。
+        userScrolling = newValue < buffer.yBase
     }
 
     /**
