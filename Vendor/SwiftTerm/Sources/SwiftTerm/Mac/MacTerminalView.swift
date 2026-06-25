@@ -2157,12 +2157,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         guard selection?.active == true, terminal.displayBuffer.rows > 0 else {
             return 0
         }
-        // 全屏程序（备用屏，如 Claude Code/vim/less）没有终端回看缓冲，转发滚轮只会让
-        // 程序重绘、选区锚定的格子内容随之错位 → 选不准。这里直接不自动滚动，让划选锁定
-        // 在可见屏内、保证精准（与 iTerm2/Terminal.app 在全屏程序里的行为一致）。
-        if terminal.isDisplayBufferAlternate {
-            return 0
-        }
         let edgeInset = max((cellDimension?.height ?? 1) * 1.5, 24)
         if point.y < edgeInset {
             return selectionAutoScrollVelocity(distanceFromEdge: edgeInset - point.y)
@@ -2222,11 +2216,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     @discardableResult
     func performSelectionAutoScroll (delta: Int, point: CGPoint) -> Bool
     {
-        // 备用屏（全屏程序）不参与划选自动滚动：selectionAutoScrollDelta 在 alt 屏恒返回 0，
-        // timer 不会武装，正常情况下不会带非 0 delta 进来。此处防御性兜底——alt 屏里
-        // scrollUp/scrollDown 本就是 no-op（canScroll=false），只扩展选区到当前点，不转发滚轮。
-        guard selection.active, delta != 0, !terminal.isDisplayBufferAlternate else {
+        guard selection.active, delta != 0 else {
             return false
+        }
+
+        if terminal.isDisplayBufferAlternate {
+            // 备用屏没有 Relay 自己的回看缓冲。拖到边缘继续划选时，必须把滚动意图交给
+            // Claude Code/vim/less 这类 TUI 自己处理，否则 timer 虽在跑，内容永远不会动。
+            sendAlternateSelectionScroll(delta: delta, point: point)
+            selection.dragExtend(bufferPosition: selectionPosition(for: point))
+            didSelectionDrag = true
+            return true
         }
 
         let oldYDisp = terminal.displayBuffer.yDisp
@@ -2240,6 +2240,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         selection.dragExtend(bufferPosition: selectionPosition(for: point))
         didSelectionDrag = true
         return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
+    }
+
+    private func sendAlternateSelectionScroll (delta: Int, point: CGPoint)
+    {
+        let lines = max(1, min(abs(delta), Self.alternateScrollLineCap))
+        let goingUp = delta < 0
+        if allowMouseReporting && terminal.mouseMode != .off {
+            sendAlternateMouseWheel(up: goingUp, lines: lines, at: point, modifierFlags: [])
+        } else {
+            sendAlternateScrollKeys(up: goingUp, lines: lines)
+        }
     }
 
     // Callback from when the mouseDown autoscrolling timer goes off

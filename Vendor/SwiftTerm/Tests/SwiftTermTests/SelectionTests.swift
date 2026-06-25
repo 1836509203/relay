@@ -143,10 +143,11 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.selectionAutoScrollIsActive == false)
     }
 
-    // Relay 行为变更：全屏程序（备用屏，如 Claude Code/vim/less）没有终端回看缓冲，
-    // 转发滚轮只会让程序重绘、选区锚定的格子内容随之错位 → 选不准。改为在备用屏里
-    // 不自动滚动，划选锁定在可见屏内、保证精准（与 iTerm2/Terminal.app 一致）。
-    @Test func testSelectionAutoScrollDisabledOnAlternateScreen() {
+    // Relay regression: Claude Code/codex run in the alternate screen. It has no Relay
+    // scrollback, so edge-drag selection must forward scroll intent to the TUI itself.
+    // Otherwise the visible selection works, but dragging past the edge never brings in
+    // more content to select.
+    @Test func testSelectionAutoScrollOnAlternateScreenSendsScrollInput() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let delegate = CapturingTerminalViewDelegate()
         view.terminalDelegate = delegate
@@ -156,16 +157,20 @@ final class SelectionTests: TerminalDelegate {
         view.selection.startSelection(row: max(view.terminal.rows - 2, 0), col: 0)
         let bottomPoint = CGPoint(x: 20, y: 0)
 
-        // 边缘点也不应武装 timer / 产生自动滚动 delta
-        #expect(view.selectionAutoScrollDelta(for: bottomPoint) == 0)
+        #expect(view.selectionAutoScrollDelta(for: bottomPoint) > 0)
         view.updateSelectionAutoScroll(at: bottomPoint)
-        #expect(view.selectionAutoScrollIsActive == false)
+        #expect(view.selectionAutoScrollIsActive == true)
 
-        // 即便被直接以非 0 delta 调用，也不转发滚轮、不改 yDisp（防御性兜底）
         let oldYDisp = view.terminal.displayBuffer.yDisp
-        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == false)
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
         #expect(view.terminal.displayBuffer.yDisp == oldYDisp)
-        #expect(delegate.sent.isEmpty == true)
+        #expect(delegate.sent == EscapeSequences.moveDownNormal + EscapeSequences.moveDownNormal)
+
+        delegate.sent.removeAll()
+        view.feed(text: "\u{1B}[?1000h")
+        #expect(view.terminal.mouseMode != .off)
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+        #expect(delegate.sent.isEmpty == false)
     }
 
     // Relay 回归（v0.4.5）：「选不中」的真凶是 feedPrepare 每帧无条件 selection.active=false，
