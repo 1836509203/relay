@@ -781,6 +781,14 @@ open class Terminal {
         normalBuffer.fillViewportRows()
         normalBuffer.setupTabStops(tabStopWidth: tabStopWidth)
     }
+
+    private func resetAltBuffer(fillAttr: Attribute? = nil) {
+        altBuffer = Buffer(cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: options.scrollback)
+        altBuffer.disableReflow = true
+        altBuffer.scroll = { [weak self] wrapped in self?.scroll(isWrapped: wrapped) }
+        altBuffer.fillViewportRows(attribute: fillAttr)
+        altBuffer.setupTabStops(tabStopWidth: tabStopWidth)
+    }
     
     private func activateNormalBuffer(clearAlt: Bool) {
         if buffer === normalBuffer {
@@ -839,7 +847,8 @@ open class Terminal {
         
         if isReset {
             resetNormalBuffer()
-            activateNormalBuffer(clearAlt: false)
+            resetAltBuffer()
+            buffer = normalBuffer
         } else {
             normalBuffer.resize(newCols: cols, newRows: rows)
             altBuffer.resize(newCols: cols, newRows: rows)
@@ -5437,14 +5446,15 @@ open class Terminal {
     
     /**
      * Changes the scrollback size of the terminal after it has been instantiated.
-     * The new scrollback size only affects the normal buffer, not the alternate buffer.
+     * The new scrollback size affects both the normal buffer and the alternate buffer.
      *
      * - Parameter newScrollback: The new scrollback size in lines. Pass `nil` to disable scrollback.
      */
     public func changeScrollback (_ newScrollback: Int?)
     {
-        // Only the normal buffer has scrollback, the alt buffer should never have scrollback.
         normalBuffer.changeHistorySize(newScrollback)
+        altBuffer.changeHistorySize(newScrollback)
+        altBuffer.disableReflow = true
 
         // Update the options to reflect the new scrollback size.
         options.scrollback = newScrollback ?? 0
@@ -5455,7 +5465,7 @@ open class Terminal {
 
     /**
      * Changes the scrollback (history) size of the terminal after it has been instantiated.
-     * The new scrollback size only affects the normal buffer, not the alternate buffer.
+     * The new scrollback size affects both the normal buffer and the alternate buffer.
      *
      * - Parameter newScrollback: The new scrollback size in lines. Pass `nil` to disable scrollback.
      */

@@ -1913,7 +1913,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     private func setFindPasteboardFromSelection() {
-        let selected = selection.getSelectedText()
+        let selected = selectedTextForCopy()
         guard !selected.isEmpty else {
             return
         }
@@ -1970,7 +1970,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private func showFindBar(prefillSelection: Bool) {
         let bar = ensureFindBar()
         bar.isHidden = false
-        let selectedText = prefillSelection ? selection.getSelectedText() : nil
+        let selectedText = prefillSelection ? selectedTextForCopy() : nil
         let initial = (selectedText?.isEmpty == false) ? selectedText : findPasteboardString()
         if let initial {
             bar.searchText = initial
@@ -2002,6 +2002,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func selectionChanged(source: Terminal) {
+        if selection == nil || !selection.active || !terminal.isDisplayBufferAlternate {
+            resetAlternateSelectionAutoScrollCapture()
+        }
         #if canImport(MetalKit)
         if metalView != nil {
             let buffer = terminal.displayBuffer
@@ -2058,7 +2061,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     open func copy(_ sender: Any)
     {
         // find the selected range of text in the buffer and put in the clipboard
-        let str = selection.getSelectedText()
+        let str = selectedTextForCopy()
         
         let clipboard = NSPasteboard.general
         clipboard.clearContents()
@@ -2084,6 +2087,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     public override func selectAll(_ sender: Any?)
     {
+        resetAlternateSelectionAutoScrollCapture()
         selectAll ()
     }
     
@@ -2146,6 +2150,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // mouseDragged 置 true，mouseDown / mouseUp 复位。非 private：feedPrepare 在
     // AppleTerminalView.swift 的同模块扩展里需读取它。
     var isSelectionDragInProgress = false
+
+    enum AlternateSelectionAutoScrollDirection {
+        case up
+        case down
+    }
+
+    private var alternateSelectionAutoScrollText: String?
+    private var alternateSelectionAutoScrollDirection: AlternateSelectionAutoScrollDirection?
+    private var alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
 
     // 测试钩子：选区自动滚动 timer 是否处于武装状态。守护"驱动自动滚动的 timer 接线"。
     var selectionAutoScrollIsActive: Bool { selectionAutoScrollTimer != nil }
@@ -2239,9 +2252,19 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return false
         }
 
-        // 备用屏现在也有 Relay 自己的回看缓冲（见 Terminal init 给 altBuffer 配的 scrollback），
-        // 因此与主屏走同一套：本地 scrollUp/scrollDown 推动 yDisp 露出历史行，再用 dragExtend
-        // 把选区延伸进去——视觉连续、复制所见即所得，不再需要「转发滚动 + 文本拼接」的脆弱方案。
+        if shouldForwardAlternateSelectionAutoScroll(delta: delta) {
+            selection.dragExtend(bufferPosition: selectionPosition(for: point))
+            captureAlternateSelectionAutoScrollText(direction: delta < 0 ? .up : .down)
+            alternateSelectionAutoScrollNeedsCaptureAfterFeed = true
+            sendAlternateSelectionScroll(delta: delta, point: point)
+            didSelectionDrag = true
+            return true
+        }
+
+        if terminal.isDisplayBufferAlternate {
+            resetAlternateSelectionAutoScrollCapture()
+        }
+
         let oldYDisp = terminal.displayBuffer.yDisp
         let oldEnd = selection.end
         if delta < 0 {
@@ -2253,6 +2276,134 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         selection.dragExtend(bufferPosition: selectionPosition(for: point))
         didSelectionDrag = true
         return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
+    }
+
+    private func canSelectionAutoScrollLocally(delta: Int) -> Bool {
+        let displayBuffer = terminal.displayBuffer
+        let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
+        if delta < 0 {
+            return displayBuffer.yDisp > 0
+        }
+        return displayBuffer.yDisp < maxScrollback
+    }
+
+    private func shouldForwardAlternateSelectionAutoScroll(delta: Int) -> Bool {
+        guard terminal.isDisplayBufferAlternate else {
+            return false
+        }
+        guard !canSelectionAutoScrollLocally(delta: delta) else {
+            return false
+        }
+
+        // vim/less/htop 等备用屏程序通常不产生 Relay 本地历史，yBase 会保持 0。
+        // 这类程序必须收到滚轮/方向键事件才能把自己的内容滚进可见区域。
+        return terminal.displayBuffer.yBase == 0
+    }
+
+    private func sendAlternateSelectionScroll (delta: Int, point: CGPoint)
+    {
+        let lines = max(1, min(abs(delta), Self.alternateScrollLineCap))
+        let goingUp = delta < 0
+        if allowMouseReporting && terminal.mouseMode != .off {
+            sendAlternateMouseWheel(up: goingUp, lines: lines, at: point, modifierFlags: [])
+        } else {
+            sendAlternateScrollKeys(up: goingUp, lines: lines)
+        }
+    }
+
+    func selectedTextForCopy () -> String
+    {
+        if selection.active, terminal.isDisplayBufferAlternate,
+           let text = alternateSelectionAutoScrollText, !text.isEmpty {
+            return text
+        }
+        return selection.getSelectedText()
+    }
+
+    private func resetAlternateSelectionAutoScrollCapture ()
+    {
+        alternateSelectionAutoScrollText = nil
+        alternateSelectionAutoScrollDirection = nil
+        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
+    }
+
+    func updateAlternateSelectionAutoScrollCaptureAfterFeed ()
+    {
+        guard terminal.isDisplayBufferAlternate else {
+            resetAlternateSelectionAutoScrollCapture()
+            return
+        }
+        guard alternateSelectionAutoScrollText != nil, alternateSelectionAutoScrollNeedsCaptureAfterFeed else {
+            return
+        }
+        guard selection.active, let direction = alternateSelectionAutoScrollDirection else {
+            resetAlternateSelectionAutoScrollCapture()
+            return
+        }
+
+        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
+        captureAlternateSelectionAutoScrollText(direction: direction)
+    }
+
+    func captureAlternateSelectionAutoScrollText (direction: AlternateSelectionAutoScrollDirection)
+    {
+        guard terminal.isDisplayBufferAlternate, selection.active else {
+            return
+        }
+        let current = selection.getSelectedText()
+        guard !current.isEmpty else {
+            return
+        }
+        guard let existing = alternateSelectionAutoScrollText else {
+            alternateSelectionAutoScrollText = current
+            alternateSelectionAutoScrollDirection = direction
+            return
+        }
+
+        alternateSelectionAutoScrollText = mergedAlternateSelectionAutoScrollText(existing: existing, current: current, direction: direction)
+        alternateSelectionAutoScrollDirection = direction
+    }
+
+    func mergedAlternateSelectionAutoScrollText (existing: String, current: String, direction: AlternateSelectionAutoScrollDirection) -> String
+    {
+        guard !existing.isEmpty else {
+            return current
+        }
+        guard !current.isEmpty, current != existing else {
+            return existing
+        }
+
+        switch direction {
+        case .down:
+            return joinedSelectionBlocks(existing, current)
+        case .up:
+            return joinedSelectionBlocks(current, existing)
+        }
+    }
+
+    private func joinedSelectionBlocks (_ upper: String, _ lower: String) -> String
+    {
+        if upper.isEmpty {
+            return lower
+        }
+        if lower.isEmpty {
+            return upper
+        }
+
+        let upperLines = upper.components(separatedBy: "\n")
+        let lowerLines = lower.components(separatedBy: "\n")
+        let maxOverlap = min(upperLines.count, lowerLines.count)
+        if maxOverlap > 0 {
+            for count in stride(from: maxOverlap, through: 1, by: -1) {
+                if Array(upperLines.suffix(count)) == Array(lowerLines.prefix(count)) {
+                    return (upperLines + lowerLines.dropFirst(count)).joined(separator: "\n")
+                }
+            }
+        }
+        if upper.hasSuffix("\n") || lower.hasPrefix("\n") {
+            return upper + lower
+        }
+        return upper + "\n" + lower
     }
 
     // Callback from when the mouseDown autoscrolling timer goes off
@@ -2352,6 +2503,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         // 新一次按下：拖拽尚未开始，复位标志（真正开始划选时由 mouseDragged 置 true）。
         isSelectionDragInProgress = false
+        resetAlternateSelectionAutoScrollCapture()
 
         switch event.clickCount {
         case 1:
@@ -2388,6 +2540,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public override func mouseUp(with event: NSEvent) {
         stopSelectionAutoScroll()
         pendingSelectionAnchor = nil
+        if terminal.isDisplayBufferAlternate, isSelectionDragInProgress,
+           let direction = alternateSelectionAutoScrollDirection {
+            captureAlternateSelectionAutoScrollText(direction: direction)
+        }
         // 拖拽结束：恢复主屏「输出滚动时清选区」的原行为（备用屏由 feedPrepare/linefeed 自身判断保留）。
         isSelectionDragInProgress = false
         let hit = calculateMouseHit(with: event).grid

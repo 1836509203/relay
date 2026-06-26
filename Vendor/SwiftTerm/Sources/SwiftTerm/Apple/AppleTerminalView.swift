@@ -1868,18 +1868,18 @@ extension TerminalView {
         return []
     }
     /**
-     * Returns the thumb size in proportion to the visible content of the entire content, alternate buffers are not scrollable, so this returns 0
+     * Returns the thumb size in proportion to the visible content of the entire content.
      */
     public var scrollThumbsize: CGFloat {
         get {
             let displayBuffer = terminal.displayBuffer
-            if terminal.isDisplayBufferAlternate {
-                return 0
+            guard displayBuffer.hasScrollback, displayBuffer.lines.count > displayBuffer.rows else {
+                return 1
             }
             
             // the thumb size is the proportion of the visible content of the
             // entire content but don't make it too small
-            return max (CGFloat (displayBuffer.rows) / CGFloat (displayBuffer.lines.count), 0.01)
+            return max (CGFloat (displayBuffer.rows) / CGFloat (max(displayBuffer.lines.count, 1)), 0.01)
         }
     }
     
@@ -1889,11 +1889,11 @@ extension TerminalView {
     public var scrollPosition: Double {
         get {
             let displayBuffer = terminal.displayBuffer
-            if terminal.isDisplayBufferAlternate || displayBuffer.yDisp <= 0 {
+            let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
+            if displayBuffer.yDisp <= 0 || maxScrollback == 0 {
                 return 0
             }
             
-            let maxScrollback = displayBuffer.lines.count - displayBuffer.rows
             if displayBuffer.yDisp >= maxScrollback {
                 return 1
             }
@@ -1908,8 +1908,7 @@ extension TerminalView {
     public var canScroll: Bool {
         get {
             let displayBuffer = terminal.displayBuffer
-            return !terminal.isDisplayBufferAlternate &&
-                displayBuffer.hasScrollback &&
+            return displayBuffer.hasScrollback &&
                 displayBuffer.lines.count > displayBuffer.rows
         }
     }
@@ -1920,7 +1919,7 @@ extension TerminalView {
         let displayBuffer = terminal.displayBuffer
         let oldPosition = displayBuffer.yDisp
         
-        let maxScrollback = displayBuffer.lines.count - displayBuffer.rows
+        let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
         var newScrollPosition = Int (Double (maxScrollback) * toPosition)
         
         if newScrollPosition < 0 {
@@ -1932,6 +1931,8 @@ extension TerminalView {
 
         if newScrollPosition != oldPosition {
             scrollTo(row: newScrollPosition)
+        } else {
+            terminal.setViewYDisp(newScrollPosition)
         }
         userScrolling = false
     }
@@ -1939,9 +1940,9 @@ extension TerminalView {
     public func scrollTo (row: Int, notifyAccessibility: Bool = true)
     {
         let displayBuffer = terminal.displayBuffer
-        if row != displayBuffer.yDisp {
-            terminal.setViewYDisp (row)
-
+        let oldPosition = displayBuffer.yDisp
+        terminal.setViewYDisp(row)
+        if row != oldPosition {
             // tell the terminal we want to refresh all the rows
             terminal.refresh (startRow: 0, endRow: terminal.rows)
 
@@ -1957,7 +1958,7 @@ extension TerminalView {
     /// Scrolls the content of the terminal one page up
     public func pageUp()
     {
-        if terminal.isDisplayBufferAlternate {
+        if terminal.isDisplayBufferAlternate && !canScroll {
             send (EscapeSequences.cmdPageUp)
         } else {
             scrollUp (lines: terminal.rows)
@@ -1967,7 +1968,7 @@ extension TerminalView {
     /// Scrolls the content of the terminal one page down
     public func pageDown ()
     {
-        if terminal.isDisplayBufferAlternate {
+        if terminal.isDisplayBufferAlternate && !canScroll {
             send (EscapeSequences.cmdPageDown)
         } else {
             scrollDown (lines: terminal.rows)
@@ -1985,7 +1986,8 @@ extension TerminalView {
     public func scrollDown (lines: Int)
     {
         let displayBuffer = terminal.displayBuffer
-        let newPosition = max (0, min (displayBuffer.yDisp + lines, displayBuffer.lines.count - displayBuffer.rows))
+        let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
+        let newPosition = max (0, min (displayBuffer.yDisp + lines, maxScrollback))
         scrollTo (row: newPosition)
     }
       
@@ -2011,6 +2013,9 @@ extension TerminalView {
     
     func feedFinish ()
     {
+        #if os(macOS)
+        updateAlternateSelectionAutoScrollCaptureAfterFeed()
+        #endif
         suspendDisplayUpdates ()
         queuePendingDisplay()
     }

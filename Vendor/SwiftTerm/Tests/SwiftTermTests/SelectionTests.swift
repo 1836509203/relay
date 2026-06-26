@@ -143,10 +143,8 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.selectionAutoScrollIsActive == false)
     }
 
-    // Relay regression: Claude Code/codex/vim run in the alternate screen. It has no
-    // Relay scrollback, so edge-drag selection must forward scroll intent to the TUI
-    // itself. Otherwise the visible selection works, but dragging past the edge never
-    // brings in more content to select.
+    // Relay regression: vim/less/htop 这类备用屏程序自己管理可见内容，通常不会产生
+    // Relay 本地 scrollback。此时边缘拖选必须把滚动转发给 TUI，否则窗口外的内容永远滚不进来。
     @Test func testSelectionAutoScrollOnAlternateScreenSendsScrollInput() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let delegate = CapturingTerminalViewDelegate()
@@ -171,6 +169,65 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.terminal.mouseMode != .off)
         #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
         #expect(delegate.sent.isEmpty == false)
+    }
+
+    // Relay regression: Claude Code/codex 会在备用屏里持续输出，旧行从顶部滚出后应进入
+    // Relay 本地 scrollback。拖选到边缘时应本地滚动并继续扩展选区，不能转发方向键给程序。
+    @Test func testSelectionAutoScrollOnAlternateScreenUsesLocalScrollbackWhenAvailable() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: (0..<120).map { "line \($0)" }.joined(separator: "\r\n"))
+        #expect(view.terminal.isDisplayBufferAlternate == true)
+        #expect(view.terminal.displayBuffer.yBase > 0)
+
+        let maxScrollback = max(0, view.terminal.displayBuffer.lines.count - view.terminal.displayBuffer.rows)
+        view.scrollTo(row: max(0, maxScrollback - 3))
+        view.selection.startSelection(row: view.terminal.displayBuffer.yDisp, col: 0)
+
+        let bottomPoint = CGPoint(x: 20, y: 0)
+        let oldYDisp = view.terminal.displayBuffer.yDisp
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+        #expect(view.terminal.displayBuffer.yDisp == min(oldYDisp + 2, maxScrollback))
+        #expect(delegate.sent.isEmpty == true)
+        #expect(view.selectedTextForCopy() == view.selection.getSelectedText())
+    }
+
+    @Test func testAlternateScreenScrollerUsesLocalScrollback() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: (0..<120).map { "line \($0)" }.joined(separator: "\r\n"))
+
+        #expect(view.terminal.isDisplayBufferAlternate == true)
+        #expect(view.canScroll == true)
+        #expect(view.scrollThumbsize > 0)
+        #expect(view.scrollThumbsize < 1)
+
+        view.scrollTo(row: max(0, view.terminal.displayBuffer.lines.count - view.terminal.displayBuffer.rows))
+        #expect(view.scrollPosition == 1)
+    }
+
+    @Test func testAlternateBufferScrollbackTracksResetAndRuntimeResize() {
+        let terminal = Terminal(delegate: self, options: TerminalOptions(cols: 20, rows: 4, scrollback: 8))
+        terminal.feed(text: "\u{1B}[?1049h")
+        terminal.feed(text: (0..<20).map { "line \($0)" }.joined(separator: "\r\n"))
+
+        #expect(terminal.isDisplayBufferAlternate == true)
+        #expect(terminal.displayBuffer.hasScrollback == true)
+        #expect(terminal.displayBuffer.yBase > 0)
+        #expect(terminal.altBuffer.disableReflow == true)
+
+        terminal.changeScrollback(2)
+        #expect(terminal.altBuffer.hasScrollback == true)
+        #expect(terminal.altBuffer.lines.maxLength == terminal.rows + 2)
+        #expect(terminal.altBuffer.disableReflow == true)
+
+        terminal.resetToInitialState()
+        #expect(terminal.isDisplayBufferAlternate == false)
+        #expect(terminal.altBuffer.hasScrollback == true)
+        #expect(terminal.altBuffer.lines.maxLength == terminal.rows + 2)
+        #expect(terminal.altBuffer.disableReflow == true)
     }
 
     @Test func testAlternateSelectionAutoScrollMergeKeepsContinuousText() {
