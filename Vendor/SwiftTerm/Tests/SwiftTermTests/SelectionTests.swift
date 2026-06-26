@@ -108,13 +108,17 @@ final class SelectionTests: TerminalDelegate {
         view.scrollTo(row: 10)
         view.selection.startSelection(row: 0, col: 0)
 
-        let bottomPoint = CGPoint(x: 20, y: 0)
+        let edgeInset = max(view.cellDimension.height * 1.5, 24)
+        let bottomPoint = CGPoint(x: 20, y: edgeInset - 1)
         let oldYDisp = view.terminal.displayBuffer.yDisp
         #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint))
         #expect(view.terminal.displayBuffer.yDisp == oldYDisp + 2)
-        #expect(view.selection.end.row >= view.terminal.displayBuffer.yDisp)
+        #expect(view.selection.end.row == min(
+            view.terminal.displayBuffer.lines.count - 1,
+            view.terminal.displayBuffer.yDisp + view.terminal.displayBuffer.rows - 1
+        ))
 
-        let topPoint = CGPoint(x: 20, y: view.bounds.height)
+        let topPoint = CGPoint(x: 20, y: view.bounds.height - edgeInset + 1)
         let scrolledYDisp = view.terminal.displayBuffer.yDisp
         #expect(view.performSelectionAutoScroll(delta: -2, point: topPoint))
         #expect(view.terminal.displayBuffer.yDisp == scrolledYDisp - 2)
@@ -163,6 +167,10 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
         #expect(view.terminal.displayBuffer.yDisp == oldYDisp)
         #expect(delegate.sent == EscapeSequences.moveDownNormal + EscapeSequences.moveDownNormal)
+        #expect(view.selection.end.row == min(
+            view.terminal.displayBuffer.lines.count - 1,
+            view.terminal.displayBuffer.yDisp + view.terminal.displayBuffer.rows - 1
+        ))
 
         delegate.sent.removeAll()
         view.feed(text: "\u{1B}[?1000h")
@@ -266,10 +274,16 @@ final class SelectionTests: TerminalDelegate {
 
         view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 2))
         view.isSelectionDragInProgress = true
-        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: 0)
+        let edgeInset = max(view.cellDimension.height * 1.5, 24)
+        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: edgeInset - 1)
+        view.updateSelectionAutoScroll(at: bottomPoint)
         #expect(view.performSelectionAutoScroll(delta: 1, point: bottomPoint) == true)
+        #expect(view.selection.end.row == view.terminal.displayBuffer.rows - 1)
+        #expect(view.selection.end.col == 6)
         view.feed(text: "\u{1B}[Hline 2\u{1B}[K\r\nline 3\u{1B}[K\r\nline 4\u{1B}[K")
 
+        #expect(view.selection.end.row == view.terminal.displayBuffer.rows - 1)
+        #expect(view.selection.end.col == 6)
         #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
 
         view.isSelectionDragInProgress = false

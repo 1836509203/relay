@@ -2214,6 +2214,24 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return Position(col: col, row: row)
     }
 
+    private func selectionAutoScrollEdgePosition (delta: Int, point: CGPoint) -> Position
+    {
+        let displayBuffer = terminal.displayBuffer
+        let cellWidth = max(cellDimension.width, 1)
+        let x = min(max(point.x, 0), max(bounds.width - 1, 0))
+        let col = min(max(0, Int(x / cellWidth)), terminal.cols - 1)
+        let edgeScreenRow = delta < 0 ? 0 : max(0, displayBuffer.rows - 1)
+        let maxRow = max(0, displayBuffer.lines.count - 1)
+        let row = min(max(0, displayBuffer.yDisp + edgeScreenRow), maxRow)
+        return Position(col: col, row: row)
+    }
+
+    private func extendSelectionToAutoScrollEdge (direction: AlternateSelectionAutoScrollDirection, point: CGPoint? = nil)
+    {
+        let delta = direction == .up ? -1 : 1
+        selection.dragExtend(bufferPosition: selectionAutoScrollEdgePosition(delta: delta, point: point ?? selectionAutoScrollPoint))
+    }
+
     private func ensureSelectionAutoScrollTimer ()
     {
         guard selectionAutoScrollTimer == nil else {
@@ -2252,9 +2270,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return false
         }
 
+        let direction: AlternateSelectionAutoScrollDirection = delta < 0 ? .up : .down
         if shouldForwardAlternateSelectionAutoScroll(delta: delta) {
-            selection.dragExtend(bufferPosition: selectionPosition(for: point))
-            captureAlternateSelectionAutoScrollText(direction: delta < 0 ? .up : .down)
+            extendSelectionToAutoScrollEdge(direction: direction, point: point)
+            captureAlternateSelectionAutoScrollText(direction: direction)
             alternateSelectionAutoScrollNeedsCaptureAfterFeed = true
             sendAlternateSelectionScroll(delta: delta, point: point)
             didSelectionDrag = true
@@ -2273,7 +2292,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             scrollDown(lines: delta)
         }
 
-        selection.dragExtend(bufferPosition: selectionPosition(for: point))
+        extendSelectionToAutoScrollEdge(direction: direction, point: point)
         didSelectionDrag = true
         return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
     }
@@ -2342,6 +2361,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
 
         alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
+        extendSelectionToAutoScrollEdge(direction: direction)
         captureAlternateSelectionAutoScrollText(direction: direction)
     }
 
