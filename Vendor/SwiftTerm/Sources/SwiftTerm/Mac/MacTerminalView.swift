@@ -2824,6 +2824,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
 
         if terminal.isDisplayBufferAlternate && !mouseReportingBypassed(with: event) {
+            // Relay patch: 走到这里 = 备用屏本地没有可滚的历史(yBase==0)，滚轮要转发给程序。
+            // Claude Code / codex 这类 TUI 自管滚动、收到滚轮后就地重绘视口，并不把旧行吐进
+            // Relay 的 scrollback（故上面的本地分支永不触发）。重绘后内容变了，而选区仍锚在
+            // 固定的终端行号上：高亮块原地不动、内容从下面滑过，底部选中行被挤出高亮（看起来
+            // 「掉选」），更糟的是复制会拿到与高亮错位的文本。程序驱动的滚动一旦开始就清掉选区
+            // ——与 iTerm2/Terminal.app/Ghostty 一致。拖拽划选(isSelectionDragInProgress)不在
+            // 此列：那条路由 performSelectionAutoScroll 自管边缘滚动与跨屏文本捕获，不经 scrollWheel。
+            if selection.active && !isSelectionDragInProgress {
+                selection.selectNone()
+                resetAlternateSelectionAutoScrollCapture()
+                setNeedsDisplay(bounds)
+            }
             // Discrete notched wheels report one tick at a time (velocity 1);
             // give them the xterm `alternateScroll` convention of ~3 lines per
             // notch so vim/less scroll at the expected pace. Trackpads/Magic
