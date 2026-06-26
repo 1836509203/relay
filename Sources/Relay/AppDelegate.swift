@@ -16,6 +16,7 @@ private func CGSSetWindowBackgroundBlurRadius(
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     private var updateTimer: Timer?
+    private weak var toastView: NSView?
 
     /// 窗口级透明与毛玻璃（applySettings 每次调用）。透明度 <1 才放开
     /// isOpaque/clear 背景 —— 不透明时保持系统默认，避免无谓的合成开销。
@@ -272,6 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             add(m, "粘贴", #selector(NSText.paste(_:)), "v")
             add(m, "全选", #selector(NSText.selectAll(_:)), "a")
             m.addItem(.separator())
+            add(m, "复制最近回复", #selector(self.copyLatestResponse(_:)), "c", [.command, .shift], target: self)
             add(m, "搜索终端内容", #selector(self.toggleSearch(_:)), "f", target: self)
         }
         menu("显示") { m in
@@ -362,6 +364,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         v.getTerminal().resetToInitialState()
         v.send(txt: "\u{0C}")
     }
+
+    /// ⌘⇧C：把当前 Claude 会话最近一条回复的纯文本写入剪贴板。
+    /// 长回复在终端里会被 CC 就地重绘 + 滚出屏幕而无法整段划选，直接读 transcript 才完整。
+    @objc private func copyLatestResponse(_ sender: Any?) {
+        let ok = SessionStore.shared.copyLatestClaudeResponse()
+        showToast(ok ? "已复制最近回复" : "未找到 Claude 回复")
+    }
+
+    /// 轻量临时提示：窗口底部居中的小胶囊，1.2s 后淡出。无原生 toast，自己搓一个。
+    private func showToast(_ text: String) {
+        guard let content = window?.contentView else { NSSound.beep(); return }
+        toastView?.removeFromSuperview()
+
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.textColor = .white
+        label.backgroundColor = .clear
+        label.sizeToFit()
+
+        let padX: CGFloat = 16, padY: CGFloat = 9
+        let box = PassthroughView(frame: NSRect(
+            x: 0, y: 0,
+            width: label.frame.width + padX * 2,
+            height: label.frame.height + padY * 2))
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
+        box.layer?.cornerRadius = 9
+        label.frame.origin = CGPoint(x: padX, y: padY)
+        box.addSubview(label)
+        box.setFrameOrigin(CGPoint(
+            x: (content.bounds.width - box.frame.width) / 2,
+            y: content.bounds.height * 0.12))
+        box.autoresizingMask = [.minXMargin, .maxXMargin, .maxYMargin]
+        content.addSubview(box)
+        toastView = box
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak box] in
+            guard let box else { return }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.35
+                box.animator().alphaValue = 0
+            }, completionHandler: { box.removeFromSuperview() })
+        }
+    }
+}
+
+/// toast 容器：1.2s 内悬浮在终端上，但不能吞掉底下的鼠标点击。
+private final class PassthroughView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 // MARK: - 通知交互（点击横幅跳回会话 / 触发更新）

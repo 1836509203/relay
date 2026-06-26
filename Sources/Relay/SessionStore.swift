@@ -405,6 +405,22 @@ final class SessionStore: ObservableObject {
     /// RELAY_DEBUG 排障入口用：只读暴露常驻视图表（relay.dump 转储 cols/rows）。
     var debugViews: [String: RelayTerminalView] { views }
 
+    /// ⌘⇧C：把活动 Claude 会话最近一条回复的纯文本写入剪贴板（直接读 CC 的 transcript，
+    /// 见 AgentTranscript）。返回 false 表示当前不是 Claude 会话、定位不到 cwd、或没找到回复。
+    /// 备用屏自管滚动、终端里抓不全长回复，故走结构化原文这条路。codex 暂未支持。
+    func copyLatestClaudeResponse() -> Bool {
+        guard let id = activeId,
+              let s = sessions.first(where: { $0.id == id }),
+              s.kind == .claude else { return false }
+        let cwd = liveCwd[id] ?? s.cwd
+        guard let cwd, !cwd.isEmpty,
+              let text = AgentTranscript.latestClaudeResponse(cwd: cwd) else { return false }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        return true
+    }
+
     func closeActive() {
         if let id = activeId { confirmClose(id) }
     }
