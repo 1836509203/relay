@@ -10,6 +10,10 @@ import Testing
 
 @testable import SwiftTerm
 
+#if os(macOS)
+import AppKit
+#endif
+
 final class SelectionTests: TerminalDelegate {
     func send(source: Terminal, data: ArraySlice<UInt8>) {
         print ("here")
@@ -60,6 +64,19 @@ final class SelectionTests: TerminalDelegate {
     }
 
 #if os(macOS)
+    private func mouseDraggedEvent(at point: CGPoint) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: point,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1)!
+    }
+
     // Test only on macOS due to differences in how frames are handled on mac and iOS
     @Test func testMouseHitCorrectWhenScrolled() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 10, height: 10)))
@@ -145,6 +162,46 @@ final class SelectionTests: TerminalDelegate {
         // 回到中间：应解除并清理 timer
         view.updateSelectionAutoScroll(at: CGPoint(x: 20, y: view.bounds.midY))
         #expect(view.selectionAutoScrollIsActive == false)
+    }
+
+    // Relay regression: 真实 mouseDragged 每帧也必须把选区终点贴到自动滚动边缘。
+    // 0.4.16 只修了 timer tick，拖动事件本身仍把 selection.end 拉回鼠标所在行，
+    // 结果表现为"能滚，但高亮选区不能连续延伸"。
+    @Test func testMouseDraggedAtAutoScrollEdgeKeepsSelectionAtVisibleEdgeAcrossTicks() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: (0..<120).map { "line \($0)" }.joined(separator: "\r\n"))
+        view.scrollTo(row: 10)
+        view.selection.startSelection(row: 0, col: 0)
+
+        let edgeInset = max(view.cellDimension.height * 1.5, 24)
+        let dragX = view.cellDimension.width * 20
+        let bottomPoint = CGPoint(x: dragX, y: edgeInset - 0.5)
+        view.mouseDragged(with: mouseDraggedEvent(at: bottomPoint))
+        #expect(view.selection.end.row == min(
+            view.terminal.displayBuffer.lines.count - 1,
+            view.terminal.displayBuffer.yDisp + view.terminal.displayBuffer.rows - 1
+        ))
+        #expect(view.selectionAutoScrollIsActive == true)
+
+        let oldYDisp = view.terminal.displayBuffer.yDisp
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint))
+        #expect(view.terminal.displayBuffer.yDisp == oldYDisp + 2)
+        #expect(view.selection.end.row == min(
+            view.terminal.displayBuffer.lines.count - 1,
+            view.terminal.displayBuffer.yDisp + view.terminal.displayBuffer.rows - 1
+        ))
+
+        view.mouseDragged(with: mouseDraggedEvent(at: bottomPoint))
+        #expect(view.selection.end.row == min(
+            view.terminal.displayBuffer.lines.count - 1,
+            view.terminal.displayBuffer.yDisp + view.terminal.displayBuffer.rows - 1
+        ))
+        #expect(view.selectedTextForCopy().contains("line 26"))
+
+        let topPoint = CGPoint(x: dragX, y: view.bounds.height - edgeInset + 0.5)
+        view.mouseDragged(with: mouseDraggedEvent(at: topPoint))
+        #expect(view.selection.end.row == view.terminal.displayBuffer.yDisp)
+        #expect(view.selectionAutoScrollIsActive == true)
     }
 
     // Relay regression: vim/less/htop 这类备用屏程序自己管理可见内容，通常不会产生

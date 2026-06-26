@@ -2182,9 +2182,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
 
-    func selectionAutoScrollDelta (for point: CGPoint) -> Int
+    private func selectionAutoScrollDeltaIgnoringSelectionState (for point: CGPoint) -> Int
     {
-        guard selection?.active == true, terminal.displayBuffer.rows > 0 else {
+        guard terminal.displayBuffer.rows > 0 else {
             return 0
         }
         // 备用屏现在也有 scrollback（见 Terminal init），故和主屏一样参与划选自动滚动：
@@ -2197,6 +2197,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return -selectionAutoScrollVelocity(distanceFromEdge: point.y - (bounds.height - edgeInset))
         }
         return 0
+    }
+
+    func selectionAutoScrollDelta (for point: CGPoint) -> Int
+    {
+        guard selection?.active == true else {
+            return 0
+        }
+        return selectionAutoScrollDeltaIgnoringSelectionState(for: point)
     }
 
     private func selectionPosition (for point: CGPoint) -> Position
@@ -2224,6 +2232,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let maxRow = max(0, displayBuffer.lines.count - 1)
         let row = min(max(0, displayBuffer.yDisp + edgeScreenRow), maxRow)
         return Position(col: col, row: row)
+    }
+
+    private func selectionDragPosition (for point: CGPoint) -> Position
+    {
+        let delta = selectionAutoScrollDeltaIgnoringSelectionState(for: point)
+        if delta != 0 {
+            return selectionAutoScrollEdgePosition(delta: delta, point: point)
+        }
+        return selectionPosition(for: point)
     }
 
     private func extendSelectionToAutoScrollEdge (direction: AlternateSelectionAutoScrollDirection, point: CGPoint? = nil)
@@ -2611,12 +2628,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             }
         }
 
-        let selectionHit = selectionPosition(for: point)
+        let rawSelectionHit = selectionPosition(for: point)
+        let selectionHit = selectionDragPosition(for: point)
         if selection.active {
             selection.dragExtend(bufferPosition: selectionHit)
         } else {
             // 起点用 mouseDown 记录的锚点（真正按下的格子），缺省回退到当前点。
-            let anchor = pendingSelectionAnchor ?? selectionHit
+            let anchor = pendingSelectionAnchor ?? rawSelectionHit
             selection.setSoftStart(bufferPosition: anchor)
             selection.startSelection()
             selection.dragExtend(bufferPosition: selectionHit)
