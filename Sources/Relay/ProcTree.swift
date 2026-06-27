@@ -38,10 +38,12 @@ struct ProcTable {
         return ProcTable(cmd: cmd, children: children)
     }
 
-    /// 判定某 shell 进程树的有效类型：agent（claude/codex）> ssh > shell。
+    /// 判定某 shell 进程树的有效类型：agent（claude/codex/opencode）
+    /// > remotion > ssh > shell。
     func classify(root: pid_t) -> WindowType {
         var stack = [root]
         var seen = Set<pid_t>()
+        var foundRemotion = false
         var foundSSH = false
 
         while let pid = stack.popLast() {
@@ -50,12 +52,15 @@ struct ProcTable {
                 switch ProcTable.cmdType(c) {
                 case .claude: return .claude
                 case .codex: return .codex
+                case .opencode: return .opencode
+                case .remotion: foundRemotion = true
                 case .ssh: foundSSH = true
                 default: break
                 }
             }
             if let ch = children[pid] { stack.append(contentsOf: ch) }
         }
+        if foundRemotion { return .remotion }
         return foundSSH ? .ssh : .shell
     }
 
@@ -93,17 +98,44 @@ struct ProcTable {
         switch base {
         case "claude": return .claude
         case "codex": return .codex
+        case "opencode", "opencode-ai": return .opencode
+        case "remotion": return .remotion
         case "ssh", "mosh", "mosh-client", "autossh", "sshpass", "et": return .ssh
         default: break
         }
-        // node/bun/deno 包装的 CLI：只看脚本路径的「路径段」，
+        // npm/npx/pnpm/yarn/bunx 这类包管理器入口，真正 CLI 常在参数里。
+        if ["npm", "npx", "pnpm", "pnpx", "yarn", "yarnpkg", "bunx"].contains(base) {
+            if let type = packageCommandType(tokens.dropFirst().map(String.init)) {
+                return type
+            }
+        }
+        // node/bun/deno 包装的 CLI：优先看脚本路径的「路径段」，
         // 避免 `node server.js --claude-mode` 之类参数误判。
         if ["node", "node.js", "bun", "deno"].contains(base) {
             if let script = tokens.dropFirst().first(where: { !$0.hasPrefix("-") && $0 != "run" }) {
                 let lc = script.lowercased()
                 if lc.split(separator: "/").contains(where: { $0.contains("claude") }) { return .claude }
                 if lc.split(separator: "/").contains(where: { $0.contains("codex") }) { return .codex }
+                if lc.split(separator: "/").contains(where: { $0.contains("opencode") }) { return .opencode }
+                if lc.split(separator: "/").contains(where: { $0.contains("remotion") }) { return .remotion }
             }
+            if let type = packageCommandType(tokens.dropFirst().map(String.init)) {
+                return type
+            }
+        }
+        return nil
+    }
+
+    private static func packageCommandType(_ args: [String]) -> WindowType? {
+        let normalized = args
+            .filter { !$0.hasPrefix("-") && $0 != "exec" && $0 != "dlx" && $0 != "x" && $0 != "run" }
+            .map { $0.lowercased() }
+        for arg in normalized {
+            let segments = arg.split(separator: "/")
+            if segments.contains(where: { $0 == "claude" || $0.contains("claude-code") }) { return .claude }
+            if segments.contains(where: { $0 == "codex" || $0.contains("openai-codex") }) { return .codex }
+            if segments.contains(where: { $0 == "opencode" || $0 == "opencode-ai" }) { return .opencode }
+            if segments.contains(where: { $0 == "remotion" || $0.hasPrefix("@remotion") }) { return .remotion }
         }
         return nil
     }

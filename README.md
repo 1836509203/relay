@@ -4,14 +4,14 @@
 
 # Relay
 
-**原生单进程 AI 终端 · 为 Claude Code / Codex 等 agent 工作流而生**
+**原生单进程 AI 终端 · 为 Codex / Claude Code / OpenCode 工作流而生**
 
 纯 Swift + AppKit/SwiftUI 构建，无 Electron、无 Web 运行时、无多进程开销。
-一个窗口管理所有 AI 编码任务：侧栏感知每个 agent 的工作状态，终端以 Metal 渲染跑满 ProMotion 120Hz。
-
-<img src="docs/screenshots/main-dark.png" width="800" alt="Relay 暗色主题" />
+一个窗口管理所有 AI 编码任务：侧栏按任务类型聚合，终端以 Metal 渲染跑满 ProMotion 120Hz。
 
 <img src="docs/screenshots/main-light.png" width="800" alt="Relay 亮色主题" />
+
+<img src="docs/screenshots/main-dark.png" width="800" alt="Relay 暗色主题" />
 
 </div>
 
@@ -21,8 +21,10 @@
 
 ### 为 AI agent 设计的任务模型
 
-- **任务 = 一组标签页**：每个任务（如一次 Claude Code 会话）可挂多个标签页（agent 主会话 + 看日志的 shell + ssh），侧栏一行聚合展示
-- **状态感知侧栏**：自动识别会话里跑的是 claude / codex / ssh / shell，实时显示 Thinking / Working / Waiting / Done / Failed 阶段，完成未读时亮点提醒
+- **任务 = 一组标签页**：每个任务可挂多个标签页（agent 主会话 + 看日志的 shell + ssh），侧栏一行聚合展示
+- **任务类型分组**：侧栏按 **Codex / Claude Code / OpenCode / 本地 Shell / 远程 SSH** 聚合，agent 任务和普通终端任务天然分开
+- **状态感知侧栏**：自动识别 `codex`、`claude`、`opencode`、`ssh`、本地 shell，以及 `npx` / `npm` / `pnpm` / `yarn` / `bunx` 包装启动的命令
+- **Remotion 友好**：Remotion 动画任务归入本地 Shell 分组，具体任务行保留本地终端的图标与快捷角标展示
 - **Claude Code hook 集成**：内置本地 HTTP hook 服务，agent 的状态变化（等待输入、任务完成）直接驱动 UI 与系统通知，不靠猜屏幕
 - **会话持久化**：退出后自动保存所有会话回看内容（纯文本快照），重启点开即恢复历史并重启 shell
 
@@ -36,7 +38,8 @@
 ### macOS 原生体验
 
 - **Safari 式标签条**：单标签融入标题栏无感显示，多标签均分宽度、淡色胶囊高亮，深度融合窗口色调
-- **整窗半透明 + 毛玻璃**：透明度/模糊半径可调，侧栏、标签条、终端区单层垫色，色调完全一致
+- **透明毛玻璃侧栏**：侧栏使用 macOS 原生 material，暗色和白色主题都保持半透明玻璃质感
+- **整窗半透明 + 毛玻璃**：终端区透明度/模糊半径可调，侧栏、标签条、终端区色调统一
 - **明暗跟随系统**：暗色 / 亮色各配一套主题（内置 Catppuccin Mocha/Latte、Solarized、One Dark、Gruvbox 等），随系统外观即时切换
 - **中文输入法完整支持**：preedit 组合浮层跟随光标，组合期光标定位正确；CJK 宽字符按网格列锚定渲染，中英混排零漂移
 - **细节**：overlay 滚动条滚动浮现自动隐藏、⌘ 长按显示任务快捷角标（⌘1-9 直达）、双击侧栏重命名任务
@@ -91,6 +94,7 @@ open dist/Relay.app # 或拷贝到 /Applications
 - **主题**：暗色 / 亮色主题独立选择，可跟随系统明暗自动切换
 - **字体**：等宽字体族 + 字号；行距、字距微调（负字距可收紧 CJK 全角间隙）
 - **背景**：不透明度（0.7–1.0）+ 毛玻璃模糊半径
+- **侧栏**：透明毛玻璃开关；任务分组可在类型分组与项目分组之间切换
 - **光标**：块 / 竖线 / 下划线，闪烁开关
 - **回看行数**：500–10000（内存敏感场景可调低）
 - **GPU 渲染**：Metal / CoreGraphics 运行时切换

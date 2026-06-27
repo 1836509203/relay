@@ -18,8 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var updateTimer: Timer?
     private weak var toastView: NSView?
 
-    /// 窗口级透明与毛玻璃（applySettings 每次调用）。透明度 <1 才放开
-    /// isOpaque/clear 背景 —— 不透明时保持系统默认，避免无谓的合成开销。
+    /// 窗口级透明与毛玻璃（applySettings 每次调用）。整窗透明或半透明
+    /// 侧栏开启时放开 isOpaque/clear 背景；纯不透明窗口保持系统默认，
+    /// 避免无谓的合成开销。
     /// 同时按生效终端主题的明暗设窗口 appearance：Theme 的动态色、SwiftUI
     /// 语义色与设置窗口随之整体切换（日间侧栏半透明白的关键一环）。
     func applyWindowChrome(opacity: Double, blur: Int) {
@@ -28,18 +29,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow?.appearance = appearance
         guard let w = window, w.windowNumber > 0 else { return }
         w.appearance = appearance
-        let translucent = opacity < 0.999
+        let translucent = opacity < 0.999 || SessionStore.shared.settings.translucentSidebar
         w.isOpaque = !translucent
         w.backgroundColor = translucent ? .clear : .windowBackgroundColor
         CGSSetWindowBackgroundBlurRadius(
             CGSDefaultConnectionForThread(), UInt32(w.windowNumber),
-            translucent ? UInt32(max(0, min(64, blur))) : 0)
+            opacity < 0.999 ? UInt32(max(0, min(64, blur))) : 0)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 通知代理须在收到任何通知前就位：点击「已完成/需确认/响铃」横幅跳回会话，
         // 点击「有新版本」横幅触发检查更新（详见扩展实现）。
-        UNUserNotificationCenter.current().delegate = self
+        if Bundle.main.bundleIdentifier != nil {
+            UNUserNotificationCenter.current().delegate = self
+        }
 
         // 运行时直设 Dock/切换器图标：ad-hoc 签名 + 手工组包的 app，
         // iconservices 常按 bundle id 命中旧缓存（通用图标），不等系统刷新。
@@ -223,6 +226,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        SessionStore.shared.noteCmdHeld(false)
+    }
+
+    func applicationWillResignActive(_ notification: Notification) {
+        SessionStore.shared.noteCmdHeld(false)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         SessionStore.shared.persistAllScrollback()
     }
@@ -313,23 +324,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
 
     @objc private func openSettings(_ sender: Any?) {
-        if settingsWindow == nil {
-            let w = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 420, height: 470),
-                styleMask: [.titled, .closable],
-                backing: .buffered, defer: false
-            )
-            w.title = "Relay 设置"
-            w.isReleasedWhenClosed = false
-            let hosting = NSHostingView(rootView: SettingsView())
-            w.contentView = hosting
-            // 设置项随版本增减，窗口高度跟内容走。
-            w.setContentSize(hosting.fittingSize)
-            w.appearance = window?.appearance
-            w.center()
-            settingsWindow = w
-        }
-        settingsWindow?.makeKeyAndOrderFront(nil)
+        SessionStore.shared.openSettings()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
     @objc private func checkForUpdates(_ sender: Any?) { Updater.check(interactive: true) }
     @objc private func prevSession(_ sender: Any?) { SessionStore.shared.cycle(-1) }

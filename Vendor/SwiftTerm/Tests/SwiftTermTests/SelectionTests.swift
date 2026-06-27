@@ -259,6 +259,32 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.selectedTextForCopy() == view.selection.getSelectedText())
     }
 
+    // Relay regression: Claude Code/codex 这类 mouse-aware TUI 可能既有 Relay 本地
+    // alt scrollback，又有程序内部视口历史。本地 scrollback 到边界后，继续拖选到
+    // 边缘应 fallback 转发鼠标滚轮，否则表现为"选区滚到边界就停住"。
+    @Test func testSelectionAutoScrollForwardsAtAlternateScrollbackBoundaryWhenMouseTrackingEnabled() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: (0..<120).map { "line \($0)" }.joined(separator: "\r\n"))
+        view.feed(text: "\u{1B}[?1000h")
+        #expect(view.terminal.isDisplayBufferAlternate == true)
+        #expect(view.terminal.displayBuffer.yBase > 0)
+        #expect(view.terminal.mouseMode != .off)
+
+        view.scrollTo(row: 0)
+        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 0))
+        delegate.sent.removeAll()
+
+        let topPoint = CGPoint(x: view.cellDimension.width * 6, y: view.bounds.height)
+        #expect(view.performSelectionAutoScroll(delta: -2, point: topPoint) == true)
+        #expect(view.terminal.displayBuffer.yDisp == 0)
+        #expect(delegate.sent.isEmpty == false)
+        #expect(view.selection.end.row == 0)
+        #expect(view.selection.end.col == 6)
+    }
+
     @Test func testAlternateScreenScrollerUsesLocalScrollback() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         view.feed(text: "\u{1B}[?1049h")

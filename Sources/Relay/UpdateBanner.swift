@@ -11,7 +11,7 @@ struct UpdateBanner: View {
         HStack(spacing: 10) {
             content
         }
-        .font(.system(size: 12))
+        .font(Theme.uiFont(size: 12))
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)

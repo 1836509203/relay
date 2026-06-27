@@ -101,12 +101,14 @@ enum Updater {
         UpdateModel.shared.found(version: version, assetURL: urlString, notes: notes)
         if !interactive {
             // 后台发现：系统通知推送，不打断当前操作；安装走通知点击或菜单。
-            let content = UNMutableNotificationContent()
-            content.title = "Relay 有新版本 v\(version)"
-            content.body = "在菜单 Relay → 检查更新… 中一键安装。"
-            content.sound = nil
-            UNUserNotificationCenter.current().add(
-                UNNotificationRequest(identifier: "relay.update.\(version)", content: content, trigger: nil))
+            if Bundle.main.bundleIdentifier != nil {
+                let content = UNMutableNotificationContent()
+                content.title = "Relay 有新版本 v\(version)"
+                content.body = "在菜单 Relay → 检查更新… 中一键安装。"
+                content.sound = nil
+                UNUserNotificationCenter.current().add(
+                    UNNotificationRequest(identifier: "relay.update.\(version)", content: content, trigger: nil))
+            }
             return
         }
         let a = NSAlert()

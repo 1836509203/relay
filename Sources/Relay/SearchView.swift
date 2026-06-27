@@ -18,14 +18,15 @@ struct SearchBar: View {
                 .foregroundColor(Theme.fg2)
             TextField("搜索终端内容", text: $query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(Theme.uiFont(size: 12))
                 .foregroundColor(Theme.fg0)
                 .focused($focused)
                 .onSubmit { jump(1) }
                 .onChange(of: query) { _ in research() }
             Text(matchCount == 0 ? (query.isEmpty ? "" : "无匹配") : "\(current + 1)/\(matchCount)")
-                .font(.system(size: 10.5).monospacedDigit())
+                .font(Theme.uiFont(size: 10.5))
                 .foregroundColor(Theme.fg2)
+                .monospacedDigit()
                 .frame(minWidth: 52, alignment: .trailing)
             Button { jump(-1) } label: { Image(systemName: "chevron.up").font(.system(size: 10, weight: .semibold)) }
                 .buttonStyle(.plain).foregroundColor(Theme.fg2)
@@ -41,7 +42,10 @@ struct SearchBar: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(Theme.bg2)
+        .background(Theme.workspaceRaised)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Theme.chromeLine).frame(height: 1)
+        }
         .onAppear { focused = true }
         .onExitCommand { closeBar() }
     }

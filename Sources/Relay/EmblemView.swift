@@ -8,6 +8,7 @@
 //   Codex  = 蓝紫三段渐变云朵 + 白 > + 下划线光标
 //     working  = 光标阶跃闪烁 + ±2.5% 呼吸；thinking = ±6° 摆动 + ±5% 呼吸
 //                + 光标呼吸式明暗；done = 回弹落定 + 辉光闪落 + 角标
+//   OpenCode = 青绿开放菱形 + 旋转节点；Remotion = 粉紫播放三角 + 轨道环
 //   本地终端 = 灰白 ❯ + 琥珀竖线光标闪烁 + 静态柔光
 //   远程 SSH = 蓝 ❯ + 竖线光标 + 底部流动虚线（lineDashPhase 行军）
 //
@@ -92,6 +93,8 @@ final class EmblemBackingView: NSView {
         switch kind {
         case .claude: buildSpark(in: core, S: S, phase: phase, active: active)
         case .codex: buildCloud(in: core, S: S, phase: phase, active: active)
+        case .opencode: buildOpenCode(in: core, S: S, phase: phase, active: active)
+        case .remotion: buildRemotion(in: core, S: S, phase: phase, active: active)
         case .shell: buildTerm(in: core, S: S, phase: phase, active: active)
         case .ssh: buildSSH(in: core, S: S, phase: phase, active: active)
         }
@@ -503,6 +506,153 @@ final class EmblemBackingView: NSView {
             settle.duration = 0.73
             settle.timingFunction = Self.easeOutBack
             body.add(once(settle, delay: 0.2), forKey: "settle")
+        }
+    }
+
+    // MARK: OpenCode（开放菱形 + 节点轨道）
+
+    private func buildOpenCode(in parent: CALayer, S: CGFloat, phase: DisplayPhase, active: Bool) {
+        let working = phase == .working || phase == .waiting
+        let thinking = phase == .thinking
+        let done = phase == .done
+        let full = CGRect(x: 0, y: 0, width: S, height: S)
+        let tint = NSColor(hexv: 0x36C5A6)
+        let accent = NSColor(hexv: 0x8EE8D1)
+
+        if active || done {
+            let glow = glowLayer(
+                S: S, color: tint,
+                base: done ? 0.26 : (thinking ? 0.34 : 0.38),
+                amp: active ? 0.16 : 0,
+                active: active
+            )
+            parent.addSublayer(glow)
+        }
+
+        let body = CALayer()
+        body.frame = full
+        parent.addSublayer(body)
+
+        let diamond = CGMutablePath()
+        diamond.move(to: CGPoint(x: S * 0.50, y: S * 0.17))
+        diamond.addLine(to: CGPoint(x: S * 0.82, y: S * 0.50))
+        diamond.addLine(to: CGPoint(x: S * 0.50, y: S * 0.83))
+        diamond.addLine(to: CGPoint(x: S * 0.18, y: S * 0.50))
+        diamond.closeSubpath()
+        let frame = shape(diamond, stroke: tint, fill: nil, lineWidth: S * 0.07, frame: full)
+        frame.lineJoin = .round
+        frame.lineCap = .round
+        frame.lineDashPattern = [NSNumber(value: Double(S * 0.24)), NSNumber(value: Double(S * 0.10))]
+        body.addSublayer(frame)
+
+        let slash = CGMutablePath()
+        slash.move(to: CGPoint(x: S * 0.58, y: S * 0.28))
+        slash.addLine(to: CGPoint(x: S * 0.42, y: S * 0.72))
+        body.addSublayer(shape(slash, stroke: accent, lineWidth: S * 0.07, frame: full))
+
+        for i in 0..<3 {
+            let a = CGFloat(i) * .pi * 2 / 3 - .pi / 2
+            let dot = CALayer()
+            let r = S * 0.055
+            dot.bounds = CGRect(x: 0, y: 0, width: r * 2, height: r * 2)
+            dot.cornerRadius = r
+            dot.position = CGPoint(x: S * 0.5 + cos(a) * S * 0.29, y: S * 0.5 + sin(a) * S * 0.29)
+            dot.backgroundColor = (i == 0 ? accent : tint).cgColor
+            body.addSublayer(dot)
+            if thinking {
+                let pulse = loop(key: "transform.scale", from: 0.75, to: 1.22, dur: 0.9)
+                pulse.timeOffset = Double(i) * 0.25
+                dot.add(pulse, forKey: "nodePulse")
+            }
+        }
+
+        if working {
+            body.add(spin(dur: Self.loopDur * 0.85), forKey: "orbit")
+            frame.add(loop(key: "lineDashPhase", from: 0, to: -S * 0.34, dur: 1.2), forKey: "dash")
+        } else if thinking {
+            body.add(loop(key: "transform.rotation.z", from: -.pi / 24, to: .pi / 24, dur: 1.6), forKey: "sway")
+            body.add(loop(key: "transform.scale", from: 0.94, to: 1.06, dur: 1), forKey: "breathe")
+        } else if done {
+            let settle = CABasicAnimation(keyPath: "transform.scale")
+            settle.fromValue = 0.9
+            settle.toValue = 1
+            settle.duration = 0.65
+            settle.timingFunction = Self.easeOutBack
+            body.add(once(settle, delay: 0.1), forKey: "settle")
+        }
+    }
+
+    // MARK: Remotion 动画（播放三角 + 轨道环）
+
+    private func buildRemotion(in parent: CALayer, S: CGFloat, phase: DisplayPhase, active: Bool) {
+        let working = phase == .working || phase == .waiting
+        let thinking = phase == .thinking
+        let done = phase == .done
+        let full = CGRect(x: 0, y: 0, width: S, height: S)
+        let magenta = NSColor(hexv: 0xF04AB8)
+        let violet = NSColor(hexv: 0x7C5CFF)
+        let cyan = NSColor(hexv: 0x42D6FF)
+        let c = S / 2
+
+        if active || done {
+            parent.addSublayer(glowLayer(
+                S: S, color: violet,
+                base: done ? 0.25 : (thinking ? 0.32 : 0.36),
+                amp: active ? 0.18 : 0,
+                active: active
+            ))
+        }
+
+        let ring = CAShapeLayer()
+        ring.frame = full
+        ring.path = CGPath(ellipseIn: CGRect(x: S * 0.17, y: S * 0.17, width: S * 0.66, height: S * 0.66), transform: nil)
+        ring.strokeColor = violet.cgColor
+        ring.fillColor = nil
+        ring.lineWidth = S * 0.065
+        ring.lineCap = .round
+        ring.strokeStart = 0.08
+        ring.strokeEnd = 0.82
+        parent.addSublayer(ring)
+
+        let smallRing = CAShapeLayer()
+        smallRing.frame = full
+        smallRing.path = CGPath(ellipseIn: CGRect(x: S * 0.26, y: S * 0.26, width: S * 0.48, height: S * 0.48), transform: nil)
+        smallRing.strokeColor = cyan.withAlphaComponent(0.85).cgColor
+        smallRing.fillColor = nil
+        smallRing.lineWidth = S * 0.035
+        smallRing.lineDashPattern = [NSNumber(value: Double(S * 0.09)), NSNumber(value: Double(S * 0.075))]
+        parent.addSublayer(smallRing)
+
+        let play = CGMutablePath()
+        play.move(to: CGPoint(x: S * 0.42, y: S * 0.34))
+        play.addLine(to: CGPoint(x: S * 0.42, y: S * 0.66))
+        play.addLine(to: CGPoint(x: S * 0.68, y: S * 0.50))
+        play.closeSubpath()
+        let playLayer = shape(play, fill: magenta, frame: full)
+        parent.addSublayer(playLayer)
+
+        let spark = CALayer()
+        spark.bounds = CGRect(x: 0, y: 0, width: S * 0.11, height: S * 0.11)
+        spark.cornerRadius = S * 0.055
+        spark.position = CGPoint(x: c + S * 0.33, y: c)
+        spark.backgroundColor = cyan.cgColor
+        parent.addSublayer(spark)
+
+        if working {
+            ring.add(spin(dur: 1.35), forKey: "ringSpin")
+            smallRing.add(spin(dur: 2.1), forKey: "dashSpin")
+            playLayer.add(loop(key: "transform.scale", from: 0.92, to: 1.08, dur: 0.75), forKey: "playPulse")
+            spark.add(loop(key: "opacity", from: 0.45, to: 1, dur: 0.6), forKey: "sparkPulse")
+        } else if thinking {
+            ring.add(loop(key: "strokeEnd", from: 0.62, to: 0.92, dur: 1.1), forKey: "trim")
+            playLayer.add(loop(key: "transform.translation.x", from: -S * 0.035, to: S * 0.035, dur: 1), forKey: "seek")
+        } else if done {
+            let pop = CABasicAnimation(keyPath: "transform.scale")
+            pop.fromValue = 0.88
+            pop.toValue = 1
+            pop.duration = 0.6
+            pop.timingFunction = Self.easeOutBack
+            playLayer.add(once(pop, delay: 0.1), forKey: "pop")
         }
     }
 

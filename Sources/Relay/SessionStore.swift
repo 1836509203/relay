@@ -21,6 +21,8 @@ final class SessionStore: ObservableObject {
     @Published var unread: Set<String> = []
     /// 按住 ⌘ 时侧栏任务行显示 ⌘1-9 快捷角标（松开即隐）。
     @Published var cmdHeld = false
+    /// 主窗口内设置模式。菜单和侧栏入口都切到同一处，避免弹出第二个窗口。
+    @Published var settingsVisible = false
     /// 系统当前是否暗色（followSystemTheme 用；AppDelegate 监听变化刷新）。
     @Published var systemIsDark = true
 
@@ -28,11 +30,31 @@ final class SessionStore: ObservableObject {
     /// 否则用 theme 原值。
     var effectiveThemeId: String {
         guard settings.followSystemTheme else { return settings.theme }
-        return TerminalTheme.counterpart(of: settings.theme, wantLight: !systemIsDark)
+        if systemIsDark {
+            return TerminalTheme.counterpart(of: settings.theme, wantLight: false)
+        }
+        let lightTheme = TerminalTheme.by(id: settings.themeLight)
+        return lightTheme.isLight ? lightTheme.id : TerminalTheme.counterpart(of: settings.themeLight, wantLight: true)
+    }
+
+    var effectiveTheme: TerminalTheme {
+        TerminalTheme.by(id: effectiveThemeId).applyingOverrides(
+            accent: settings.customAccentHex,
+            background: settings.customBackgroundHex,
+            foreground: settings.customForegroundHex
+        )
     }
 
     /// 壳层（侧栏/标签条/设置页）明暗 = 生效终端主题的明暗。
-    var shellIsLight: Bool { TerminalTheme.by(id: effectiveThemeId).isLight }
+    var shellIsLight: Bool { effectiveTheme.isLight }
+
+    var reduceMotionEnabled: Bool {
+        switch settings.motionPreference {
+        case "on": return true
+        case "off": return false
+        default: return NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        }
+    }
 
     /// 系统明暗变化入口（AppDelegate 分布式通知回调）。
     func noteSystemAppearance() {
@@ -44,6 +66,15 @@ final class SessionStore: ObservableObject {
 
     func noteCmdHeld(_ held: Bool) {
         if cmdHeld != held { cmdHeld = held }
+    }
+
+    func openSettings() {
+        settingsVisible = true
+        searchVisible = false
+    }
+
+    func closeSettings() {
+        settingsVisible = false
     }
 
     /// 每会话检测运行态（不持久化）。必须是引用类型：feed 热路径就地变更。
@@ -116,6 +147,17 @@ final class SessionStore: ObservableObject {
     /// 某任务的全部标签页（根 + 子，创建顺序）。
     func tabs(ofTask tid: String) -> [Session] {
         sessions.filter { $0.id == tid || $0.parentId == tid }
+    }
+
+    /// 单个会话当前工作目录：实时采样优先，回落到最近一次落盘值。
+    func cwd(of id: String) -> String? {
+        if let live = liveCwd[id], !live.isEmpty { return live }
+        return sessions.first(where: { $0.id == id })?.cwd
+    }
+
+    /// 任务当前工作目录：取任务内任一标签页的可用 cwd，用于侧栏项目分组展示。
+    func cwd(ofTask tid: String) -> String? {
+        tabs(ofTask: tid).compactMap { cwd(of: $0.id) }.first { !$0.isEmpty }
     }
 
     // MARK: - 任务重排（侧栏拖拽）
@@ -447,7 +489,7 @@ final class SessionStore: ObservableObject {
 
     /// 把当前设置（主题/字体族/字号）应用到全部常驻终端视图并持久化。
     func applySettings() {
-        let theme = TerminalTheme.by(id: effectiveThemeId)
+        let theme = effectiveTheme
         // 行高/字距补丁是静态量，必须先设好 —— 随后 apply 里的 font setter
         // 会触发 computeFontDimensions 重算（setter 无相等守卫）。
         RelayTerminalView.cellHeightAdjustment = CGFloat(settings.lineSpacing)
@@ -500,9 +542,8 @@ final class SessionStore: ObservableObject {
         v.metalBufferingMode = .perFrameAggregated
         RelayTerminalView.cellHeightAdjustment = CGFloat(settings.lineSpacing)
         RelayTerminalView.cellWidthAdjustment = CGFloat(settings.letterSpacing)
-        TerminalTheme.by(id: effectiveThemeId)
-            .apply(to: v, fontSize: settings.fontSize, fontName: settings.fontName,
-                   bgAlpha: settings.bgOpacity)
+        effectiveTheme.apply(to: v, fontSize: settings.fontSize, fontName: settings.fontName,
+                             bgAlpha: settings.bgOpacity)
         // 必须在主题（含字体）应用之后：设字体会整体重置 options。
         // 此时还没喂任何数据，reset 重建 buffer 让容量立即生效，零副作用。
         v.ensureScrollback(reset: true)
@@ -528,10 +569,12 @@ final class SessionStore: ObservableObject {
         // 末三个是 macOS 以 GUI app 拉起进程时 LaunchServices/XPC 注入的残留：
         // 对登录 shell 毫无意义，还会把 app 身份（bundle id）泄漏给每个子进程，
         // 规矩的终端不会传它们。__CF_USER_TEXT_ENCODING 是合法 locale 提示，保留。
+        // NO_COLOR 是宿主测试环境常见变量，会让 Claude Code 等 TUI 主动关闭彩色
+        // 输出；Relay 作为终端容器不应把这个宿主偏好漏给用户新开的 shell。
         for k in ["PROMPT_COMMAND", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID",
                   "ITERM_SESSION_ID", "ITERM_PROFILE", "TMUX", "TMUX_PANE", "STY",
                   "INSIDE_EMACS", "VSCODE_INJECTION", "WEZTERM_PANE", "KITTY_WINDOW_ID",
-                  "__CFBundleIdentifier", "XPC_SERVICE_NAME", "XPC_FLAGS"] {
+                  "NO_COLOR", "__CFBundleIdentifier", "XPC_SERVICE_NAME", "XPC_FLAGS"] {
             env.removeValue(forKey: k)
         }
         env = env.filter { !$0.key.lowercased().hasPrefix("_cmux") && !$0.key.lowercased().hasPrefix("cmux") }
@@ -596,6 +639,7 @@ final class SessionStore: ObservableObject {
         switch kind {
         case .claude: return "claude --continue"
         case .codex: return "codex resume --last"
+        case .opencode: return "opencode"
         default: return nil
         }
     }
@@ -753,10 +797,18 @@ final class SessionStore: ObservableObject {
         }
         // 采样各活动会话的工作目录（退出时并入 Session.cwd 落盘，重开恢复）。
         // proc_pidinfo 读自己子进程很便宜，无需 shell 发 OSC 7。
+        var sawCwdChange = false
         for (id, v) in views {
             guard v.process?.running == true,
                   let dir = processCwd(pid: v.process?.shellPid ?? 0) else { continue }
-            if liveCwd[id] != dir { liveCwd[id] = dir; cwdDirty = true }
+            if liveCwd[id] != dir {
+                if !sawCwdChange {
+                    objectWillChange.send()
+                    sawCwdChange = true
+                }
+                liveCwd[id] = dir
+                cwdDirty = true
+            }
         }
         // ps 全表 fork+exec 不便宜：5s 一次足以跟上 claude/ssh 的启停。
         if tick % 5 == 0 { reclassifyTypes() }
@@ -793,6 +845,15 @@ final class SessionStore: ObservableObject {
                 if kind != .claude { ds.hookSeen = false }
             }
             guard sessions[i].kind != kind else { continue }
+            // agent / Remotion 进程退出后，PTY 会回到普通 shell。
+            // 任务身份不能因此被写回 Local，否则侧栏按类型分组会把 Codex、
+            // Claude、OpenCode 任务打散。真正发现另一个非 shell 类型时仍切换。
+            if kind == .shell, sessions[i].kind.isAgent || sessions[i].kind == .remotion {
+                if sessions[i].status == .waiting {
+                    applyStatus(id, .idle, nil)
+                }
+                continue
+            }
             let wasAgent = sessions[i].kind.isAgent
             sessions[i].kind = kind
             sessions[i].host = kind == .ssh ? host : nil

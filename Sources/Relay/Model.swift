@@ -2,9 +2,9 @@
 import Foundation
 
 enum WindowType: String, Codable, CaseIterable {
-    case shell, claude, codex, ssh
+    case shell, claude, codex, opencode, remotion, ssh
 
-    var isAgent: Bool { self == .claude || self == .codex }
+    var isAgent: Bool { self == .claude || self == .codex || self == .opencode }
 
     /// 类型短标签 / 自动默认会话名。
     var label: String { rawValue }
@@ -15,12 +15,27 @@ enum WindowType: String, Codable, CaseIterable {
         case .shell: return "Local"
         case .claude: return "Claude Code"
         case .codex: return "Codex"
+        case .opencode: return "OpenCode"
+        case .remotion: return "Remotion"
         case .ssh:
             if let h = host, !h.trimmingCharacters(in: .whitespaces).isEmpty {
                 let bare = h.split(separator: "@").last.map(String.init) ?? h
                 return "SSH · \(bare)"
             }
             return "SSH"
+        }
+    }
+}
+
+enum SidebarTaskGrouping: String, Codable, CaseIterable, Identifiable {
+    case type, project
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .type: return "类型"
+        case .project: return "项目"
         }
     }
 }
@@ -81,9 +96,17 @@ func representativeTab(of tabs: [Session]) -> Session? {
 }
 
 struct AppSettings: Codable {
-    /// 默认 12：claude 等 agent TUI 的状态条按终端列数自适应（≥~115 列才
-    /// 合并成一行），13pt 在常规窗口宽度下列数卡在阈值边缘。
-    var fontSize: Double = 12
+    static let minimumPadding: Double = 8
+    static let defaultFontSize: Double = 14
+    static let defaultLineSpacing: Double = 1
+    static let defaultLetterSpacing: Double = -0.25
+    private static let legacyDefaultFontSize: Double = 12
+    private static let legacyDefaultLineSpacing: Double = 0
+    private static let legacyDefaultLetterSpacing: Double = 0
+    private static let currentTerminalGeometryVersion = 3
+
+    /// 终端默认排版贴近 Codex 主内容的阅读密度；字格仍保持等宽，只做轻微收紧。
+    var fontSize: Double = defaultFontSize
     /// "system" = 系统等宽（SF Mono），否则为字体族名。
     var fontName: String = "system"
     var theme: String = "relay-dark"
@@ -98,7 +121,7 @@ struct AppSettings: Codable {
     var gpuRender: Bool = true
     /// 跟随系统明暗：开启后暗色用 theme、亮色用 themeLight（Ghostty 的
     /// theme = light:…,dark:… 语义）。关闭时只看 theme。
-    var followSystemTheme: Bool = false
+    var followSystemTheme: Bool = true
     var themeLight: String = "catppuccin-latte"
     /// 终端/窗口背景不透明度（0.7-1.0）。<1 时整窗半透明。
     var bgOpacity: Double = 1.0
@@ -108,40 +131,111 @@ struct AppSettings: Codable {
     var cursorShape: String = "block"
     var cursorBlink: Bool = true
     /// 终端内容与窗口边缘的内边距（pt，Ghostty window-padding）。
-    var padding: Double = 0
+    /// 保留一个最小 inset，避免 Claude Code/Codex 等全屏 TUI 从第 0 列贴边绘制。
+    var padding: Double = minimumPadding
     /// 行高微调（pt，加到每行格高上，Ghostty adjust-cell-height）。
-    var lineSpacing: Double = 0
+    var lineSpacing: Double = defaultLineSpacing
     /// 字距微调（pt，加到格宽上，负值收紧；Ghostty adjust-cell-width。
     /// 中文占 2 格，收紧量是英文的两倍——正好抵消 2 格网格的中文空隙）。
-    var letterSpacing: Double = 0
+    var letterSpacing: Double = defaultLetterSpacing
+    /// 终端字格几何迁移版本。旧版曾把中文观感参数写入全局默认值，Claude/Codex
+    /// 这类全屏 TUI 会因此拿到变形的行列数；无此字段的设置文件需迁移。
+    var terminalGeometryVersion: Int = currentTerminalGeometryVersion
     /// 侧边栏显隐（Safari 式收起/展开，标签条左侧按钮切换）。
     var sidebarVisible: Bool = true
     /// 侧边栏宽度（pt，可拖拽右缘分隔条调整，持久化）。
     var sidebarWidth: Double = 232
     /// 自动检查更新（启动后台 + 每 24h 查 GitHub Releases，有新版发通知）。
     var autoUpdateCheck: Bool = true
+    /// Codex 风格外观设置。
+    var translucentSidebar: Bool = true
+    /// 侧栏任务聚合方式：默认按工具类型聚合，让 Codex/Claude/OpenCode 任务分开。
+    var taskGrouping: SidebarTaskGrouping = .type
+    var uiContrast: Double = 60
+    /// 终端主题的局部覆盖。nil 表示沿用当前主题原值，避免切主题后残留旧色。
+    var customAccentHex: UInt32?
+    var customBackgroundHex: UInt32?
+    var customForegroundHex: UInt32?
+    /// "system" = macOS 系统 UI 字体，否则为字体族名。
+    var uiFontName: String = "system"
+    /// system / on / off
+    var motionPreference: String = "system"
+    var uiFontSize: Double = 14
 
     // 旧版本设置文件缺字段时取默认值。
     init() {}
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        fontSize = (try? c.decode(Double.self, forKey: .fontSize)) ?? 12
+        fontSize = (try? c.decode(Double.self, forKey: .fontSize)) ?? Self.defaultFontSize
         fontName = (try? c.decode(String.self, forKey: .fontName)) ?? "system"
         theme = (try? c.decode(String.self, forKey: .theme)) ?? "relay-dark"
         scrollback = (try? c.decode(Int.self, forKey: .scrollback)) ?? 2000
         gpuRender = (try? c.decode(Bool.self, forKey: .gpuRender)) ?? true
-        followSystemTheme = (try? c.decode(Bool.self, forKey: .followSystemTheme)) ?? false
+        followSystemTheme = (try? c.decode(Bool.self, forKey: .followSystemTheme)) ?? true
         themeLight = (try? c.decode(String.self, forKey: .themeLight)) ?? "catppuccin-latte"
         bgOpacity = (try? c.decode(Double.self, forKey: .bgOpacity)) ?? 1.0
         bgBlur = (try? c.decode(Int.self, forKey: .bgBlur)) ?? 0
         cursorShape = (try? c.decode(String.self, forKey: .cursorShape)) ?? "block"
         cursorBlink = (try? c.decode(Bool.self, forKey: .cursorBlink)) ?? true
-        padding = (try? c.decode(Double.self, forKey: .padding)) ?? 0
-        lineSpacing = (try? c.decode(Double.self, forKey: .lineSpacing)) ?? 0
-        letterSpacing = (try? c.decode(Double.self, forKey: .letterSpacing)) ?? 0
+        padding = max(Self.minimumPadding, (try? c.decode(Double.self, forKey: .padding)) ?? Self.minimumPadding)
+        lineSpacing = (try? c.decode(Double.self, forKey: .lineSpacing)) ?? Self.defaultLineSpacing
+        letterSpacing = (try? c.decode(Double.self, forKey: .letterSpacing)) ?? Self.defaultLetterSpacing
+        terminalGeometryVersion = (try? c.decode(Int.self, forKey: .terminalGeometryVersion)) ?? 1
         sidebarVisible = (try? c.decode(Bool.self, forKey: .sidebarVisible)) ?? true
         sidebarWidth = (try? c.decode(Double.self, forKey: .sidebarWidth)) ?? 232
         autoUpdateCheck = (try? c.decode(Bool.self, forKey: .autoUpdateCheck)) ?? true
+        translucentSidebar = (try? c.decode(Bool.self, forKey: .translucentSidebar)) ?? true
+        taskGrouping = (try? c.decode(SidebarTaskGrouping.self, forKey: .taskGrouping)) ?? .type
+        uiContrast = (try? c.decode(Double.self, forKey: .uiContrast)) ?? 60
+        customAccentHex = try? c.decode(UInt32.self, forKey: .customAccentHex)
+        customBackgroundHex = try? c.decode(UInt32.self, forKey: .customBackgroundHex)
+        customForegroundHex = try? c.decode(UInt32.self, forKey: .customForegroundHex)
+        uiFontName = (try? c.decode(String.self, forKey: .uiFontName)) ?? "system"
+        motionPreference = (try? c.decode(String.self, forKey: .motionPreference)) ?? "system"
+        uiFontSize = (try? c.decode(Double.self, forKey: .uiFontSize)) ?? 14
+
+        migrateTerminalGeometryIfNeeded()
+    }
+
+    private mutating func migrateTerminalGeometryIfNeeded() {
+        if terminalGeometryVersion >= Self.currentTerminalGeometryVersion {
+            padding = max(Self.minimumPadding, padding)
+            return
+        }
+
+        if terminalGeometryVersion < 2 {
+            // v1 设置把中文观感用的行距/字距带进了全局终端字格。对普通输出只是
+            // "看起来松一点"，但 Claude/Codex/vim 这类全屏程序会按变形后的行列数
+            // 重新布局，结果就是内屏比例和 iTerm2 不一致。
+            if lineSpacing != 0 || letterSpacing != 0 || padding < Self.minimumPadding {
+                if fontSize <= 13 {
+                    fontSize = Self.legacyDefaultFontSize
+                }
+                lineSpacing = Self.legacyDefaultLineSpacing
+                letterSpacing = Self.legacyDefaultLetterSpacing
+                padding = Self.minimumPadding
+            }
+        }
+
+        // v3 将仍停留在旧默认排版的用户迁到 Codex 风格的阅读密度；已手动调过
+        // 字号/行距/字距的配置保持原样。
+        if terminalGeometryVersion < 3 {
+            let usingLegacyDefaults = approx(fontSize, Self.legacyDefaultFontSize)
+                && approx(lineSpacing, Self.legacyDefaultLineSpacing)
+                && approx(letterSpacing, Self.legacyDefaultLetterSpacing)
+            if usingLegacyDefaults {
+                fontSize = Self.defaultFontSize
+                lineSpacing = Self.defaultLineSpacing
+                letterSpacing = Self.defaultLetterSpacing
+            }
+        }
+
+        padding = max(Self.minimumPadding, padding)
+        terminalGeometryVersion = Self.currentTerminalGeometryVersion
+    }
+
+    private func approx(_ lhs: Double, _ rhs: Double) -> Bool {
+        abs(lhs - rhs) < 0.001
     }
 }
 

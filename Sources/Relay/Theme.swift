@@ -39,6 +39,48 @@ enum Theme {
     static let amber = dyn(0xD9A857, 0xB07D2B)
     static let red = dyn(0xC96A6A, 0xB94A4A)
 
+    // Codex-style shell palette. The terminal renderer keeps its own theme; these
+    // colors are only for the app chrome around it.
+    static let workspace = dyn(0x181818, 0xF5F5F7)
+    static let workspaceRaised = dyn(0x1B1B1B, 0xFFFFFF)
+    static let chromeLine = dyn(0x2C2C2C, 0xD7DAE2)
+    static let chromeControl = dyn(0x252525, 0xEAECF2)
+    static let chromeControlHover = dyn(0x303030, 0xDEE2EA)
+    static let sidebarBackgroundActive = LinearGradient(
+        colors: [
+            dyn(0x3F3471, 0xFFFFFF).opacity(0.12),
+            dyn(0x243466, 0xF4F7FF).opacity(0.09),
+            dyn(0x173A58, 0xEEF4FA).opacity(0.07),
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+    static let sidebarBackgroundInactive = LinearGradient(
+        colors: [
+            dyn(0x342D55, 0xFFFFFF).opacity(0.075),
+            dyn(0x223153, 0xF3F6FC).opacity(0.055),
+            dyn(0x16344D, 0xEEF3F8).opacity(0.045),
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+    static let sidebarPrimary = dyn(0xECECEC, 0x252A38)
+    static let sidebarSecondary = dyn(0x9E9E9E, 0x697085)
+    static let sidebarControl = dyn(0xFFFFFF, 0x000000).opacity(0.10)
+    static let sidebarHover = dyn(0xFFFFFF, 0x000000).opacity(0.055)
+    static let sidebarSeparator = dyn(0xFFFFFF, 0x000000).opacity(0.035)
+    static let sidebarSelection = dyn(0xFFFFFF, 0x000000).opacity(0.135)
+    static let sidebarSelectionHighlight = dyn(0xFFFFFF, 0x000000).opacity(0.22)
+    static let sidebarSelectionStroke = dyn(0xFFFFFF, 0x000000).opacity(0.26)
+    static let sidebarSelectionInactive = dyn(0xFFFFFF, 0x000000).opacity(0.08)
+    static let sidebarSelectionInactiveStroke = dyn(0xFFFFFF, 0x000000).opacity(0.14)
+
+    static func uiFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        let name = SessionStore.shared.settings.uiFontName
+        guard name != "system" else { return .system(size: size, weight: weight) }
+        return .custom(name, size: size).weight(weight)
+    }
+
     static func phaseColor(_ p: DisplayPhase) -> Color {
         switch p {
         case .thinking: return think
@@ -50,6 +92,64 @@ enum Theme {
         }
     }
 
+}
+
+struct SidebarPanelBackground: View {
+    let isActive: Bool
+    let translucent: Bool
+
+    var body: some View {
+        ZStack {
+            if translucent {
+                SidebarPanelMaterial(
+                    material: .sidebar,
+                    blendingMode: .behindWindow,
+                    isActive: isActive,
+                    alpha: isActive ? 0.98 : 0.82
+                )
+                (isActive ? Theme.sidebarBackgroundActive : Theme.sidebarBackgroundInactive)
+                LinearGradient(
+                    colors: [
+                        Theme.pill.opacity(isActive ? 0.050 : 0.030),
+                        Color.clear,
+                        Theme.pill.opacity(isActive ? 0.018 : 0.010),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            } else {
+                Theme.workspace
+            }
+        }
+    }
+}
+
+private struct SidebarPanelMaterial: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+    let blendingMode: NSVisualEffectView.BlendingMode
+    let isActive: Bool
+    let alpha: CGFloat
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        configure(view)
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {
+        configure(view)
+    }
+
+    private func configure(_ view: NSVisualEffectView) {
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = isActive ? .active : .inactive
+        view.isEmphasized = false
+        view.alphaValue = alpha
+        view.wantsLayer = true
+        view.layer?.isOpaque = false
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+    }
 }
 
 extension Color {
@@ -72,5 +172,13 @@ extension NSColor {
             blue: CGFloat(hex6 & 0xFF) / 255,
             alpha: 1
         )
+    }
+
+    var hex6: UInt32 {
+        let color = usingColorSpace(.sRGB) ?? self
+        let r = UInt32(max(0, min(255, round(color.redComponent * 255))))
+        let g = UInt32(max(0, min(255, round(color.greenComponent * 255))))
+        let b = UInt32(max(0, min(255, round(color.blueComponent * 255))))
+        return (r << 16) | (g << 8) | b
     }
 }

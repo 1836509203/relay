@@ -13,6 +13,17 @@ struct TerminalTheme: Identifiable {
     /// ANSI 0-15
     let ansi: [UInt32]
 
+    func applyingOverrides(accent: UInt32?, background: UInt32?, foreground: UInt32?) -> TerminalTheme {
+        TerminalTheme(
+            id: id,
+            name: name,
+            bg: background ?? bg,
+            fg: foreground ?? fg,
+            caret: accent ?? caret,
+            ansi: ansi
+        )
+    }
+
     // 列表顺序＝设置页菜单顺序（再按 isLight 分组成「暗色/亮色」两节）。
     // 先 Relay 自家与苹果原生（Xcode / Apple 终端经典 / 石墨 / 深海），
     // 再社区精品（夜枭 / 东京夜 / 玫瑰松 / Ayu / Dracula…），最后亮色组。
@@ -28,12 +39,13 @@ struct TerminalTheme: Identifiable {
 
     static let relayDark = TerminalTheme(
         id: "relay-dark", name: "Relay 暗色",
-        bg: 0x14171D, fg: 0xE8E6E1, caret: 0xD9A857,
+        // 默认暗色主题贴近 Codex 面板底色，避免主工作区和侧栏/外部应用割裂。
+        bg: 0x181818, fg: 0xE6E8EC, caret: 0xD4D8E0,
         ansi: [
-            0x1B1F27, 0xC96A6A, 0x9CB97E, 0xD9A857,
-            0x6FA8DC, 0xA99BD9, 0x7FB8B0, 0xC2C0B6,
-            0x5C6273, 0xE08C8C, 0xB5D193, 0xE8C078,
-            0x8FC1ED, 0xC3B7E8, 0x9AD3CB, 0xE8E6E1,
+            0x111318, 0xD66C75, 0x8FAE6F, 0xC6A15B,
+            0x6E8FCA, 0xA58ACB, 0x6EA8B7, 0xC9CCD3,
+            0x5F6673, 0xE68189, 0xA4C47C, 0xD7B86F,
+            0x86A7DA, 0xBDA0DD, 0x85C3D0, 0xECEFF4,
         ]
     )
 
@@ -369,6 +381,21 @@ struct TerminalTheme: Identifiable {
                      "Maple Mono NF CN", "Noto Sans Mono CJK SC", "Sarasa Mono SC",
                      "Sarasa Term SC", "LXGW WenKai Mono"] {
             if NSFont(name: cand, size: 12) != nil { out.append((cand, cand)) }
+        }
+        return out
+    }
+
+    /// 设置页的 UI 字体候选。保留系统字体作为默认，其余只展示本机已安装字体。
+    static func availableUIFonts() -> [(id: String, label: String)] {
+        var out: [(String, String)] = [("system", "系统字体")]
+        let families = Set(NSFontManager.shared.availableFontFamilies)
+        for cand in [
+            "SF Pro", "SF Pro Text", "PingFang SC", "Hiragino Sans GB",
+            "Helvetica Neue", "Arial", "Inter", "Avenir Next",
+            "Source Han Sans SC", "Noto Sans CJK SC", "LXGW WenKai",
+            "Sarasa UI SC"
+        ] where families.contains(cand) || NSFont(name: cand, size: 13) != nil {
+            out.append((cand, cand))
         }
         return out
     }

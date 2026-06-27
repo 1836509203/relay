@@ -2333,7 +2333,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         // vim/less/htop 等备用屏程序通常不产生 Relay 本地历史，yBase 会保持 0。
         // 这类程序必须收到滚轮/方向键事件才能把自己的内容滚进可见区域。
-        return terminal.displayBuffer.yBase == 0
+        if terminal.displayBuffer.yBase == 0 {
+            return true
+        }
+
+        // Claude Code/codex 这类 mouse-aware TUI 可能同时存在两种历史：
+        // 已经吐进 Relay 的 alt scrollback，以及程序自己维护的内部视口历史。
+        // 本地 scrollback 到边界后，继续拖到边缘应把滚轮交还给程序，否则选区会停住。
+        return allowMouseReporting && terminal.mouseMode != .off
     }
 
     private func sendAlternateSelectionScroll (delta: Int, point: CGPoint)
