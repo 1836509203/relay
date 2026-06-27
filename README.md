@@ -14,6 +14,8 @@ Relay 是为 Claude Code、Codex 等 AI agent 编码工作流设计的原生 mac
 
 <img src="docs/screenshots/main-dark.png" width="900" alt="Relay 暗色主题" />
 
+<img src="docs/screenshots/main-light.png" width="900" alt="Relay 亮色主题" />
+
 </div>
 
 ---
