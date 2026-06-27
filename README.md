@@ -54,12 +54,6 @@ Relay 的目标很直接：
 - **中文输入法完整支持**：preedit 组合浮层跟随光标，组合期光标定位正确；CJK 宽字符按网格列锚定渲染，中英混排零漂移
 - **细节**：overlay 滚动条滚动浮现自动隐藏、⌘ 长按显示任务快捷角标（⌘1-9 直达）、双击侧栏重命名任务
 
-## 截图
-
-| 暗色主题 | 亮色主题 |
-|---|---|
-| <img src="docs/screenshots/main-dark.png" width="430" alt="Relay 暗色主题截图" /> | <img src="docs/screenshots/main-light.png" width="430" alt="Relay 亮色主题截图" /> |
-
 ## 资源占用
 
 Relay 的性能目标不是「看起来快」，而是在真实 Vibe Coding 工作流里长时间运行多个 agent 时依然轻。
