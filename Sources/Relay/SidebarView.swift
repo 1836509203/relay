@@ -111,7 +111,6 @@ struct SidebarView: View {
             return ProjectIdentity(id: projectRoot.standardizedFileURL.path, name: pathComponents[rootComponents.count])
         }
 
-        guard url.path != home.path else { return nil }
         let name = url.lastPathComponent
         return name.isEmpty ? nil : ProjectIdentity(id: url.path, name: name)
     }
@@ -338,11 +337,22 @@ struct SidebarView: View {
     private func typeGroupedTaskTitle(for root: Session) -> String {
         let project = projectName(for: root)
         let trimmed = root.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let defaultLabels = Set(WindowType.allCases.map(\.label))
-        guard !trimmed.isEmpty, !defaultLabels.contains(trimmed), trimmed != project else {
+        guard !trimmed.isEmpty,
+              !isDefaultTaskName(trimmed),
+              trimmed.caseInsensitiveCompare(project) != .orderedSame else {
             return project
         }
         return "\(project) · \(trimmed)"
+    }
+
+    private func isDefaultTaskName(_ name: String) -> Bool {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return true }
+        var defaults = Set(WindowType.allCases.flatMap {
+            [$0.rawValue, $0.label, $0.group(host: nil)].map { $0.lowercased() }
+        })
+        defaults.formUnion(["local", "本地", "open code"])
+        return defaults.contains(normalized)
     }
 
     private func taskGroupingKind(for root: Session) -> WindowType {
