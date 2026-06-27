@@ -4,20 +4,33 @@
 
 # Relay
 
-**原生单进程 AI 终端 · 为 Claude Code / Codex 等 agent 工作流而生**
+**Vibe Coding 时代最好用、最轻量、性能最强的 AI 终端**
+
+Relay 是为 Claude Code、Codex 等 AI agent 编码工作流设计的原生 macOS 终端。
+它不是把聊天窗口塞进终端，而是把「任务、agent 状态、会话恢复、终端性能」作为第一优先级重新组织：
+一个窗口管理所有 Vibe Coding 任务，侧栏实时感知每个 agent 的进度，终端用 Metal 渲染跑满 ProMotion 120Hz。
 
 纯 Swift + AppKit/SwiftUI 构建，无 Electron、无 Web 运行时、无多进程开销。
-一个窗口管理所有 AI 编码任务：侧栏感知每个 agent 的工作状态，终端以 Metal 渲染跑满 ProMotion 120Hz。
 
-<img src="docs/screenshots/main-dark.png" width="800" alt="Relay 暗色主题" />
-
-<img src="docs/screenshots/main-light.png" width="800" alt="Relay 亮色主题" />
+<img src="docs/screenshots/main-dark.png" width="900" alt="Relay 暗色主题" />
 
 </div>
 
 ---
 
-## ✨ 特性
+## 为什么需要 Relay
+
+Vibe Coding 的终端不只是一个能输入命令的窗口。它需要同时处理多个长期运行的 agent 会话、频繁切换项目目录、等待模型回复、恢复中断任务，并且不能因为终端本身吃掉太多资源而拖慢开发机器。
+
+Relay 的目标很直接：
+
+- **最好用**：以任务为中心管理 Claude Code / Codex / shell / ssh，不再靠一堆窗口和标签页记忆上下文
+- **最轻量**：原生单进程架构，避免 Electron 终端常见的多渲染进程和高常驻内存
+- **性能最强**：Metal GPU 渲染 + SwiftTerm 深度优化，能承受 agent/TUI 的高频全屏刷新和海量日志输出
+- **更适合 agent**：内置本地 hook 服务，agent 状态可以直接驱动 UI 和通知，而不是只靠猜测终端文本
+- **local-first**：不登录、不上云、不接管代码仓库，终端和会话数据默认都在本机
+
+## 核心能力
 
 ### 为 AI agent 设计的任务模型
 
@@ -26,12 +39,12 @@
 - **Claude Code hook 集成**：内置本地 HTTP hook 服务，agent 的状态变化（等待输入、任务完成）直接驱动 UI 与系统通知，不靠猜屏幕
 - **会话持久化**：退出后自动保存所有会话回看内容（纯文本快照），重启点开即恢复历史并重启 shell
 
-### 原生性能
+### 轻量与性能
 
 - **单进程架构**：所有任务共享一个进程，几十个会话照样轻量（对比：Electron 终端每窗口一个渲染进程）
 - **Metal GPU 渲染**：字形图集 + 逐 cell quad，agent TUI 高频全屏重绘（CSI 2026 同步输出）下依然流畅，重绘跟随 ProMotion 120Hz
-- **吞吐实测**：`seq 2000000` 灌满输出从上游 SwiftTerm 的 62s / +1.5GB 内存优化到 **~3s / +60MB**，与 Ghostty 同量级
-- **内存克制**：空闲常驻 ~136MB（含 Metal 字形图集），滚动缓冲按需实体化
+- **高吞吐输出**：`seq 2000000` 灌满输出从上游 SwiftTerm 的 62s / +1.5GB 内存优化到 **~3s / +60MB**，与 Ghostty 同量级
+- **内存克制**：空闲常驻约 **136MB**（含 Metal 字形图集），滚动缓冲按需实体化
 
 ### macOS 原生体验
 
@@ -40,6 +53,26 @@
 - **明暗跟随系统**：暗色 / 亮色各配一套主题（内置 Catppuccin Mocha/Latte、Solarized、One Dark、Gruvbox 等），随系统外观即时切换
 - **中文输入法完整支持**：preedit 组合浮层跟随光标，组合期光标定位正确；CJK 宽字符按网格列锚定渲染，中英混排零漂移
 - **细节**：overlay 滚动条滚动浮现自动隐藏、⌘ 长按显示任务快捷角标（⌘1-9 直达）、双击侧栏重命名任务
+
+## 截图
+
+| 暗色主题 | 亮色主题 |
+|---|---|
+| <img src="docs/screenshots/main-dark.png" width="430" alt="Relay 暗色主题截图" /> | <img src="docs/screenshots/main-light.png" width="430" alt="Relay 亮色主题截图" /> |
+
+## 资源占用
+
+Relay 的性能目标不是「看起来快」，而是在真实 Vibe Coding 工作流里长时间运行多个 agent 时依然轻。
+
+| 场景 | 资源表现 | 说明 |
+|---|---:|---|
+| 空闲常驻 | 约 **136MB** RSS | 包含 Metal 字形图集、主题、会话状态与基础 UI |
+| 海量输出 | `seq 2000000` 约 **3s / +60MB** | 相比上游 SwiftTerm 约 62s / +1.5GB 的路径做了吞吐和内存优化 |
+| 多会话 | 单进程共享资源 | 多个任务/标签页不会为每个窗口额外拉起 Electron 渲染进程 |
+| 滚动缓冲 | 按需实体化 | 避免 10k 回看、多任务同时打开时提前吃满内存 |
+| 渲染 | Metal GPU | 高频 TUI 重绘、agent spinner、全屏刷新走 GPU 渲染路径 |
+
+> 数据来自当前 macOS 原生版本的本地开发测试。不同机器、字体、主题、回看行数和正在运行的 agent 数量会影响实际数值。
 
 ## 📦 安装与构建
 
