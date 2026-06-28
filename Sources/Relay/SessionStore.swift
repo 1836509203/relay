@@ -845,16 +845,8 @@ final class SessionStore: ObservableObject {
                 if kind != .claude { ds.hookSeen = false }
             }
             guard sessions[i].kind != kind else { continue }
-            // agent / Remotion 进程退出后，PTY 会回到普通 shell。
-            // 任务身份不能因此被写回 Local，否则侧栏按类型分组会把 Codex、
-            // Claude、OpenCode 任务打散。真正发现另一个非 shell 类型时仍切换。
-            if kind == .shell, sessions[i].kind.isAgent || sessions[i].kind == .remotion {
-                if sessions[i].status == .waiting {
-                    applyStatus(id, .idle, nil)
-                }
-                continue
-            }
             let wasAgent = sessions[i].kind.isAgent
+            let wasTransientTool = wasAgent || sessions[i].kind == .remotion
             sessions[i].kind = kind
             sessions[i].host = kind == .ssh ? host : nil
             sessions[i].group = kind.group(host: sessions[i].host)
@@ -869,7 +861,7 @@ final class SessionStore: ObservableObject {
             }
             // agent 退出降级后扫屏停了，残留的"等待确认"没人收尾，就地归 idle
             //（running 由 settle 收，waiting 原来会永久卡住）。
-            if isDowngrade, sessions[i].status == .waiting {
+            if kind == .shell, wasTransientTool, sessions[i].status != .idle {
                 applyStatus(id, .idle, nil)
             }
             changed = true
