@@ -565,15 +565,13 @@ private struct ProjectEmblem: View {
     let session: Session?
     var kindOverride: WindowType?
     let size: CGFloat
-    /// 非聚焦任务行：徽标去饱和成中性灰。
-    var neutral: Bool = false
 
     var body: some View {
         let boxSize = max(24, size + 4)
 
         Group {
             if let session {
-                EmblemView(kind: kindOverride ?? session.kind, phase: phaseOf(session).key, size: size, neutral: neutral)
+                EmblemView(kind: kindOverride ?? session.kind, phase: phaseOf(session).key, size: size)
                     .frame(width: size, height: size)
             } else {
                 Image(systemName: "folder")
@@ -623,7 +621,7 @@ private struct ProjectTaskRow: View {
         let tabs = store.tabs(ofTask: root.id)
         let rep = representativeTab(of: tabs) ?? root
         HStack(spacing: 8) {
-            ProjectEmblem(session: rep, size: 22, neutral: true)
+            ProjectEmblem(session: rep, size: 22)
             Text(title)
                 .font(Theme.uiFont(size: SidebarTypography.body, weight: isActive ? .semibold : .medium))
                 .foregroundColor(isActive ? Theme.sidebarPrimary : Theme.sidebarPrimary.opacity(0.9))
@@ -689,7 +687,7 @@ private struct TaskRow: View {
         let rep = representativeTab(of: tabs) ?? root
         HStack(spacing: 8) {
             if showsEmblem {
-                ProjectEmblem(session: rep, kindOverride: emblemKind, size: 19, neutral: true)
+                ProjectEmblem(session: rep, kindOverride: emblemKind, size: 19)
             } else {
                 Spacer().frame(width: 16)
             }
