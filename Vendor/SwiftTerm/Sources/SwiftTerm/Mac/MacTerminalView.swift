@@ -2469,18 +2469,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// 避免在 CC 繁忙时误触——误触会把一帧迟到的真重绘当作自发输出丢弃(丢行漂移)。
     static let harvestWatchdogTimeout: TimeInterval = 0.25   // 改动H(P1)：0.5→0.25。detectN 吸收掉合并帧后，残余 nil 多为 spinner/状态栏半帧，到顶/沉默应秒级自愈而非半秒冻结(肉眼最明确的「顿」)。取值仍明显大于 CC 最坏单帧重绘，避免繁忙误判把迟到真帧当自发输出丢弃。
 
-    // Relay patch：默认【开启】alt-screen 收割（用户 2026-06-30 拍板要「真·跨屏连续选中」、知情接受
-    // 卡顿风险）。收割靠「prime 冻结屏 → 注入 1 个滚轮 → diff 落库 → yBase++」逐行往返地把 CC/codex
-    // 滚出顶部的行搬进 Relay scrollback，让选区/高亮/复制同读 [0,yBase) 冻结缓冲 → 跨屏 highlight==copy
-    // 逐字节可信。代价（已知、用户接受）：这条逐行借的链路抢在 scrollWheel 直接转发路径(下方
-    // isDisplayBufferAlternate 转发分支)前面，把程序原本流畅的自滚换成 Relay 主导的一行一行卡顿——
-    // CC、codex 实测都卡(两者同样开鼠标上报、同样命中 eligible)。设 RELAY_ALT_HARVEST=0 即可显式关闭、
-    // 回退到「滚轮直接转发 button4/5 给程序、程序自滚自历史」的流畅行为(iTerm2/Ghostty 同款)作 A/B 对照。
-    // 「流畅且跨屏」的终极解需 detached-PTY（未做）。
-    static let harvestEnabled = ProcessInfo.processInfo.environment["RELAY_ALT_HARVEST"] != "0"
+    // Relay patch：默认【关闭】alt-screen 收割。2026-06-30 曾默认开启发 v0.5.5，但真机实测 harvest 在
+    // 真实 CC 会话里改写 scrollback 出错——向上滚动时同一段历史被重复 bank、夹大量空行（搞花活体屏），
+    // 且本机无法 GUI 测试、修了也无法验证不复发。故 v0.5.6 紧急回退默认关闭、回到锁可见屏(iTerm2/Ghostty
+    // 同款：滚动/拖选丝滑、显示可信)。收割机制本身（prime→注入滚轮→band-diff→prependScrollback→yBase++
+    // 逐行往返把 CC 滚出顶部的行搬进 Relay scrollback、让 [0,yBase) 冻结缓冲使 highlight==copy）保留为
+    // 实验入口，仅在显式 RELAY_ALT_HARVEST=1 时开启。两个已知硬伤：①逐行往返受 CC 重绘速率钳制，不丝滑
+    // ②band-diff 在真实会话误判会搞花屏。「流畅且跨屏」的可靠解需 detached-PTY（另起进程持 PTY、全量镜像
+    // 输出），待立项。
+    static let harvestEnabled = ProcessInfo.processInfo.environment["RELAY_ALT_HARVEST"] == "1"
 
     /// 收割是否对当前缓冲适用：开关开 + 允许鼠标上报 + 备用屏 + 程序在用鼠标上报。
-    /// 收割靠注入「滚轮鼠标上报」让 CC 翻页，故必须鼠标上报在用。默认 harvestEnabled=true（RELAY_ALT_HARVEST=0 可关）。
+    /// 收割靠注入「滚轮鼠标上报」让 CC 翻页，故必须鼠标上报在用。默认 harvestEnabled=false → 恒为 false。
     private var harvestEligible: Bool {
         Self.harvestEnabled && allowMouseReporting && terminal.isDisplayBufferAlternate && terminal.mouseMode != .off
     }
