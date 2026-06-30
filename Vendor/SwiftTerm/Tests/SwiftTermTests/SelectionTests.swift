@@ -204,36 +204,44 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.selectionAutoScrollIsActive == true)
     }
 
-    // Relay regression: vim/less/htop 这类备用屏程序自己管理可见内容，通常不会产生
-    // Relay 本地 scrollback。此时边缘拖选必须把滚动转发给 TUI，否则窗口外的内容永远滚不进来。
-    @Test func testSelectionAutoScrollOnAlternateScreenSendsScrollInput() {
+    // Relay 回归（锁可见屏，用户拍板）：Claude Code/codex 用 CUP 就地重绘、从不把旧行吐进
+    // 任何缓冲（yBase 恒为 0），备用屏本地无历史可滚。拖选到边缘必须停在可见边缘行——绝不
+    // 把滚轮/方向键转发给程序（转发会让程序重绘、选区与高亮错位），也绝不累积屏外文本。
+    // 复制永远 == 当前真实选区（highlight == copy）。这是被反复横跳过的「转发+累积」老路的反面。
+    @Test func testSelectionAutoScrollOnAlternateScreenWithoutScrollbackLocksToViewport() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let delegate = CapturingTerminalViewDelegate()
         view.terminalDelegate = delegate
         view.feed(text: "\u{1B}[?1049h")
-        #expect(view.terminal.isDisplayBufferAlternate == true)
-
-        view.selection.startSelection(row: max(view.terminal.rows - 2, 0), col: 0)
-        let bottomPoint = CGPoint(x: 20, y: 0)
-
-        #expect(view.selectionAutoScrollDelta(for: bottomPoint) > 0)
-        view.updateSelectionAutoScroll(at: bottomPoint)
-        #expect(view.selectionAutoScrollIsActive == true)
-
-        let oldYDisp = view.terminal.displayBuffer.yDisp
-        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
-        #expect(view.terminal.displayBuffer.yDisp == oldYDisp)
-        #expect(delegate.sent == EscapeSequences.moveDownNormal + EscapeSequences.moveDownNormal)
-        #expect(view.selection.end.row == min(
-            view.terminal.displayBuffer.lines.count - 1,
-            view.terminal.displayBuffer.yDisp + view.terminal.displayBuffer.rows - 1
-        ))
-
-        delegate.sent.removeAll()
         view.feed(text: "\u{1B}[?1000h")
+        // CUP 就地重绘三行、不发换行 → 不产生 alt scrollback（模拟 Claude Code）
+        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
+        #expect(view.terminal.isDisplayBufferAlternate == true)
         #expect(view.terminal.mouseMode != .off)
-        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
-        #expect(delegate.sent.isEmpty == false)
+        #expect(view.terminal.displayBuffer.yBase == 0)
+
+        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 0))
+        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: 0)
+        delegate.sent.removeAll()
+
+        // 锁可见屏门控：无本地历史可滚 → 自动滚动 delta 归零、timer 不武装（不空转、不转发）。
+        #expect(view.selectionAutoScrollDelta(for: bottomPoint) == 0)
+        view.updateSelectionAutoScroll(at: bottomPoint)
+        #expect(view.selectionAutoScrollIsActive == false)
+
+        // 即便直接调用 performSelectionAutoScroll：不转发、不滚动视口，选区延伸到底部可见行后即停。
+        _ = view.performSelectionAutoScroll(delta: 2, point: bottomPoint)
+        #expect(delegate.sent.isEmpty == true)
+        #expect(view.terminal.displayBuffer.yDisp == 0)
+        #expect(view.selection.end.row == view.terminal.displayBuffer.rows - 1)
+
+        // 再拖一次也不应转发或越界——稳定锁在可见边缘。
+        _ = view.performSelectionAutoScroll(delta: 2, point: bottomPoint)
+        #expect(delegate.sent.isEmpty == true)
+        #expect(view.selection.end.row == view.terminal.displayBuffer.rows - 1)
+
+        // 复制 == 当前真实选区高亮（绝不返回累积/错位文本）。
+        #expect(view.selectedTextForCopy() == view.selection.getSelectedText())
     }
 
     // Relay regression: Claude Code/codex 会在备用屏里持续输出，旧行从顶部滚出后应进入
@@ -257,32 +265,6 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.terminal.displayBuffer.yDisp == min(oldYDisp + 2, maxScrollback))
         #expect(delegate.sent.isEmpty == true)
         #expect(view.selectedTextForCopy() == view.selection.getSelectedText())
-    }
-
-    // Relay regression: Claude Code/codex 这类 mouse-aware TUI 可能既有 Relay 本地
-    // alt scrollback，又有程序内部视口历史。本地 scrollback 到边界后，继续拖选到
-    // 边缘应 fallback 转发鼠标滚轮，否则表现为"选区滚到边界就停住"。
-    @Test func testSelectionAutoScrollForwardsAtAlternateScrollbackBoundaryWhenMouseTrackingEnabled() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-        let delegate = CapturingTerminalViewDelegate()
-        view.terminalDelegate = delegate
-        view.feed(text: "\u{1B}[?1049h")
-        view.feed(text: (0..<120).map { "line \($0)" }.joined(separator: "\r\n"))
-        view.feed(text: "\u{1B}[?1000h")
-        #expect(view.terminal.isDisplayBufferAlternate == true)
-        #expect(view.terminal.displayBuffer.yBase > 0)
-        #expect(view.terminal.mouseMode != .off)
-
-        view.scrollTo(row: 0)
-        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 0))
-        delegate.sent.removeAll()
-
-        let topPoint = CGPoint(x: view.cellDimension.width * 6, y: view.bounds.height)
-        #expect(view.performSelectionAutoScroll(delta: -2, point: topPoint) == true)
-        #expect(view.terminal.displayBuffer.yDisp == 0)
-        #expect(delegate.sent.isEmpty == false)
-        #expect(view.selection.end.row == 0)
-        #expect(view.selection.end.col == 6)
     }
 
     @Test func testAlternateScreenScrollerUsesLocalScrollback() {
@@ -319,94 +301,6 @@ final class SelectionTests: TerminalDelegate {
         #expect(terminal.altBuffer.hasScrollback == true)
         #expect(terminal.altBuffer.lines.maxLength == terminal.rows + 2)
         #expect(terminal.altBuffer.disableReflow == true)
-    }
-
-    @Test func testAlternateSelectionAutoScrollMergeKeepsContinuousText() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-
-        let down = view.mergedAlternateSelectionAutoScrollText(
-            existing: "line 1\nline 2\nline 3",
-            current: "line 2\nline 3\nline 4",
-            direction: .down)
-        #expect(down == "line 1\nline 2\nline 3\nline 4")
-
-        let up = view.mergedAlternateSelectionAutoScrollText(
-            existing: "line 2\nline 3\nline 4",
-            current: "line 1\nline 2\nline 3",
-            direction: .up)
-        #expect(up == "line 1\nline 2\nline 3\nline 4")
-
-        let partialCharacterOverlap = view.mergedAlternateSelectionAutoScrollText(
-            existing: "abc",
-            current: "cde",
-            direction: .down)
-        #expect(partialCharacterOverlap == "abc\ncde")
-
-        let singleFullLineOverlap = view.mergedAlternateSelectionAutoScrollText(
-            existing: "a\nx",
-            current: "x\ny",
-            direction: .down)
-        #expect(singleFullLineOverlap == "a\nx\ny")
-    }
-
-    @Test func testAlternateSelectionAutoScrollCopyUsesAccumulatedTextAfterFeed() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-        view.feed(text: "\u{1B}[?1049h")
-        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
-        #expect(view.terminal.isDisplayBufferAlternate == true)
-
-        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 2))
-        view.isSelectionDragInProgress = true
-        let edgeInset = max(view.cellDimension.height * 1.5, 24)
-        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: edgeInset - 1)
-        view.updateSelectionAutoScroll(at: bottomPoint)
-        #expect(view.performSelectionAutoScroll(delta: 1, point: bottomPoint) == true)
-        #expect(view.selection.end.row == view.terminal.displayBuffer.rows - 1)
-        #expect(view.selection.end.col == 6)
-        view.feed(text: "\u{1B}[Hline 2\u{1B}[K\r\nline 3\u{1B}[K\r\nline 4\u{1B}[K")
-
-        #expect(view.selection.end.row == view.terminal.displayBuffer.rows - 1)
-        #expect(view.selection.end.col == 6)
-        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
-
-        view.isSelectionDragInProgress = false
-        view.feed(text: "\u{1B}[Hline 3\u{1B}[K\r\nline 4\u{1B}[K\r\nline 5\u{1B}[K")
-
-        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
-    }
-
-    @Test func testAlternateSelectionAutoScrollCapturesOnePendingFeedAfterDragEnds() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-        view.feed(text: "\u{1B}[?1049h")
-        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
-
-        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 2))
-        view.isSelectionDragInProgress = true
-        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: 0)
-        #expect(view.performSelectionAutoScroll(delta: 1, point: bottomPoint) == true)
-
-        view.isSelectionDragInProgress = false
-        view.feed(text: "\u{1B}[Hline 2\u{1B}[K\r\nline 3\u{1B}[K\r\nline 4\u{1B}[K")
-
-        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
-
-        view.feed(text: "\u{1B}[Hline 3\u{1B}[K\r\nline 4\u{1B}[K\r\nline 5\u{1B}[K")
-        #expect(view.selectedTextForCopy() == "line 1\nline 2\nline 3\nline 4")
-    }
-
-    @Test func testAlternateSelectionAutoScrollCacheClearsForSelectAll() {
-        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
-        view.feed(text: "\u{1B}[?1049h")
-        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
-
-        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 1))
-        view.captureAlternateSelectionAutoScrollText(direction: .down)
-        #expect(view.selectedTextForCopy() == "line 1\nline 2")
-
-        view.selectAll(nil)
-
-        #expect(view.selectedTextForCopy() == view.selection.getSelectedText())
-        #expect(view.selectedTextForCopy() != "line 1\nline 2")
     }
 
     // Relay 回归（v0.4.5）：「选不中」的真凶是 feedPrepare 每帧无条件 selection.active=false，

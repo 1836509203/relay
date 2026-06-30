@@ -2002,9 +2002,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func selectionChanged(source: Terminal) {
-        if selection == nil || !selection.active || !terminal.isDisplayBufferAlternate {
-            resetAlternateSelectionAutoScrollCapture()
-        }
         #if canImport(MetalKit)
         if metalView != nil {
             let buffer = terminal.displayBuffer
@@ -2087,7 +2084,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     public override func selectAll(_ sender: Any?)
     {
-        resetAlternateSelectionAutoScrollCapture()
         selectAll ()
     }
     
@@ -2156,10 +2152,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         case down
     }
 
-    private var alternateSelectionAutoScrollText: String?
-    private var alternateSelectionAutoScrollDirection: AlternateSelectionAutoScrollDirection?
-    private var alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-
     // 测试钩子：选区自动滚动 timer 是否处于武装状态。守护"驱动自动滚动的 timer 接线"。
     var selectionAutoScrollIsActive: Bool { selectionAutoScrollTimer != nil }
 
@@ -2182,21 +2174,39 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
 
+    // 本地 scrollback 在给定方向上是否还有可滚的历史行（delta<0 上滚、delta>0 下滚）。
+    private func canSelectionAutoScrollLocally (delta: Int) -> Bool
+    {
+        let displayBuffer = terminal.displayBuffer
+        let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
+        if delta < 0 {
+            return displayBuffer.yDisp > 0
+        }
+        return displayBuffer.yDisp < maxScrollback
+    }
+
     private func selectionAutoScrollDeltaIgnoringSelectionState (for point: CGPoint) -> Int
     {
         guard terminal.displayBuffer.rows > 0 else {
             return 0
         }
-        // 备用屏现在也有 scrollback（见 Terminal init），故和主屏一样参与划选自动滚动：
-        // 拖到边缘时本地滚动露出历史行，选区连续延伸进 scrollback（iTerm2 式）。
         let edgeInset = max((cellDimension?.height ?? 1) * 1.5, 24)
+        let delta: Int
         if point.y < edgeInset {
-            return selectionAutoScrollVelocity(distanceFromEdge: edgeInset - point.y)
+            delta = selectionAutoScrollVelocity(distanceFromEdge: edgeInset - point.y)
+        } else if point.y > bounds.height - edgeInset {
+            delta = -selectionAutoScrollVelocity(distanceFromEdge: point.y - (bounds.height - edgeInset))
+        } else {
+            return 0
         }
-        if point.y > bounds.height - edgeInset {
-            return -selectionAutoScrollVelocity(distanceFromEdge: point.y - (bounds.height - edgeInset))
+        // 锁可见屏：备用屏（Claude Code/codex 就地重绘、无本地 scrollback）一旦本地历史在该方向
+        // 滚尽，自动滚动归零——既不武装空转 timer、也不把滚轮转发给程序。selectionPosition 的
+        // 钳制仍会把选区延伸到可见边缘行（拖到窗口外即选满可见内容），只是不再越过视口。
+        // alt-scrollback 确有历史时（程序真发了换行）仍照常本地滚动连续选中。主屏行为不受影响。
+        if terminal.isDisplayBufferAlternate && !canSelectionAutoScrollLocally(delta: delta) {
+            return 0
         }
-        return 0
+        return delta
     }
 
     func selectionAutoScrollDelta (for point: CGPoint) -> Int
@@ -2243,10 +2253,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return selectionPosition(for: point)
     }
 
-    private func extendSelectionToAutoScrollEdge (direction: AlternateSelectionAutoScrollDirection, point: CGPoint? = nil)
+    private func extendSelectionToAutoScrollEdge (direction: AlternateSelectionAutoScrollDirection, point: CGPoint)
     {
         let delta = direction == .up ? -1 : 1
-        selection.dragExtend(bufferPosition: selectionAutoScrollEdgePosition(delta: delta, point: point ?? selectionAutoScrollPoint))
+        selection.dragExtend(bufferPosition: selectionAutoScrollEdgePosition(delta: delta, point: point))
     }
 
     private func ensureSelectionAutoScrollTimer ()
@@ -2287,20 +2297,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return false
         }
 
+        // 锁可见屏（用户拍板）：选区自动滚动只读真实缓冲行——读到哪复制到哪，高亮逐字节 == 复制。
+        // 备用屏分两路（由 selectionAutoScrollDelta 的 gate 决定，见上）：① CC/codex 用 CUP 就地
+        // 重绘时 yBase 保持 0、本地无历史可滚 → delta 归零、停在可见边缘 = 锁可见屏；② 若程序改用
+        // 真实换行让旧行进入 alt-scrollback（yBase>0）→ 本地滚动连续选中。两路都绝不把滚轮转发给
+        // 程序、绝不累积屏外文本——那条老路会让高亮与复制错位、且物理上不可信（屏外内容不在任何
+        // 终端缓冲）。与 iTerm2/Terminal.app/Ghostty 全屏程序一致：要选屏外内容，先滚程序自身再划选。
         let direction: AlternateSelectionAutoScrollDirection = delta < 0 ? .up : .down
-        if shouldForwardAlternateSelectionAutoScroll(delta: delta) {
-            extendSelectionToAutoScrollEdge(direction: direction, point: point)
-            captureAlternateSelectionAutoScrollText(direction: direction)
-            alternateSelectionAutoScrollNeedsCaptureAfterFeed = true
-            sendAlternateSelectionScroll(delta: delta, point: point)
-            didSelectionDrag = true
-            return true
-        }
-
-        if terminal.isDisplayBufferAlternate {
-            resetAlternateSelectionAutoScrollCapture()
-        }
-
         let oldYDisp = terminal.displayBuffer.yDisp
         let oldEnd = selection.end
         if delta < 0 {
@@ -2314,140 +2317,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
     }
 
-    private func canSelectionAutoScrollLocally(delta: Int) -> Bool {
-        let displayBuffer = terminal.displayBuffer
-        let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
-        if delta < 0 {
-            return displayBuffer.yDisp > 0
-        }
-        return displayBuffer.yDisp < maxScrollback
-    }
-
-    private func shouldForwardAlternateSelectionAutoScroll(delta: Int) -> Bool {
-        guard terminal.isDisplayBufferAlternate else {
-            return false
-        }
-        guard !canSelectionAutoScrollLocally(delta: delta) else {
-            return false
-        }
-
-        // vim/less/htop 等备用屏程序通常不产生 Relay 本地历史，yBase 会保持 0。
-        // 这类程序必须收到滚轮/方向键事件才能把自己的内容滚进可见区域。
-        if terminal.displayBuffer.yBase == 0 {
-            return true
-        }
-
-        // Claude Code/codex 这类 mouse-aware TUI 可能同时存在两种历史：
-        // 已经吐进 Relay 的 alt scrollback，以及程序自己维护的内部视口历史。
-        // 本地 scrollback 到边界后，继续拖到边缘应把滚轮交还给程序，否则选区会停住。
-        return allowMouseReporting && terminal.mouseMode != .off
-    }
-
-    private func sendAlternateSelectionScroll (delta: Int, point: CGPoint)
-    {
-        let lines = max(1, min(abs(delta), Self.alternateScrollLineCap))
-        let goingUp = delta < 0
-        if allowMouseReporting && terminal.mouseMode != .off {
-            sendAlternateMouseWheel(up: goingUp, lines: lines, at: point, modifierFlags: [])
-        } else {
-            sendAlternateScrollKeys(up: goingUp, lines: lines)
-        }
-    }
-
     func selectedTextForCopy () -> String
     {
-        if selection.active, terminal.isDisplayBufferAlternate,
-           let text = alternateSelectionAutoScrollText, !text.isEmpty {
-            return text
-        }
+        // 单一数据源：复制永远返回当前真实选区文本，保证「看到的高亮 == 复制的内容」。
         return selection.getSelectedText()
-    }
-
-    private func resetAlternateSelectionAutoScrollCapture ()
-    {
-        alternateSelectionAutoScrollText = nil
-        alternateSelectionAutoScrollDirection = nil
-        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-    }
-
-    func updateAlternateSelectionAutoScrollCaptureAfterFeed ()
-    {
-        guard terminal.isDisplayBufferAlternate else {
-            resetAlternateSelectionAutoScrollCapture()
-            return
-        }
-        guard alternateSelectionAutoScrollText != nil, alternateSelectionAutoScrollNeedsCaptureAfterFeed else {
-            return
-        }
-        guard selection.active, let direction = alternateSelectionAutoScrollDirection else {
-            resetAlternateSelectionAutoScrollCapture()
-            return
-        }
-
-        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-        extendSelectionToAutoScrollEdge(direction: direction)
-        captureAlternateSelectionAutoScrollText(direction: direction)
-    }
-
-    func captureAlternateSelectionAutoScrollText (direction: AlternateSelectionAutoScrollDirection)
-    {
-        guard terminal.isDisplayBufferAlternate, selection.active else {
-            return
-        }
-        let current = selection.getSelectedText()
-        guard !current.isEmpty else {
-            return
-        }
-        guard let existing = alternateSelectionAutoScrollText else {
-            alternateSelectionAutoScrollText = current
-            alternateSelectionAutoScrollDirection = direction
-            return
-        }
-
-        alternateSelectionAutoScrollText = mergedAlternateSelectionAutoScrollText(existing: existing, current: current, direction: direction)
-        alternateSelectionAutoScrollDirection = direction
-    }
-
-    func mergedAlternateSelectionAutoScrollText (existing: String, current: String, direction: AlternateSelectionAutoScrollDirection) -> String
-    {
-        guard !existing.isEmpty else {
-            return current
-        }
-        guard !current.isEmpty, current != existing else {
-            return existing
-        }
-
-        switch direction {
-        case .down:
-            return joinedSelectionBlocks(existing, current)
-        case .up:
-            return joinedSelectionBlocks(current, existing)
-        }
-    }
-
-    private func joinedSelectionBlocks (_ upper: String, _ lower: String) -> String
-    {
-        if upper.isEmpty {
-            return lower
-        }
-        if lower.isEmpty {
-            return upper
-        }
-
-        let upperLines = upper.components(separatedBy: "\n")
-        let lowerLines = lower.components(separatedBy: "\n")
-        let maxOverlap = min(upperLines.count, lowerLines.count)
-        if maxOverlap > 0 {
-            for count in stride(from: maxOverlap, through: 1, by: -1) {
-                if Array(upperLines.suffix(count)) == Array(lowerLines.prefix(count)) {
-                    return (upperLines + lowerLines.dropFirst(count)).joined(separator: "\n")
-                }
-            }
-        }
-        if upper.hasSuffix("\n") || lower.hasPrefix("\n") {
-            return upper + lower
-        }
-        return upper + "\n" + lower
     }
 
     // Callback from when the mouseDown autoscrolling timer goes off
@@ -2547,7 +2420,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         // 新一次按下：拖拽尚未开始，复位标志（真正开始划选时由 mouseDragged 置 true）。
         isSelectionDragInProgress = false
-        resetAlternateSelectionAutoScrollCapture()
 
         switch event.clickCount {
         case 1:
@@ -2584,10 +2456,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public override func mouseUp(with event: NSEvent) {
         stopSelectionAutoScroll()
         pendingSelectionAnchor = nil
-        if terminal.isDisplayBufferAlternate, isSelectionDragInProgress,
-           let direction = alternateSelectionAutoScrollDirection {
-            captureAlternateSelectionAutoScrollText(direction: direction)
-        }
         // 拖拽结束：恢复主屏「输出滚动时清选区」的原行为（备用屏由 feedPrepare/linefeed 自身判断保留）。
         isSelectionDragInProgress = false
         let hit = calculateMouseHit(with: event).grid
@@ -2834,13 +2702,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             // Relay patch: 走到这里 = 备用屏本地没有可滚的历史(yBase==0)，滚轮要转发给程序。
             // Claude Code / codex 这类 TUI 自管滚动、收到滚轮后就地重绘视口，并不把旧行吐进
             // Relay 的 scrollback（故上面的本地分支永不触发）。重绘后内容变了，而选区仍锚在
-            // 固定的终端行号上：高亮块原地不动、内容从下面滑过，底部选中行被挤出高亮（看起来
-            // 「掉选」），更糟的是复制会拿到与高亮错位的文本。程序驱动的滚动一旦开始就清掉选区
-            // ——与 iTerm2/Terminal.app/Ghostty 一致。拖拽划选(isSelectionDragInProgress)不在
-            // 此列：那条路由 performSelectionAutoScroll 自管边缘滚动与跨屏文本捕获，不经 scrollWheel。
+            // 固定的终端行号上：高亮块原地不动、内容从下面滑过 → 高亮与复制都会错位。因此程序
+            // 驱动的滚动一旦开始就清掉本地选区，与 iTerm2/Terminal.app/Ghostty 一致。拖拽划选
+            // (isSelectionDragInProgress) 不在此列：那条路由 performSelectionAutoScroll 走本地
+            // scrollback 边缘滚动、滚尽即锁可见屏（不转发、不累积屏外文本），不经 scrollWheel。
             if selection.active && !isSelectionDragInProgress {
                 selection.selectNone()
-                resetAlternateSelectionAutoScrollCapture()
                 setNeedsDisplay(bounds)
             }
             // Discrete notched wheels report one tick at a time (velocity 1);
