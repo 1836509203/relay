@@ -39,7 +39,9 @@ echo "==> 生成校验和"
 
 echo "==> 打 tag 并推送"
 git tag "$TAG"
-git push origin main "$TAG"
+# 用 HEAD:main 而非本地 main —— 支持从特性分支发版（本地 main 可能被其他
+# worktree 占用或落后）。当前 HEAD 含 origin/main 全部历史时为快进推送。
+git push origin HEAD:main "$TAG"
 
 if [ -n "${GITHUB_TOKEN:-}" ]; then
     echo "==> 创建 GitHub Release"
