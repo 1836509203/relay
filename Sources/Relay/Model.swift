@@ -100,6 +100,10 @@ struct AppSettings: Codable {
     static let defaultFontSize: Double = 14
     static let defaultLineSpacing: Double = 1
     static let defaultLetterSpacing: Double = -0.25
+    /// 默认终端字体：Noto Sans Mono CJK SC。其 ASCII "W" 步进约 0.5em，故汉字(占 2 格)=1.0em=
+    /// 中文自然字宽、字距紧凑（参照 Codex）；而系统等宽 SF Mono 的 "W" 约 0.6em，汉字 2 格=1.2em
+    /// 会有 ~20% 右侧空隙。未安装该字体时 TerminalTheme.font 会优雅回退到 SF Mono。
+    static let defaultFontName = "Noto Sans Mono CJK SC"
     private static let legacyDefaultFontSize: Double = 12
     private static let legacyDefaultLineSpacing: Double = 0
     private static let legacyDefaultLetterSpacing: Double = 0
@@ -107,8 +111,9 @@ struct AppSettings: Codable {
 
     /// 终端默认排版贴近 Codex 主内容的阅读密度；字格仍保持等宽，只做轻微收紧。
     var fontSize: Double = defaultFontSize
-    /// "system" = 系统等宽（SF Mono），否则为字体族名。
-    var fontName: String = "system"
+    /// "system" = 系统等宽（SF Mono），否则为字体族名。默认 Noto Sans Mono CJK SC：
+    /// 中文字距更紧凑（见 defaultFontName 说明），未安装时优雅回退到 SF Mono。
+    var fontName: String = defaultFontName
     var theme: String = "relay-dark"
     /// 回看行数。内存敏感：SwiftTerm 每行整行预分配（~3KB/行@110列），
     /// 5000 行写满约 +15MB/会话。默认 2000 在回看与内存间取平衡。
@@ -167,7 +172,7 @@ struct AppSettings: Codable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         fontSize = (try? c.decode(Double.self, forKey: .fontSize)) ?? Self.defaultFontSize
-        fontName = (try? c.decode(String.self, forKey: .fontName)) ?? "system"
+        fontName = (try? c.decode(String.self, forKey: .fontName)) ?? Self.defaultFontName
         theme = (try? c.decode(String.self, forKey: .theme)) ?? "relay-dark"
         scrollback = (try? c.decode(Int.self, forKey: .scrollback)) ?? 2000
         gpuRender = (try? c.decode(Bool.self, forKey: .gpuRender)) ?? true
