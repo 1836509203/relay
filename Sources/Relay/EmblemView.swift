@@ -20,17 +20,20 @@
 //   提交一次后由 render server 执行，app 进程 0 CPU。爆散/粒子也全部是
 //   预排 keyframe，进程内没有逐帧工作。
 import AppKit
+import CoreImage
 import SwiftUI
 
 struct EmblemView: NSViewRepresentable {
     let kind: WindowType
     let phase: DisplayPhase
     var size: CGFloat = 18
+    /// 非聚焦任务行：整枚徽标去饱和成中性灰（侧栏中性化）。
+    var neutral: Bool = false
 
     func makeNSView(context: Context) -> EmblemBackingView { EmblemBackingView() }
 
     func updateNSView(_ v: EmblemBackingView, context: Context) {
-        v.configure(kind: kind, phase: phase, size: size)
+        v.configure(kind: kind, phase: phase, size: size, neutral: neutral)
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: EmblemBackingView, context: Context) -> CGSize? {
@@ -42,7 +45,7 @@ struct EmblemView: NSViewRepresentable {
 /// 低频事件，重建一棵 19px 的小树可忽略；动画全部 repeatForever / 一次性
 /// keyframe，由 render server 跑，进程内不再有逐帧工作。
 final class EmblemBackingView: NSView {
-    private var current: (WindowType, DisplayPhase, CGFloat)?
+    private var current: (WindowType, DisplayPhase, CGFloat, Bool)?
 
     override var isFlipped: Bool { true } // 与 SwiftUI/jsx 同向（y 向下）
 
@@ -50,8 +53,8 @@ final class EmblemBackingView: NSView {
     /// 该周期内的相对时刻（keyTimes = 帧号/120）。
     private static let loopDur: Double = 4
 
-    func configure(kind: WindowType, phase: DisplayPhase, size: CGFloat) {
-        let cfg = (kind, phase, size)
+    func configure(kind: WindowType, phase: DisplayPhase, size: CGFloat, neutral: Bool) {
+        let cfg = (kind, phase, size, neutral)
         if let c = current, c == cfg { return }
         current = cfg
         rebuild()
@@ -65,16 +68,17 @@ final class EmblemBackingView: NSView {
     }
 
     private func rebuild() {
-        guard let (kind, phase, size) = current else { return }
+        guard let (kind, phase, size, neutral) = current else { return }
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            buildTree(kind: kind, phase: phase, size: size)
+            buildTree(kind: kind, phase: phase, size: size, neutral: neutral)
         }
     }
 
-    private func buildTree(kind: WindowType, phase: DisplayPhase, size: CGFloat) {
+    private func buildTree(kind: WindowType, phase: DisplayPhase, size: CGFloat, neutral: Bool) {
         wantsLayer = true
         guard let root = layer else { return }
         root.sublayers?.forEach { $0.removeFromSuperlayer() }
+        root.filters = nil // 视图复用：清掉旧 build 可能挂在根层的滤镜
 
         let S = size
         let active = phase == .waiting || phase == .working || phase == .thinking
@@ -83,6 +87,13 @@ final class EmblemBackingView: NSView {
         let core = CALayer()
         core.frame = CGRect(x: 0, y: 0, width: S, height: S)
         root.addSublayer(core)
+
+        // 中性化任务行：对整枚徽标（root，含主字形、done/error 角标、thinking 三点）
+        // 去饱和成中性灰，彻底对齐 Codex 的扁平灰侧栏。只改 render server 合成层，
+        // 不触碰下面那套品牌几何/动画。
+        if neutral, let desat = CIFilter(name: "CIColorControls", parameters: [kCIInputSaturationKey: 0.0]) {
+            root.filters = [desat]
+        }
         if phase == .idle { root.opacity = 0.45 }
         if phase == .thinking {
             core.setAffineTransform(

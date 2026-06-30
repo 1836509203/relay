@@ -99,7 +99,9 @@ struct SettingsView: View {
         .background {
             SidebarPanelBackground(
                 isActive: windowActive,
-                translucent: embedded && store.settings.translucentSidebar
+                translucent: embedded && store.settings.translucentSidebar,
+                themeBg: Color(hex: store.effectiveTheme.bg),
+                bgOpacity: store.settings.bgOpacity
             )
             .ignoresSafeArea()
         }

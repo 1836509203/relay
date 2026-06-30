@@ -46,24 +46,10 @@ enum Theme {
     static let chromeLine = dyn(0x2C2C2C, 0xD7DAE2)
     static let chromeControl = dyn(0x252525, 0xEAECF2)
     static let chromeControlHover = dyn(0x303030, 0xDEE2EA)
-    static let sidebarBackgroundActive = LinearGradient(
-        colors: [
-            dyn(0x3F3471, 0xFFFFFF).opacity(0.12),
-            dyn(0x243466, 0xF4F7FF).opacity(0.09),
-            dyn(0x173A58, 0xEEF4FA).opacity(0.07),
-        ],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
-    static let sidebarBackgroundInactive = LinearGradient(
-        colors: [
-            dyn(0x342D55, 0xFFFFFF).opacity(0.075),
-            dyn(0x223153, 0xF3F6FC).opacity(0.055),
-            dyn(0x16344D, 0xEEF3F8).opacity(0.045),
-        ],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
+    /// 中性侧栏填充（参照 Codex 侧栏 #292929）：去掉此前的冷色（紫/蓝）渐变——它叠加桌面蓝壁纸
+    /// 让侧栏整体偏蓝(实测 #282B3F 蓝偏 +23)、与内容糊成一片。改成纯中性深灰/浅灰，
+    /// 聚焦时半透(留毛玻璃)、失焦时近实色叠在材质上（见 SidebarPanelBackground）。
+    static let sidebarFill = dyn(0x282828, 0xE8E8E8)
     static let sidebarPrimary = dyn(0xECECEC, 0x252A38)
     static let sidebarSecondary = dyn(0x9E9E9E, 0x697085)
     static let sidebarControl = dyn(0xFFFFFF, 0x000000).opacity(0.10)
@@ -97,28 +83,40 @@ enum Theme {
 struct SidebarPanelBackground: View {
     let isActive: Bool
     let translucent: Bool
+    /// 终端那侧的主题底色（RootView 的 effectiveTheme.bg）。侧栏底色直接取它，
+    /// 保证两侧严格同色（对齐 Codex 的统一深色侧栏，消除此前侧栏偏灰/透壁纸的色差）。
+    var themeBg: Color = Theme.sidebarFill
+    var bgOpacity: Double = 1
 
     var body: some View {
         ZStack {
             if translucent {
+                // Codex 同款「聚焦磨砂 / 失焦与终端统一」：
+                //  · 聚焦 → behind-window vibrancy 透出桌面壁纸柔色（毛玻璃），打底色只压 30%。
+                //  · 失焦 → 打底铺满成终端那侧的实底，两侧连成一片（Codex 失焦即如此）。
+                // 打底色一律取 themeBg（= 终端主题色），失焦用 bgOpacity 与终端 bg.opacity(bgOpacity)
+                // 同式 → 严格同色；聚焦的毛玻璃也是「终端色的磨砂版」，随主题走、不再是固定中性灰。
                 SidebarPanelMaterial(
                     material: .sidebar,
                     blendingMode: .behindWindow,
                     isActive: isActive,
                     alpha: isActive ? 0.98 : 0.82
                 )
-                (isActive ? Theme.sidebarBackgroundActive : Theme.sidebarBackgroundInactive)
-                LinearGradient(
-                    colors: [
-                        Theme.pill.opacity(isActive ? 0.050 : 0.030),
-                        Color.clear,
-                        Theme.pill.opacity(isActive ? 0.018 : 0.010),
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
+                themeBg.opacity(isActive ? bgOpacity * 0.30 : bgOpacity)
+                if isActive {
+                    LinearGradient(
+                        colors: [
+                            Theme.pill.opacity(0.045),
+                            Color.clear,
+                            Theme.pill.opacity(0.016),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                }
             } else {
-                Theme.workspace
+                // 关掉毛玻璃：侧栏与终端同色（取主题底色，含相同不透明度）。
+                themeBg.opacity(bgOpacity)
             }
         }
     }
