@@ -933,6 +933,12 @@ final class SessionStore: ObservableObject {
         if let data = try? Data(contentsOf: DataDir.settingsFile),
            let s = try? JSONDecoder().decode(AppSettings.self, from: data) {
             settings = s
+            // 解码会跑 migrateTerminalGeometryIfNeeded（含 v4 字体迁移）；这里把升级后的
+            // terminalGeometryVersion 异步写回磁盘，省得每次启动都重跑迁移。迁移本身幂等
+            // （重跑仍是 system→Noto / version=4），崩溃丢了这次写也只是下次启动再迁一遍，
+            // 无副作用。用户日后手动改回 "system" 也不会被 v4 迁回——届时内存里 version 已是
+            // 4，任何设置改动都会持久化 version=4，命中 migrate 开头的早返回从而跳过迁移。
+            persistSettings()
         }
         guard let data = try? Data(contentsOf: DataDir.sessionsFile),
               var list = try? JSONDecoder().decode([Session].self, from: data) else { return }

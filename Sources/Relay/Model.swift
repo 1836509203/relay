@@ -107,7 +107,7 @@ struct AppSettings: Codable {
     private static let legacyDefaultFontSize: Double = 12
     private static let legacyDefaultLineSpacing: Double = 0
     private static let legacyDefaultLetterSpacing: Double = 0
-    private static let currentTerminalGeometryVersion = 3
+    private static let currentTerminalGeometryVersion = 4
 
     /// 终端默认排版贴近 Codex 主内容的阅读密度；字格仍保持等宽，只做轻微收紧。
     var fontSize: Double = defaultFontSize
@@ -232,6 +232,19 @@ struct AppSettings: Codable {
                 fontSize = Self.defaultFontSize
                 lineSpacing = Self.defaultLineSpacing
                 letterSpacing = Self.defaultLetterSpacing
+            }
+        }
+
+        // v4 把仍停留在旧默认字体（"system" = SF Mono）的用户迁到 Noto Sans Mono CJK SC。
+        // SF Mono 的 "W" 步进约 0.6em，中文占 2 格 = 1.2em → 每个汉字右侧约 20% 空隙、
+        // 表格框线错位（散开难看）；Noto 的 "W" = 0.5em，中文 2 格 = 1.0em → 严丝合缝、
+        // 框线对齐（紧凑干净，参照 Codex）。只迁 "system"——用户显式选过的其他字体保持原样；
+        // 未安装 Noto 时 TerminalTheme.font 会优雅回退 SF Mono，无副作用。迁移把 version
+        // 置为 4（函数末尾）后命中开头早返回，故用户日后手动改回 "system" 不会被再次迁回；
+        // 即便落盘失败导致下次启动重跑也无妨——本块幂等（只把 "system" 改成 Noto）。
+        if terminalGeometryVersion < 4 {
+            if fontName == "system" {
+                fontName = Self.defaultFontName
             }
         }
 
