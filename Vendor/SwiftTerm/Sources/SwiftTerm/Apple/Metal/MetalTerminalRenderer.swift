@@ -240,7 +240,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             throw MetalError.commandQueueUnavailable
         }
         self.commandQueue = commandQueue
-        guard let grayscaleAtlas = GlyphAtlas(device: device, format: .grayscale),
+        // Relay patch: 灰度文字图集（含全部 CJK 字形）容量上限调到 4096²。原默认 2048²
+        // 是 append-only 货架分配器（无 LRU/回收），用 CJK 字体时不同汉字字形快速累积，
+        // 一帧可见的不同字形就可能逼近/超过 2048² 容量 → 触发 reset() 清空整张图集 →
+        // 连带清空 glyphCache/rowCache → 全量重栅格 + 整张 texture 重传；配合 Claude Code
+        // 命令框「spinner+流式输出」的高频重绘，每帧 reset thrash，主线程打满 → 整个程序冻结。
+        // 4096²（~16MB 灰度，容量约 9000+ 字形）远超任意单帧的不同字形数，彻底消除每帧 thrash。
+        // 色彩图集（emoji，bgra 4 字节/像素、占用大、不同字形极少）保持 2048² 默认不动。
+        guard let grayscaleAtlas = GlyphAtlas(device: device, size: 2048, maxSize: 4096, format: .grayscale),
               let colorAtlas = GlyphAtlas(device: device, format: .bgra) else {
             throw MetalError.atlasUnavailable
         }
