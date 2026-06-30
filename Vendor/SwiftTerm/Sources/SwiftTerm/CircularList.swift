@@ -320,6 +320,31 @@ internal class CircularBufferLineList {
         onLinePushed?(value.images != nil)
     }
 
+    /// Relay patch（捕获式回看 / 反向插入）：在逻辑索引 0 处 O(1) 插入一行历史，
+    /// 即把一行**更早**的内容接到回看缓冲的最顶端，其余逻辑行整体下移一位
+    /// （实现为 startIndex 自减一格、环形回绕，写入新腾出的头部槽位）。用于
+    /// Claude Code / codex 这类就地重绘 TUI 的「捕获式滚动」：每收割到一行被卷出
+    /// 屏幕上方的历史，就 prepend 到回看缓冲顶端。
+    ///
+    /// 与 push() 相反：push 在尾部追加、满了从**头部**淘汰最旧行；prepend 在头部
+    /// 追加且**绝不淘汰**——缓冲已满（count == maxLength）时返回 false，由调用方
+    /// 据此停止收割。这样已落盘的历史行严格不可变，是「高亮 == 复制」不变式的地基。
+    ///
+    /// ⚠️ 副作用：成功后**所有逻辑索引整体 +1**。调用方必须同步把指向旧内容的
+    /// yBase / yDisp / 选区行号一并 +1，否则它们会指向错位的行。
+    @discardableResult
+    func prependScrollback (_ value: BufferLine) -> Bool
+    {
+        // 满了就拒绝：绝不覆盖尾部历史行（push 式的头部淘汰在反向插入里是错的）。
+        guard _count < array.count else { return false }
+        let newStart = (startIndex - 1 + array.count) % array.count
+        array [newStart] = value
+        startIndex = newStart
+        _count += 1
+        onLinePushed?(value.images != nil)
+        return true
+    }
+
     func recycle (clearAttribute: Attribute)
     {
         if count != maxLength {

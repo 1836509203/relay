@@ -576,6 +576,16 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func bufferActivated(source: Terminal) {
+        // Relay patch（捕获式滚动）：换屏后旧 alt 缓冲的 banked 几何已被终端自身清理(activateNormalBuffer→clear)，
+        // 这里只复位收割状态机，不再去动（可能已是另一个）缓冲，避免对错误缓冲做折叠。
+        if harvestState != .idle {
+            harvestState = .idle
+            harvestAwaitingRepaint = false
+            clearHarvestWatchdog()
+            harvestBankedCount = 0
+            harvestRows = 0
+            harvestPrevScratch = []
+        }
         updateScroller ()
     }
     
@@ -741,6 +751,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         updateScrollerFrame()
         updateProgressBarFrame()
         guard cellDimension != nil else { return }
+        // Relay patch（捕获式滚动）：resize 会重排缓冲、破坏收割几何 → 先在旧几何上优雅复位再 resize。
+        if harvestState != .idle { abortHarvest() }
         _ = processSizeChange(newSize: frame.size)
 #if canImport(MetalKit)
         if useMetalRenderer {
@@ -973,6 +985,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // of those keys.
     //
     public override func keyDown(with event: NSEvent) {
+        // Relay patch（捕获式滚动）：primed 期间打字 = 明确的新交互 → 先回挂 live（折叠收割几何 + 清选区），
+        // 否则键入触发的 CC 输出落到 off-screen scratch、用户看不到（视口还停在 banked 历史）。
+        // 这也是用户「滚到底想保留选区」后返回实时画面的自然手势（打字即清选区，符合预期）。
+        if harvestState == .primed { reattachToLive() }
         selection.active = false
         let eventFlags = event.modifierFlags
 
@@ -2138,6 +2154,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private var autoScrollDelta = 0
     private var selectionAutoScrollTimer: Timer?
     private var selectionAutoScrollPoint: CGPoint = .zero
+    /// Relay patch（平滑滚动）：精确滚动设备(触控板/妙控鼠标)的亚行像素累积器。每个滚轮
+    /// event 把 |scrollingDeltaY| 累加进来，攒满一个 cellHeight 即产出整行步进，余数留存——
+    /// 让触控板逐行连续滚动，而非被 calcScrollingVelocity 量化成 3 行一跳（用户反馈「向上
+    /// 滚一次三行三行、不丝滑」的直接根因）。
+    private var wheelPixelAccumY: CGFloat = 0
+    /// 上次精确滚动的方向(±1)；方向反转时清空累积，避免上一方向余量把视口往回带一帧。
+    private var wheelAccumSign: Int = 0
+    /// 改动H（加速度）：上次精确滚动 event 的时间戳(秒)，算瞬时行速 rowsPerSec=Δrows/Δt 用。0=无上次。
+    private var lastWheelTime: TimeInterval = 0
     // mouseDown 记录的选区锚点：保证拖拽划选从「真正按下的格子」开始，而非拖动第一帧的采样点。
     private var pendingSelectionAnchor: Position?
 
@@ -2147,6 +2172,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // AppleTerminalView.swift 的同模块扩展里需读取它。
     var isSelectionDragInProgress = false
 
+    // 选区自动滚动方向（本地 scrollback 滚动用）。
     enum AlternateSelectionAutoScrollDirection {
         case up
         case down
@@ -2297,12 +2323,31 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return false
         }
 
-        // 锁可见屏（用户拍板）：选区自动滚动只读真实缓冲行——读到哪复制到哪，高亮逐字节 == 复制。
-        // 备用屏分两路（由 selectionAutoScrollDelta 的 gate 决定，见上）：① CC/codex 用 CUP 就地
-        // 重绘时 yBase 保持 0、本地无历史可滚 → delta 归零、停在可见边缘 = 锁可见屏；② 若程序改用
-        // 真实换行让旧行进入 alt-scrollback（yBase>0）→ 本地滚动连续选中。两路都绝不把滚轮转发给
-        // 程序、绝不累积屏外文本——那条老路会让高亮与复制错位、且物理上不可信（屏外内容不在任何
-        // 终端缓冲）。与 iTerm2/Terminal.app/Ghostty 全屏程序一致：要选屏外内容，先滚程序自身再划选。
+        // Relay patch（捕获式滚动）：备用屏(CC)拖选自动滚动的收割路由。向上拖到顶边时主动收割——
+        // 转发滚轮让 CC 露出更早一行，drainHarvest 入库后 yDisp 保持 0、内容整体下移=向上滚视觉、
+        // 选区延伸到新顶行。中部上下拖只在 banked 历史内浏览并延伸选区，clamp 到 [0,bankedCount]；
+        // **拖动中绝不回挂 live、绝不清选区**（拖动是在选，不是导航）——回挂只属于刻意的滚轮到底手势。
+        if harvestEligible {
+            let b = terminal.displayBuffer
+            if delta < 0, harvestState == .idle, b.yBase == 0, b.yDisp == 0 { _ = prime() }
+            if harvestState == .primed {
+                let goingUp = delta < 0
+                if goingUp, b.yDisp <= 0 {
+                    _ = harvestStepRequest()                         // 顶部：异步收割更早一行
+                } else {
+                    let target = goingUp ? max(0, b.yDisp + delta)   // delta<0：向更早 banked 行回滚
+                                         : min(harvestBankedCount, b.yDisp + delta)  // 前滚 clamp 到底部
+                    if target != b.yDisp { scrollTo(row: target) }
+                }
+                extendSelectionToAutoScrollEdge(direction: goingUp ? .up : .down, point: point)
+                didSelectionDrag = true
+                return true
+            }
+        }
+
+        // 锁可见屏兜底（harvest 未启用/未 prime / 非备用屏时）：只读真实缓冲行，读到哪复制到哪，
+        // 高亮逐字节 == 复制。备用屏无本地历史时 selectionAutoScrollDelta 已 gate 为 0、停在可见
+        // 边缘 = 锁可见屏；主屏 scrollback / alt-scrollback 有历史时本地滚动连续选中。
         let direction: AlternateSelectionAutoScrollDirection = delta < 0 ? .up : .down
         let oldYDisp = terminal.displayBuffer.yDisp
         let oldEnd = selection.end
@@ -2317,10 +2362,382 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
     }
 
+    // Relay patch（单一数据源不变式 / 核心）：复制文本**只**来自 selection.getSelectedText()，
+    // 与高亮渲染读的是同一个 displayBuffer.lines[row]（Metal/CoreGraphics 都按绝对行号取行）。
+    // 因此「看到的高亮」逐字节等于「复制到的文本」。此前的 alternateSelectionAutoScrollText
+    // 跨帧累积器是第二个独立数据源——在 Claude Code/codex 这类就地重绘的 TUI 里，高亮画在固定
+    // 网格上、内容每帧被重绘，累积文本与高亮必然分叉（用户核心抱怨「看到的≠复制的」）。已整体删除。
     func selectedTextForCopy () -> String
     {
-        // 单一数据源：复制永远返回当前真实选区文本，保证「看到的高亮 == 复制的内容」。
         return selection.getSelectedText()
+    }
+
+    /// Relay patch（捕获式滚动 / 核心检测算法，已用黄金轨迹离线验证）：比较转发滚轮
+    /// 前后两帧的整屏文本网格，找出「整体下移一行」的最长连续区间——即 Claude Code /
+    /// codex 收到滚轮后就地重绘出的转录文本带——并返回该区间正上方那一行，也就是本次
+    /// 滚轮新「卷入」屏幕顶部的、更早的一行内容（供 prependScrollback 落盘）。
+    ///
+    /// 为什么不是「固定表头/表尾」检测：实测 CC 顶部并无恒定表头（更早内容直接出现在
+    /// 第 0 行，或紧贴首条已置顶的对话行之下），底部状态栏每帧都在变（"✻ Churned"→
+    /// "Jump to bottom"、输入行追加文字、进度条刷新）。唯一稳定的信号是转录带逐行下移
+    /// 一格：cur[i] == prev[i-1]。取最长的这种连续区间 [lo, hi)，新行即 cur[lo-1]。
+    ///
+    /// 严格性即安全性：最长区间长度 < minBandRows 视为不可信（可能是部分重绘、换屏、
+    /// 缩放或非滚动刷新），返回 nil → 调用方本帧**不入库、不动 buffer**，从而绝不产生
+    /// 与高亮错位的历史行。纯函数、零副作用，可离线单测（见 scratchpad/golden_grids.json，
+    /// 对 cc_scroll2 黄金轨迹可无缺口复原 164…180 + 首行 prompt）。
+    static func detectRevealedTopLine (prev: [String], cur: [String], minBandRows: Int = 3) -> (line: String, revealedRow: Int)? {
+        let rows = min(prev.count, cur.count)
+        guard rows >= minBandRows + 1 else { return nil }
+        var bestLo = -1
+        var bestLen = 0
+        var i = 1
+        while i < rows {
+            // 下移一行的连续区间起点：cur[i] 等于上一帧的 cur[i-1] 位置内容，且该行非空白
+            //（空白行恒等会制造伪区间，必须排除——与 Python 参考实现的 .strip() 一致）。
+            if cur[i] == prev[i - 1], !cur[i].trimmingCharacters(in: .whitespaces).isEmpty {
+                let lo = i
+                while i < rows, cur[i] == prev[i - 1] { i += 1 }
+                let len = i - lo
+                if len > bestLen { bestLen = len; bestLo = lo }
+            } else {
+                i += 1
+            }
+        }
+        guard bestLen >= minBandRows, bestLo >= 1 else { return nil }
+        return (cur[bestLo - 1], bestLo - 1)
+    }
+
+    /// 改动H(detectN)：把 detectRevealedTopLine 从「下移恰好 1 行」推广到「下移 N 行(N=1..maxShift)」。
+    /// 实测 CC 在流水线快速续发时会把多个滚轮报告合并成一帧滚 N 行(探针:32% nil 中 64% 是 n2/n3/n4)，
+    /// 单行版只认 N=1 故丢弃这些真滚动帧、还卡满看门狗。本函数对每个 N 扫最长「cur[i]==prev[i-N] 且
+    /// 去空白非空」连续 band，在 band>=minBandRows 的候选里选「band 最长、并列取最小 N」(最保守，避免
+    /// 重复边框/提示行在大 N 上凑长 band 误判)。返回 (topRow, count)：topRow=max(0,lo-N) 是最旧卷入行号，
+    /// count=min(N,lo) 是本帧实际可回收行数(起点不足 N 时只回收可见部分，其余为固有物理缺口、非 bug)。
+    static func detectRevealedBand (prev: [String], cur: [String], minBandRows: Int = 3, maxShift: Int = 4) -> (topRow: Int, count: Int)? {
+        let rows = min(prev.count, cur.count)
+        guard rows >= minBandRows + 1 else { return nil }
+        var bestLen = 0, bestLo = -1, bestN = 0
+        for n in 1...maxShift {
+            guard rows >= n + minBandRows else { break }       // 该 N 下凑不出 minBandRows 长 band
+            var i = n
+            while i < rows {
+                if cur[i] == prev[i - n], !cur[i].trimmingCharacters(in: .whitespaces).isEmpty {
+                    let lo = i
+                    while i < rows, cur[i] == prev[i - n] { i += 1 }
+                    let len = i - lo
+                    if len > bestLen { bestLen = len; bestLo = lo; bestN = n }   // n 递增、仅严格更长才替换→并列天然保留最小 N
+                } else {
+                    i += 1
+                }
+            }
+        }
+        guard bestLen >= minBandRows, bestLo >= 1, bestN >= 1 else { return nil }
+        return (max(0, bestLo - bestN), min(bestN, bestLo))
+    }
+
+    // MARK: - Relay patch: 备用屏「捕获式滚动连续选中」(capture-on-scroll harvest)
+    //
+    // 问题：Claude Code（备用屏）就地全重绘、从不把行滚进 scrollback，屏外历史只在 CC 内存里。
+    // 解法：用户向上拖选/滚轮到顶边时，主动转发滚轮让 CC 重绘上一屏 → band-diff 算出新卷入的顶行
+    // → prependScrollback 入「真回看缓冲」→ 选区行号同步 +1。被选中的行从此都是 [0,yBase) 里
+    // CC 永不写的冻结 BufferLine，故「高亮逐字节 == 复制」恒成立（捕获再不准也只 bank 错内容）。
+    //
+    // 不变式：harvest 进行中 yBase == lines.count - rows（scratch = CC 的活体屏 = 环尾 rows 行）。
+    // 几何全在主队列变更（feed/渲染/事件同线程，已确认），无需加锁。
+    // 杀手开关 RELAY_ALT_HARVEST=0 即时回退到锁可见屏的绿色地基；任何异常 → abortHarvest 优雅降级。
+
+    enum HarvestState { case idle, primed }
+    var harvestState: HarvestState = .idle
+    var harvestAwaitingRepaint = false        // 至多一个在途的转发滚轮（等 drainHarvest 落库后再发下一个）
+    var harvestBankedCount = 0                // 已 prepend 的行数（reattach 计数 + 判定 banked 底部）
+    var harvestRows = 0                       // prime 时的 rows，resize 检测用
+    var harvestPrevScratch: [String] = []     // 上一帧 scratch 网格（detectRevealedTopLine 的 prev）
+    var harvestWatchdog: Timer?               // 自愈看门狗：CC 对转发滚轮不吐数据时 awaiting 会永卡 true，超时清掉
+    var harvestEmptySteps = 0                 // 改动E：连续「转发上滚却收割不到任何历史」的次数(看门狗每次超时累计)
+    static let harvestMaxEmptySteps = 3       // 改动E：≥3 避开 tick0 resync；达阈值且从未 bank+无选区→自愈回 live
+    /// 改动G（平滑收割流水线）：本次手势待续发的收割步预算。收割顶边分支按 velocity 累加，
+    /// drainHarvest 每成功落库一行就消费 1 并自动续发下一步——把「等下一个 momentum event 才推进
+    /// 一行」换成「重绘落库即续推进」，让触控板像素累积(wheelVelocity)真正影响翻动速度(受 CC 重绘
+    /// 往返速率封顶)。严格维持「至多一个在途上报」不变式：续发只在 drainHarvest 成功分支(awaiting
+    /// 刚清空)发生。方向反转/abort/看门狗超时/prime 必清零，避免预算泄漏把视口带歪。
+    var pendingHarvestSteps = 0
+
+    /// awaiting 看门狗超时（秒）。CC 正常重绘走 feedFinish→drainHarvest 会即时清 awaiting 并 invalidate
+    /// 本 timer；只有 CC【完全不吐数据】（到其历史顶端 / 忙 / 忽略滚轮）才会等到超时——此时清掉
+    /// awaiting，使下一次手势能继续，绝不让滚轮永久卡死。给得足够宽（明显大于 CC 最坏单帧重绘耗时），
+    /// 避免在 CC 繁忙时误触——误触会把一帧迟到的真重绘当作自发输出丢弃(丢行漂移)。
+    static let harvestWatchdogTimeout: TimeInterval = 0.25   // 改动H(P1)：0.5→0.25。detectN 吸收掉合并帧后，残余 nil 多为 spinner/状态栏半帧，到顶/沉默应秒级自愈而非半秒冻结(肉眼最明确的「顿」)。取值仍明显大于 CC 最坏单帧重绘，避免繁忙误判把迟到真帧当自发输出丢弃。
+
+    // Relay patch：默认【开启】alt-screen 收割（用户 2026-06-30 拍板要「真·跨屏连续选中」、知情接受
+    // 卡顿风险）。收割靠「prime 冻结屏 → 注入 1 个滚轮 → diff 落库 → yBase++」逐行往返地把 CC/codex
+    // 滚出顶部的行搬进 Relay scrollback，让选区/高亮/复制同读 [0,yBase) 冻结缓冲 → 跨屏 highlight==copy
+    // 逐字节可信。代价（已知、用户接受）：这条逐行借的链路抢在 scrollWheel 直接转发路径(下方
+    // isDisplayBufferAlternate 转发分支)前面，把程序原本流畅的自滚换成 Relay 主导的一行一行卡顿——
+    // CC、codex 实测都卡(两者同样开鼠标上报、同样命中 eligible)。设 RELAY_ALT_HARVEST=0 即可显式关闭、
+    // 回退到「滚轮直接转发 button4/5 给程序、程序自滚自历史」的流畅行为(iTerm2/Ghostty 同款)作 A/B 对照。
+    // 「流畅且跨屏」的终极解需 detached-PTY（未做）。
+    static let harvestEnabled = ProcessInfo.processInfo.environment["RELAY_ALT_HARVEST"] != "0"
+
+    /// 收割是否对当前缓冲适用：开关开 + 允许鼠标上报 + 备用屏 + 程序在用鼠标上报。
+    /// 收割靠注入「滚轮鼠标上报」让 CC 翻页，故必须鼠标上报在用。默认 harvestEnabled=true（RELAY_ALT_HARVEST=0 可关）。
+    private var harvestEligible: Bool {
+        Self.harvestEnabled && allowMouseReporting && terminal.isDisplayBufferAlternate && terminal.mouseMode != .off
+    }
+
+    /// 中央安全闸：harvest 期间几何不变式是否仍成立。任一不成立=发生了 resize/换屏/CC 自滚 → 应 abort。
+    private var harvestInvariantHolds: Bool {
+        guard harvestState == .primed else { return true }
+        let b = terminal.buffer                         // 改动F：几何检查读 live buffer(CC 真正写入处)，不被同步窗口冻结快照干扰
+        return terminal.isDisplayBufferAlternate
+            && b.rows == harvestRows
+            && b.yBase == b.lines.count - b.rows
+            && b.yBase >= b.rows
+    }
+
+    private var harvestMidViewportPoint: CGPoint { CGPoint(x: bounds.midX, y: bounds.midY) }
+
+    /// 当前 scratch（CC 活体屏，绝对行 [yBase, yBase+rows)）的纯文本网格快照。
+    private func harvestScratchSnapshot () -> [String] {
+        let b = terminal.buffer                         // 改动F：读 CC 写入的 live scratch，绕开同步窗口快照→收割不再等窗口结束才入库
+        let rows = b.rows
+        var out: [String] = []
+        out.reserveCapacity(rows)
+        for y in 0..<rows {
+            let idx = b.yBase + y
+            if idx >= 0, idx < b.lines.count {
+                out.append(b.lines[idx].translateToString(trimRight: true, skipNullCellsFollowingWide: true))
+            } else {
+                out.append("")
+            }
+        }
+        return out
+    }
+
+    /// 进入收割态：把当前活体屏冻结为回看，并在其下深拷贝一份 scratch 供 CC 续画。
+    /// 仅在 idle + 备用屏 + yBase==0 + 环有 2*rows 容量时成功。
+    @discardableResult
+    private func prime () -> Bool {
+        guard harvestState == .idle, harvestEligible, !terminal.isSynchronizedOutputActive else { return false }  // 改动B(P0)：同步窗口内不启动收割
+        let b = terminal.buffer                         // 改动F：在 live buffer 上建收割几何(prime 已确保非同步窗口，此刻 displayBuffer===buffer)
+        let rows = b.rows
+        guard rows > 0, b.yBase == 0, b.lines.count == rows, rows * 2 <= b.lines.maxLength else { return false }
+        b.lines.count = rows * 2                       // 活跃区 rows → 2*rows：尾 rows 行成为 scratch
+        for y in 0..<rows {                            // 冻结屏深拷贝进 scratch（CC 差分重绘需正确底图）
+            b.lines[rows + y] = BufferLine(from: b.lines[y])
+        }
+        b.yBase = rows                                 // CC 写 [rows,2rows)；[0,rows) 冻结。yBase==count-rows
+        terminal.setViewYDisp(0)                       // 视口仍显冻结屏(yDisp=0)；经 setViewYDisp 使 userScrolling=(0<yBase)=true，
+                                                       // 锁住视口 → primed 期间 CC 向 scratch 的输出不会经 scroll() 把视口弹到 scratch
+        harvestRows = rows
+        harvestBankedCount = 0
+        harvestEmptySteps = 0                           // 改动E：复位空步计数
+        pendingHarvestSteps = 0                         // 改动G：新手势开始，清续发预算
+        harvestAwaitingRepaint = false
+        harvestPrevScratch = harvestScratchSnapshot()
+        harvestState = .primed
+        return true
+    }
+
+    /// 请求 CC 多露一行更早历史：转发一个上滚滚轮（至多一个在途，落库在随后的 drainHarvest）。
+    /// 返回 true=本次确实发出了收割滚轮；false=在途/不可收割（调用方据此决定是否落到本地路径，避免冻结）。
+    @discardableResult
+    private func harvestStepRequest () -> Bool {
+        guard harvestState == .primed, !harvestAwaitingRepaint, harvestEligible else { return false }
+        guard harvestInvariantHolds else { abortHarvest(); return false }
+        harvestPrevScratch = harvestScratchSnapshot()
+        harvestAwaitingRepaint = true
+        scheduleHarvestWatchdog()
+        sendAlternateMouseWheel(up: true, lines: 1, at: harvestMidViewportPoint, modifierFlags: [])
+        return true
+    }
+
+    /// 安排/重置 awaiting 看门狗。加到 .common 模式：滚动追踪/拖动期间主 runloop 切到
+    /// eventTracking 模式，default 模式 timer 不触发——.common 覆盖二者，保证一定能自愈。
+    private func scheduleHarvestWatchdog () {
+        harvestWatchdog?.invalidate()
+        let t = Timer(timeInterval: Self.harvestWatchdogTimeout, repeats: false) { [weak self] _ in
+            self?.harvestWatchdogFired()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        harvestWatchdog = t
+    }
+
+    private func clearHarvestWatchdog () {
+        harvestWatchdog?.invalidate()
+        harvestWatchdog = nil
+    }
+
+    /// 看门狗触发=超时后 awaiting 仍为 true，说明 CC 对上次转发滚轮【完全没吐数据】（到顶/忙/忽略）。
+    /// 清掉 awaiting 让后续手势能继续；scratch 既然没变，prevScratch 重同步为当前即可（幂等、防错位）。
+    /// 绝不在这里动几何或选区——只解开「在途」这把锁，是整个状态机唯一的自愈出口。
+    private func harvestWatchdogFired () {
+        harvestWatchdog = nil
+        guard harvestState == .primed, harvestAwaitingRepaint else { return }
+        // CC 对转发滚轮超时未吐数据：只解开「在途」这把锁，让后续手势能继续。
+        // 【不】重同步 harvestPrevScratch——保留 pre-step 基线；下次 harvestStepRequest 进场会重新基线，
+        // 故即便 CC 的重绘迟到、被当作自发输出丢弃，也只丢这一行、不产生持久错位漂移（用户再上滚即补回）。
+        harvestAwaitingRepaint = false
+        pendingHarvestSteps = 0                          // 改动G：CC 对转发滚轮沉默→续发预算作废，不残留到下次手势
+        harvestEmptySteps += 1                          // 改动E：CC 对本次转发上滚完全沉默 = 一次空步
+        if !harvestInvariantHolds { abortHarvest(); return }
+        harvestGiveUpIfStuck()                          // 改动E：累计空步达阈值且从未 bank+无选区→优雅回挂 live
+    }
+
+    /// 改动E：primed 但从未收割到任何历史(bankedCount==0)、累计空步达阈值、且无选区时——说明 CC 不配合
+    /// (到其历史顶/忙/忽略滚轮)，靠下滚 reattach 逃逸对「持续上滚」无效。此时优雅放弃收割：abortHarvest→
+    /// collapseHarvest 走 setViewYDisp(0) 清 userScrolling、[0,rows) 冻结帧==当前屏(无闪烁)，恢复 live 跟随。
+    /// 一旦成功 bank 过一行(bankedCount>0)此出口永久关闭，绝不影响正常历史浏览。
+    private func harvestGiveUpIfStuck () {
+        guard harvestState == .primed, harvestBankedCount == 0,
+              harvestEmptySteps >= Self.harvestMaxEmptySteps,
+              !selection.active else { return }
+        abortHarvest()
+    }
+
+    /// 收割态滚轮浏览路由（鼠标滚轮调用）。返回 true=已消费该手势（调用方应 return，
+    /// 不再走通用本地/转发路径）。核心原则：浏览 banked 历史**绝不清选区**；只有「滚到
+    /// banked 底部再下滚」这一刻意手势才回挂 live 并清选区。
+    private func harvestRouteScroll (goingUp: Bool, velocity: Int) -> Bool {
+        guard harvestState == .primed else { return false }
+        // DS2：primed 期间若 CC 自驱滚动(IND/滚动区 LF)破坏了几何不变式(yBase==count-rows 等)，
+        // 静默 desync 会让后续 band-diff 基线错位。每次滚动路由前校验，坏了就优雅降级回 live。
+        guard harvestInvariantHolds else { abortHarvest(); return true }
+        let b = terminal.displayBuffer
+        let yDisp = b.yDisp
+        if goingUp {
+            if yDisp <= 0 {
+                // 收割态顶部：请求更早一行。无论是否发出都消费本 notch——绝不把未入库的滚轮
+                // 直接转发给 CC（会造成 CC 多滚一行而我们没入库的错位），也绝不冻结。
+                // 改动G：按本 notch 的 velocity 累加续发预算(clamp 到一屏，防大甩动 momentum 爆量)。
+                // drainHarvest 落库后会自动续发剩余预算，单手势连续 bank velocity 行而非死等下个 event。
+                pendingHarvestSteps = min(pendingHarvestSteps + velocity, harvestRows)
+                if harvestStepRequest() { flashScroller() }
+                return true
+            }
+            flashScroller()
+            scrollTo(row: max(0, yDisp - velocity))         // 向更早 banked 行回滚（选区保持）
+            return true
+        } else {
+            pendingHarvestSteps = 0                      // 改动G：方向反转(下滚)清续发预算，避免上滚余量把视口带歪
+            if yDisp >= harvestBankedCount {
+                // 已在 banked 底部（=harvest 起始屏）。
+                // 有选区 → 停在底部、保留选区，【绝不】回挂 live（回挂会 selectNone 清掉选区——
+                // 用户明确抱怨「滑到底选中自动取消」）。用户在选/复制时，到底就是到底，不该清。
+                // 返回 live 改由「打字(keyDown)」这一明确的新交互手势触发（见 keyDown 里的 reattach）。
+                if selection.active && harvestBankedCount > 0 {     // 改动D(P3)：仅当确有 banked 历史(上滚=替代逃逸通道)
+                    return true                                     // 才为保选区而 park；bankedCount==0 残留选区不再困死，落到下面 reattach 逃逸。
+                }
+                // 无选区 → 纯回看到底，按终端惯例回挂 live（无可丢失）。bankedCount==0 也要逃逸，消死格。
+                reattachToLive()
+                return true
+            }
+            flashScroller()
+            scrollTo(row: min(harvestBankedCount, yDisp + velocity))  // 向更晚 banked 行前滚（选区保持）
+            return true
+        }
+    }
+
+    /// feedFinish 内调用：CC 对上次转发滚轮的重绘已落到 scratch，diff 出新卷入顶行并入库。
+    func drainHarvest () {
+        guard Self.harvestEnabled, harvestState == .primed, harvestAwaitingRepaint else { return }
+        guard harvestInvariantHolds else { abortHarvest(); return }   // abort 内部已清 awaiting+watchdog
+        let cur = harvestScratchSnapshot()
+        let band = Self.detectRevealedBand(prev: harvestPrevScratch, cur: cur)
+        guard let band = band else {
+            // 改动C(P1)：非滚动重绘帧(spinner/状态栏/PTY 分块半帧)——【不】消费在途令牌、不撤看门狗，
+            // 仅刷新基线，等真正的滚动重绘帧到来再入库；看门狗兜底「CC 自始至终不吐滚动帧」(到顶/忙)。
+            harvestPrevScratch = cur
+            harvestGiveUpIfStuck()                     // 改动E：若已累计足够空步且从未 bank→自愈回 live
+            return
+        }
+        harvestAwaitingRepaint = false                 // 改动C：确认是真滚动重绘帧，此处才消费在途令牌
+        clearHarvestWatchdog()                         // CC 已响应真滚动帧：撤掉自愈看门狗
+        harvestEmptySteps = 0                          // 改动E：成功收割→清空空步计数
+        let b = terminal.buffer                         // 改动F：prepend/几何都作用于 live buffer(CC 真正写入处)，不读同步窗口快照
+        // 改动H(detectN)：CC 可能把多个滚轮报告合并成一帧滚 count 行；newest-first 逐行 prepend——
+        // band.topRow..topRow+count-1 顶→底=旧→新，prependScrollback 总插逻辑 0，故从底(新)向顶(旧)
+        // 依次 prepend，才能让最旧行落到回看缓冲顶端(行序正确)。环满即停止，已入库的保留。
+        var banked = 0
+        var r = band.topRow + band.count - 1
+        while r >= band.topRow {
+            let bankRow = b.yBase + r
+            guard bankRow >= 0, bankRow < b.lines.count else { break }
+            let bankLine = BufferLine(from: b.lines[bankRow])
+            guard b.lines.prependScrollback(bankLine) else { break }   // 环满 → 停止收割
+            banked += 1
+            r -= 1
+        }
+        guard banked > 0 else { abortHarvest(); return }   // 一行都没入(越界/环满起步)→兜底降级
+        b.yBase += banked                              // 整体下移 banked：同步 yBase/选区；yDisp 保持 0=向上滚视觉
+        terminal.setViewYDisp(0)                       // 经 setViewYDisp 维持 userScrolling=(0<yBase)=true，锁住视口
+        selection.shiftRows(by: banked)
+        harvestBankedCount += banked
+        harvestPrevScratch = harvestScratchSnapshot()
+        setNeedsDisplay(bounds)
+        // 改动G/H：本帧已推进 banked 行(awaiting 刚于上方清空)，按实际推进量扣预算并续发下一步——
+        // 严格维持「至多一个在途」：harvestStepRequest 内 guard !harvestAwaitingRepaint 已保证。
+        // 续发失败(到 CC 历史顶/不可收割)即清零预算，不残留到下次手势。
+        if pendingHarvestSteps > 0 {
+            pendingHarvestSteps = max(0, pendingHarvestSteps - banked)
+            if pendingHarvestSteps > 0, !harvestStepRequest() { pendingHarvestSteps = 0 }
+        }
+    }
+
+    /// 折叠收割几何，复位到「活体直绘」。copyTail=true 时把原始尾屏拷回 [0,rows) 作初始帧（优雅回挂）；
+    /// false 时硬复位、交给 CC 重绘（错误兜底，几何可能已坏不可信）。
+    private func collapseHarvest (copyTail: Bool) {
+        let b = terminal.buffer                         // 改动A(P0)：折叠/复位必须作用于 live buffer，绝不作用于
+                                                        // 同步窗口的冻结快照——否则 live 几何不复位、setViewYDisp(0)
+                                                        // 算出 userScrolling=true(live yBase 仍=rows)→视口永久冻结(真凶)。
+        let rows = b.rows
+        if copyTail {
+            // 原始冻结尾屏（harvest 起始时的活体屏）位于 logical[bankedCount, bankedCount+rows)，最贴近 live。
+            // 先快照到临时数组再写，避免源/目标区间重叠时自我覆盖。
+            let tailTop = max(0, min(harvestBankedCount, max(0, b.lines.count - rows)))
+            if b.lines.count >= tailTop + rows {
+                let snap = (0..<rows).map { BufferLine(from: b.lines[tailTop + $0]) }
+                for y in 0..<rows { b.lines[y] = snap[y] }
+            }
+        }
+        if b.lines.count > rows { b.lines.count = rows }
+        b.yBase = 0
+        terminal.setViewYDisp(0)                       // 关键(真凶 DS1 修复)：回 live 必须经 setViewYDisp 把 userScrolling 清回 false
+                                                       //（此时 0<yBase=0 → false），否则残留 true → CC 新输出经 Terminal.scroll()
+                                                       // 的 `if !userScrolling { yDisp=yBase }`(Terminal.swift:5314) 被跳过 → 视口不再
+                                                       // 跟随 live = 用户报告的「卡死不能滚动」，唯敲键(ensureCaretIsVisible)/切任务(resize→abort)能救。
+        harvestState = .idle
+        harvestAwaitingRepaint = false
+        clearHarvestWatchdog()
+        harvestBankedCount = 0
+        harvestRows = 0
+        harvestEmptySteps = 0                           // 改动E：复位空步计数
+        pendingHarvestSteps = 0                         // 改动G：折叠回 live(含 abort/reattach)清续发预算
+        harvestPrevScratch = []
+        terminal.refresh(startRow: 0, endRow: rows)
+        setNeedsDisplay(bounds)
+    }
+
+    /// 错误/换屏/resize 兜底：清选区 + 硬复位。最坏短暂残留一帧旧内容，CC 持续刷新会盖掉。
+    func abortHarvest () {
+        guard harvestState != .idle else { return }
+        selection.selectNone()
+        collapseHarvest(copyTail: false)
+    }
+
+    /// 回到 live：先转发足量下滚让 CC 内部滚回底部（在底部钳住，超发安全），再折叠复位。
+    /// CC 的下滚回包异步到达时 yBase 已=0 → 直接画成 live tail。
+    func reattachToLive () {
+        guard harvestState == .primed else { return }
+        let downs = min(harvestBankedCount + terminal.buffer.rows + 2, 256)   // 改动A(P0)：用 live buffer 的 rows
+        harvestState = .idle                           // 防止下滚回包又被 drainHarvest 当收割
+        harvestAwaitingRepaint = false
+        clearHarvestWatchdog()
+        for _ in 0..<downs {
+            sendAlternateMouseWheel(up: false, lines: 1, at: harvestMidViewportPoint, modifierFlags: [])
+        }
+        selection.selectNone()
+        collapseHarvest(copyTail: true)
     }
 
     // Callback from when the mouseDown autoscrolling timer goes off
@@ -2666,8 +3083,28 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if event.deltaY == 0 {
             return
         }
-        let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
         let goingUp = event.deltaY > 0
+        // Relay patch（平滑滚动）：触控板/妙控鼠标(精确滚动增量)改用「像素累积逐行」——把连续的
+        // 亚行手势按 cellHeight 攒成整行，替代 calcScrollingVelocity 的 1/3/10/20 离散档位。
+        // 否则触控板慢滑也被量化成每个 event 跳 3 行（用户反馈「向上滚一次三行三行、不丝滑」）。
+        // 累积未满一行 → velocity 0 → 本次不滚、纯攒，下个 event 满一行再逐行推进 = 连续跟手。
+        // 鼠标滚轮(无精确增量)保持档位量化（notch 稀疏，量化合理）。
+        let velocity = wheelVelocity(for: event)
+        if velocity == 0 { return }
+
+        // Relay patch（捕获式滚动）：备用屏(CC)普通滚轮——live 屏顶部上滚 → 进入收割态；收割态内
+        // 上下滚在 banked 历史中浏览（选区保持），滚到 banked 底部再下滚 → 刻意回挂 live。
+        // 收割未消费（idle / 顶部收割在途被吸收除外）则落到下面的通用本地/转发路径，绝不冻结滚轮。
+        // DS3：primed 期间程序撤掉鼠标上报(mouseMode→.off / allowMouseReporting 变化)使 harvestEligible 翻假，
+        // 否则下面的 harvestEligible 块被整体跳过、2*rows 的 primed 几何永远残留 → 这里先收口回 live。
+        if harvestState == .primed, !harvestEligible { abortHarvest() }
+        if harvestEligible, !mouseReportingBypassed(with: event) {
+            let b = terminal.displayBuffer
+            if goingUp, harvestState == .idle, b.yBase == 0, b.yDisp == 0 { _ = prime() }
+            if harvestRouteScroll(goingUp: goingUp, velocity: velocity) {
+                return
+            }
+        }
 
         // Relay patch: alternate-screen scroll. Fullscreen apps (vim, less,
         // htop, man, …) run on the alternate buffer, which has no scrollback —
@@ -2782,6 +3219,48 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return 3
         }
         return 1
+    }
+
+    /// Relay patch（平滑滚动）：把一次滚轮 event 归一化成「本次该滚多少行」（非负，方向由调用方
+    /// 据 event.deltaY 符号决定）。精确滚动设备(触控板/妙控鼠标)走像素累积——连续亚行手势攒满
+    /// cellHeight 才进一行，实现逐行连续滚动；普通鼠标滚轮(无精确增量)沿用 calcScrollingVelocity
+    /// 的档位量化（notch 稀疏，量化合理）。
+    private func wheelVelocity (for event: NSEvent) -> Int {
+        guard event.hasPreciseScrollingDeltas else {
+            wheelPixelAccumY = 0                                  // 切回普通滚轮：丢弃精确累积，避免残留
+            lastWheelTime = 0                                     // 改动H：重置行速基线
+            return calcScrollingVelocity(delta: Int (abs (event.deltaY)))
+        }
+        let cellHeight = max (cellDimension?.height ?? 1, 1)
+        let dy = event.scrollingDeltaY
+        let sign = dy > 0 ? 1 : (dy < 0 ? -1 : 0)
+        if sign != 0 && sign != wheelAccumSign {                 // 方向反转：清累积，避免上一方向余量把视口带回一帧
+            wheelPixelAccumY = 0
+            wheelAccumSign = sign
+        }
+        // 改动H(加速度)：按瞬时行速放大像素累积——慢滑 gain=1 保持 1:1 逐行跟手(消除当初的「跳3行」)，
+        // 快滑/甩动 ease-in 超线性放大(恢复原 calcScrollingVelocity 被丢掉的加速档)，让一次手势翻一大片。
+        let now = event.timestamp
+        let dt = lastWheelTime > 0 ? min(max(now - lastWheelTime, 0.004), 0.1) : 0.016
+        lastWheelTime = now
+        let rowsPerSec = Double(abs (dy) / cellHeight) / dt
+        wheelPixelAccumY += abs (dy) * CGFloat(Self.harvestAccelGain(rowsPerSec: rowsPerSec))
+        let steps = Int (wheelPixelAccumY / cellHeight)          // 攒满整数行才滚，余数留待下个 event
+        if steps > 0 {
+            wheelPixelAccumY -= CGFloat (steps) * cellHeight
+        }
+        return steps
+    }
+
+    /// 改动H(加速度增益)：触控板上滚收割的速度自适应放大系数。慢滑(rowsPerSec<=slow)gain=1 保持
+    /// 1:1 逐行跟手；快滑/甩动按 ease-in(t²) 超线性放大到 maxGain，恢复原 calcScrollingVelocity
+    /// 被丢掉的加速档，让一次手势注入更多收割预算、翻动一大片。阈值用「行/秒」故与字号/分辨率无关；
+    /// 常量按真机刷新率可微调(maxGain 过大→甩太多+拖尾，过小→无感)。
+    static func harvestAccelGain (rowsPerSec: Double) -> Double {
+        let slow = 8.0, fast = 90.0, maxGain = 6.0
+        if rowsPerSec <= slow { return 1.0 }
+        let t = min((rowsPerSec - slow) / (fast - slow), 1.0)
+        return 1.0 + (maxGain - 1.0) * t * t
     }
 
     public override func resetCursorRects() {

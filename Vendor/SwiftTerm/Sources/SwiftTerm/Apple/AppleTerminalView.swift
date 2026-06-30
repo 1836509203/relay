@@ -2014,6 +2014,12 @@ extension TerminalView {
     func feedFinish ()
     {
         suspendDisplayUpdates ()
+        #if os(macOS)
+        // Relay patch（捕获式滚动）：CC/codex 对转发滚轮的就地重绘已落地到 displayBuffer 后，
+        // 在这里（render 入队之前、仍在主队列）把本帧新「卷入」屏顶的历史行收割进真回看缓冲。
+        // 非收割态 / 非备用屏时为零开销 no-op。
+        drainHarvest()
+        #endif
         queuePendingDisplay()
     }
     

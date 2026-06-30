@@ -338,6 +338,11 @@ open class Terminal {
     var isDisplayBufferAlternate: Bool {
         synchronizedOutputBuffer != nil ? synchronizedOutputBufferIsAlternate : isCurrentBufferAlternate
     }
+
+    /// Relay(改动B / P0)：DEC 2026 同步输出窗口内 displayBuffer 指向冻结快照，harvest 不可在此期间【启动】
+    /// （只读、无副作用；prime() 据此守卫——不要塞进 harvestEligible，否则 CC 一开同步窗口就会误 abort
+    /// 正在进行的历史浏览）。
+    var isSynchronizedOutputActive: Bool { synchronizedOutputActive }
     
     public var isCurrentBufferAlternate: Bool {
         buffer === altBuffer

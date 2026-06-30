@@ -84,7 +84,18 @@ class SelectionService: CustomDebugStringConvertible {
     public var isMultiLine: Bool {
         return start.row != end.row
     }
-    
+
+    /// Relay patch（捕获式回看）：`prependScrollback` 在缓冲头部插入一行历史后，所有逻辑
+    /// 行号整体 +1（更一般地 +delta）。此方法把当前选区的起止**行号**一并平移，使其继续
+    /// 锚定相同的内容行——这是「高亮逐字节 == 复制」不变式在收割时不破的关键（start/end 为
+    /// `private(set)`，外部无法直接改，故在类内提供此受控入口）。delta 通常为 +1。
+    public func shiftRows (by delta: Int)
+    {
+        guard delta != 0, hasSelectionRange || active else { return }
+        start = Position (col: start.col, row: max (0, start.row + delta))
+        end   = Position (col: end.col,   row: max (0, end.row + delta))
+    }
+
     /**
      * Starts the selection from the specific screen-relative location
      */
