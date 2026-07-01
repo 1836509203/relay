@@ -77,6 +77,32 @@ final class SelectionTests: TerminalDelegate {
             pressure: 1)!
     }
 
+    private func mouseUpEvent(at point: CGPoint) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: point,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1)!
+    }
+
+    private func mouseDownEvent(at point: CGPoint, clickCount: Int = 1) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: point,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: clickCount,
+            pressure: 1)!
+    }
+
     // Test only on macOS due to differences in how frames are handled on mac and iOS
     @Test func testMouseHitCorrectWhenScrolled() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 10, height: 10)))
@@ -204,43 +230,117 @@ final class SelectionTests: TerminalDelegate {
         #expect(view.selectionAutoScrollIsActive == true)
     }
 
-    // Relay 回归（锁可见屏，用户拍板）：Claude Code/codex 用 CUP 就地重绘、从不把旧行吐进
-    // 任何缓冲（yBase 恒为 0），备用屏本地无历史可滚。拖选到边缘必须停在可见边缘行——绝不
-    // 把滚轮/方向键转发给程序（转发会让程序重绘、选区与高亮错位），也绝不累积屏外文本。
-    // 复制永远 == 当前真实选区（highlight == copy）。这是被反复横跳过的「转发+累积」老路的反面。
-    @Test func testSelectionAutoScrollOnAlternateScreenWithoutScrollbackLocksToViewport() {
+    // Relay 回归（跨屏连续选中，取代旧版"锁可见屏"）：Claude Code/codex 用 CUP 就地重绘、
+    // 从不把旧行吐进任何缓冲（yBase 恒为 0），备用屏本地无历史可滚。拖到边缘时改为把滚轮/
+    // 方向键转发给程序、让它翻出下一屏，同时把每一帧的选中文本累积起来——高亮受限于当前帧
+    // （只能显示程序刚重绘的内容），但复制结果应当囊括已经被滚出可见区的历史内容。
+    @Test func testSelectionAutoScrollOnAlternateScreenWithoutScrollbackForwardsAndAccumulates() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let delegate = CapturingTerminalViewDelegate()
         view.terminalDelegate = delegate
         view.feed(text: "\u{1B}[?1049h")
         view.feed(text: "\u{1B}[?1000h")
-        // CUP 就地重绘三行、不发换行 → 不产生 alt scrollback（模拟 Claude Code）
-        view.feed(text: "\u{1B}[Hline 1\r\nline 2\r\nline 3")
+        // CUP 就地重绘三行、不发换行 → 不产生 alt scrollback（模拟 Claude Code frame 1）。
+        view.feed(text: "\u{1B}[Hframe1 top\r\nframe1 mid\r\nframe1 bottom")
         #expect(view.terminal.isDisplayBufferAlternate == true)
         #expect(view.terminal.mouseMode != .off)
         #expect(view.terminal.displayBuffer.yBase == 0)
 
-        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 0))
-        let bottomPoint = CGPoint(x: view.cellDimension.width * 6, y: 0)
+        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 10, row: 0))
+        let bottomPoint = CGPoint(x: view.cellDimension.width * 10, y: 0)
         delegate.sent.removeAll()
 
-        // 锁可见屏门控：无本地历史可滚 → 自动滚动 delta 归零、timer 不武装（不空转、不转发）。
-        #expect(view.selectionAutoScrollDelta(for: bottomPoint) == 0)
+        // 无本地历史可滚，但仍要武装 timer——转发与否交给 performSelectionAutoScroll 内部
+        // 判断，不再在这一层锁死为 0（区别于旧版"锁可见屏"）。
+        #expect(view.selectionAutoScrollDelta(for: bottomPoint) != 0)
         view.updateSelectionAutoScroll(at: bottomPoint)
-        #expect(view.selectionAutoScrollIsActive == false)
+        #expect(view.selectionAutoScrollIsActive == true)
 
-        // 即便直接调用 performSelectionAutoScroll：不转发、不滚动视口，选区延伸到底部可见行后即停。
-        _ = view.performSelectionAutoScroll(delta: 2, point: bottomPoint)
-        #expect(delegate.sent.isEmpty == true)
-        #expect(view.terminal.displayBuffer.yDisp == 0)
+        // 拖到边缘：转发滚轮/方向键给程序，选区延伸到底部可见行。
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+        #expect(delegate.sent.isEmpty == false)
         #expect(view.selection.end.row == view.terminal.displayBuffer.rows - 1)
 
-        // 再拖一次也不应转发或越界——稳定锁在可见边缘。
-        _ = view.performSelectionAutoScroll(delta: 2, point: bottomPoint)
-        #expect(delegate.sent.isEmpty == true)
-        #expect(view.selection.end.row == view.terminal.displayBuffer.rows - 1)
+        // 模拟程序收到滚动后就地重绘出下一屏：整体上移一行，顶部露出全新内容，
+        // frame1 的顶行已经不在当前帧里了。
+        view.feed(text: "\u{1B}[Hframe1 mid\r\nframe1 bottom\r\nframe2 new")
 
-        // 复制 == 当前真实选区高亮（绝不返回累积/错位文本）。
+        // 复制结果应当同时包含 frame1 顶部（已经被滚出可见区，当前 selection.getSelectedText()
+        // 单独读不到）和 frame2 新露出的内容——这正是"累积"要做到的事。
+        let copied = view.selectedTextForCopy()
+        #expect(copied.contains("frame1 top"))
+        #expect(copied.contains("frame2 new"))
+    }
+
+    // Relay 回归（51a3fbc 点名的历史坑之一："按任意长度（含 1 字符）overlap 拼接易误删行"）：
+    // 早期版本的合并算法允许短至 1 行的重叠就采信，两帧恰好在某个短公共行（复用的分隔符/
+    // 提示符）处巧合相同时会被误判成"同一行的延续"，把 current 里紧跟着的那次独立重复吞掉——
+    // 两次真实出现的内容被错并成一次。修复要求最短可信重叠行数，此测试直接验证这个契约。
+    @Test func testMergedAlternateSelectionAutoScrollTextIgnoresShortCoincidentalOverlap() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let existing = "first block A\nfirst block B\n---"
+        // current 恰好也以同一个分隔符 "---" 开头，但这是一次无关的、独立的巧合重复
+        // （不是同一次滚动里真正延续下来的那一行），后面跟着全新内容。
+        let current = "---\nsecond block C\nsecond block D"
+        let merged = view.mergedAlternateSelectionAutoScrollText(existing: existing, current: current, direction: .down)
+
+        #expect(merged.contains("first block A"))
+        #expect(merged.contains("first block B"))
+        #expect(merged.contains("second block C"))
+        #expect(merged.contains("second block D"))
+        // 关键断言：分隔符应当保留两次真实出现（一次来自 existing 结尾，一次来自 current
+        // 开头），而不是被 1 行巧合匹配误吞成一次。
+        let separatorOccurrences = merged.components(separatedBy: "---").count - 1
+        #expect(separatorOccurrences == 2)
+    }
+
+    // Relay 回归（51a3fbc 点名的历史坑之一："松手后流式输出污染 ⌘C"）：拖拽一旦结束，累积器
+    // 必须立刻封存。若此刻还欠一次 feedFinish 回调，程序在松手之后继续输出（哪怕只是常规的
+    // 流式刷新，不需要用户再有任何动作）不应该让复制文本被悄悄追加新内容。
+    @Test func testMouseUpSealsAlternateSelectionAccumulatorAgainstLaterStreaming() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[?1000h")
+        view.feed(text: "\u{1B}[Hframe A\r\nframe B\r\nframe C")
+        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 7, row: 0))
+        view.isSelectionDragInProgress = true
+        let bottomPoint = CGPoint(x: view.cellDimension.width * 7, y: 0)
+        view.updateSelectionAutoScroll(at: bottomPoint)
+
+        // 拖到边缘触发一次转发；不等程序应答就直接松手（needsCaptureAfterFeed 还悬着）。
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+        view.mouseUp(with: mouseUpEvent(at: bottomPoint))
+        let sealedText = view.selectedTextForCopy()
+        #expect(sealedText.isEmpty == false)
+
+        // 松手之后程序仍在正常输出，不应该再改写已经封存的复制文本。
+        view.feed(text: "\u{1B}[Hunrelated 1\r\nunrelated 2\r\nunrelated 3")
+        #expect(view.selectedTextForCopy() == sealedText)
+        #expect(view.selectedTextForCopy().contains("unrelated") == false)
+    }
+
+    // Relay 回归（51a3fbc 点名的历史坑之一："缓存污染下次选区复制"）：上一次拖选留下的
+    // 累积器，不能泄漏进下一次全新选区的复制结果。
+    @Test func testNewMouseDownResetsStaleAlternateSelectionAccumulator() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[?1000h")
+        view.feed(text: "\u{1B}[Hframe A\r\nframe B\r\nframe C")
+        view.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 7, row: 0))
+        view.isSelectionDragInProgress = true
+        let bottomPoint = CGPoint(x: view.cellDimension.width * 7, y: 0)
+        view.updateSelectionAutoScroll(at: bottomPoint)
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+        view.mouseUp(with: mouseUpEvent(at: bottomPoint))
+        #expect(view.selectedTextForCopy().isEmpty == false)
+
+        // 全新一次按下：即便还没开始拖，也应该先清掉上一次拖拽遗留的累积文本。
+        view.mouseDown(with: mouseDownEvent(at: CGPoint(x: 20, y: bottomPoint.y + view.cellDimension.height * 2)))
+        view.selection.setSelection(start: Position(col: 0, row: 1), end: Position(col: 4, row: 1))
         #expect(view.selectedTextForCopy() == view.selection.getSelectedText())
     }
 
