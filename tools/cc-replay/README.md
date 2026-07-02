@@ -29,6 +29,21 @@ swiftc -Onone -o replay replay-main.swift \
 - Phase B：模拟「向上拖到顶边」拖选，逐块打印检测到的平移量 K、锚点位置。
 - Phase C：打印 ⌘C 复制文本，检查完整性/重复块。
 
+## 进程内 NSEvent 闭环 e2e（e2e-main.swift）
+
+```bash
+mkdir -p /tmp/e2e && cp e2e-main.swift /tmp/e2e/main.swift   # 顶层语句要求文件名为 main.swift
+swiftc -Onone -o /tmp/e2e/e2e /tmp/e2e/main.swift \
+    $(find ../../Vendor/SwiftTerm/Sources/SwiftTerm -name '*.swift')
+/tmp/e2e/e2e cc-session.jsonl    # exit 0 = 复制文本连续、无重复、无 NUL
+```
+
+比无头回放器更进一步：真 NSEvent 打进 mouseDown/mouseDragged/mouseUp、20Hz 自动滚动
+定时器真跑（RunLoop 驱动），转发出的 SGR 滚轮上报由录制的 CC 响应帧逐组应答——除了
+系统级事件注入之外与真机链路完全一致，且不需要辅助功能权限、不动用户鼠标。
+v0.5.11 的两个 bug（mouseUp 封存整屏前插污染块、NUL 混进剪贴板）只有这一层能抓到：
+无头回放器不走 mouseUp，合成测试的行文本没有 null cell。
+
 ## 判读要点
 
 - `相邻帧K=nil` 连续出现 = 平移检测被真实重绘模式打穿（去看 detectAlternateContentShift）。

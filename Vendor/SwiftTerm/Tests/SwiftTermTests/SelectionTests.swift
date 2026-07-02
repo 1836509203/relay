@@ -489,6 +489,15 @@ final class SelectionTests: TerminalDelegate {
         #expect(result?.matchedHi == currBody.count - 3)
     }
 
+    // CC/Ink「CUP 跳列画字」留下的前导 null cell 会被 translate 成 \0：同一行一帧带 NUL
+    // 一帧带空格，逐字节比较摇摆失配，且 NUL 会混进 ⌘C 剪贴板文本。统一成空格并剪尾。
+    @Test func testSanitizedScreenLineStripsNulPadding() {
+        #expect(TerminalView.sanitizedScreenLine("\u{0}\u{0}115") == "  115")
+        #expect(TerminalView.sanitizedScreenLine("  54\u{0}\u{0}") == "  54")
+        #expect(TerminalView.sanitizedScreenLine("\u{0}") == "")
+        #expect(TerminalView.sanitizedScreenLine("plain") == "plain")
+    }
+
     // 捕获文本的稳定性契约：边缘侧行必须取全宽。旧版按鼠标列截断末行，同一内容行下一帧
     // 变成内部行后文本就变了，重叠比对必然失配——几乎每帧都退化成保守拼接、复制出重复块。
     @Test func testAlternateSelectionCaptureTextTakesFullWidthAtEdgeSide() {

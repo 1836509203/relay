@@ -2510,6 +2510,22 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     /// 可见屏的全宽文本（每行 trimRight），供逐帧平移检测与确定性追加使用。
+    /// CC/Ink 用「CUP 跳列画字」渲染，跳过的前导格是 null cell，translateBufferLineToString
+    /// 会原样输出 NUL（\0）。同一行内容一帧带 NUL 一帧带空格（取决于该帧 diff 是否重画了它），
+    /// 逐字节比较会摇摆失配；NUL 混进累积器还会污染 ⌘C 出去的剪贴板文本。统一 NUL→空格再
+    /// 剪尾，让屏幕行比较与复制文本都以「肉眼所见」为准。
+    static func sanitizedScreenLine (_ line: String) -> String
+    {
+        var s = line
+        if s.contains("\u{0}") {
+            s = s.replacingOccurrences(of: "\u{0}", with: " ")
+        }
+        while s.hasSuffix(" ") {
+            s.removeLast()
+        }
+        return s
+    }
+
     func visibleAlternateScreenLines () -> [String]
     {
         let buffer = terminal.displayBuffer
@@ -2518,7 +2534,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let bottom = min(buffer.yDisp + buffer.rows - 1, buffer.lines.count - 1)
         guard top <= bottom else { return [] }
         return (top...bottom).map {
-            buffer.translateBufferLineToString(lineIndex: $0, trimRight: true, skipNullCellsFollowingWide: true)
+            Self.sanitizedScreenLine(buffer.translateBufferLineToString(
+                lineIndex: $0, trimRight: true, skipNullCellsFollowingWide: true))
         }
     }
 
@@ -2644,9 +2661,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             // .down 锚点在上端：首行从锚点列起；.up 锚点在下端：末行截到锚点列（含）。
             let startCol = (direction == .down && row == topRow) ? max(0, ordered.upper.col) : 0
             let endCol = (direction == .up && row == bottomRow) ? min(terminal.cols, ordered.lower.col + 1) : -1
-            lines.append(buffer.translateBufferLineToString(
+            lines.append(Self.sanitizedScreenLine(buffer.translateBufferLineToString(
                 lineIndex: row, trimRight: true, startCol: startCol, endCol: endCol,
-                skipNullCellsFollowingWide: true))
+                skipNullCellsFollowingWide: true)))
         }
         return lines.joined(separator: "\n")
     }
@@ -2861,7 +2878,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         stopSelectionAutoScroll()
         pendingSelectionAnchor = nil
         if terminal.isDisplayBufferAlternate, isSelectionDragInProgress,
-           let direction = alternateSelectionAutoScrollDirection {
+           let direction = alternateSelectionAutoScrollDirection,
+           alternateSelectionAutoScrollLastScreen == nil || alternateSelectionTrackingFailures > 0 {
+            // 兜底封存：仅在内容跟踪不可用（基线丢失/最近帧失配）时才整选区补捕一次。
+            // 跟踪健康时累积器已由初始捕获 + 每 feed 确定性追加拼完整；此刻锚点通常已被
+            // 钳到屏幕边缘，整选区再捕一遍会连 prompt/固定状态栏一起圈进来，与累积器
+            // 端点重叠必然对不上（joinedSelectionBlocks 只认端点重叠），整屏垃圾直接
+            // 前插进复制文本——进程内 NSEvent 闭环 e2e（真实 CC 字节流）抓到的真机路径。
             captureAlternateSelectionAutoScrollText(direction: direction)
         }
         // Relay 回归（51a3fbc 曾点名的坑：「松手后流式输出污染 ⌘C」）：拖拽一旦结束，累积器必须
