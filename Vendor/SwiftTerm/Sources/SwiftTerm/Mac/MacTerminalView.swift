@@ -2159,10 +2159,20 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private var alternateSelectionAutoScrollText: String?
     private var alternateSelectionAutoScrollDirection: AlternateSelectionAutoScrollDirection?
     private var alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-    /// 上一次处理过的可见屏全宽文本（每行 trimRight），用于逐帧检测程序把内容实际滚了几行
-    /// （detectAlternateContentShift）——这是「高亮锚点跟随内容平移」和「累积器确定性追加」
-    /// 的共同依据。转发被 stall 跳过的帧也没关系：下次比对算出的是跨帧累计平移量。
+    /// 内容跟踪基线：上一次可信帧的可见屏全宽文本（每行 trimRight），用于逐帧检测程序把内容
+    /// 实际滚了几行（detectAlternateContentShift）——这是「高亮选区跟随内容平移」和「累积器
+    /// 确定性追加」的共同依据。非 nil 即「跟踪已武装」。撕裂帧（检测失败）不换基线：等完整帧
+    /// 到齐后与老基线一次对出跨块累计平移量。
     private var alternateSelectionAutoScrollLastScreen: [String]?
+    /// 基线对应的 yDisp：本地视口滚动（yDisp 变化）也会让整屏 dump 平移，但那不是程序滚内容，
+    /// 拿去对齐会骗出假平移量——yDisp 一变就只重建基线、不平移选区。
+    private var alternateSelectionTrackingYDisp = 0
+    /// 连续检测失败（撕裂帧/整屏换内容）次数。真实 CC 的一帧重绘常拆成多个 PTY 块到达，每块
+    /// 都触发一次 feedFinish——只画了一半的撕裂帧对不出可信平移量是常态（v0.5.8 只看转发后第
+    /// 一个 feed，正是被这点打穿：半帧污染累积器、完整帧被跳过、锚点永远没平移）。连续多次
+    /// 失败才判定内容真被整体换掉。
+    private var alternateSelectionTrackingFailures = 0
+    private static let alternateSelectionTrackingMaxFailures = 4
     /// 连续多少个 20Hz tick 仍在等上一次转发的 feedFinish 回调。用于节流「至多一个在途转发」，
     /// 避免程序重绘跟不上时被连续糊进多个滚轮事件，导致前后两次捕获对不上、拼接静默丢段。
     private var alternateSelectionAutoScrollStalledTicks = 0
@@ -2302,7 +2312,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             if alternateSelectionAutoScrollNeedsCaptureAfterFeed {
                 alternateSelectionAutoScrollStalledTicks += 1
                 if alternateSelectionAutoScrollStalledTicks < Self.alternateSelectionAutoScrollMaxStalledTicks {
-                    // 上一次转发还没等到程序重绘回调（updateAlternateSelectionAutoScrollCaptureAfterFeed
+                    // 上一次转发还没等到程序重绘回调（trackAlternateSelectionContentAfterFeed
                     // 尚未清掉这个标志）：本 tick 不追发，避免糊入第二个滚轮事件后两次捕获窗口错位、
                     // joinedSelectionBlocks 找不到重叠而静默丢段。等下个 tick 再看，feed 一到位就正常推进。
                     return false
@@ -2315,12 +2325,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             if alternateSelectionAutoScrollText == nil {
                 // 只有本次拖拽第一次转发需要在这里补一次「转发前」快照——此时累积器还是空的，
                 // 没有任何历史可用。后续每个 tick 开头，屏幕内容其实还是上一 tick 结尾
-                // updateAlternateSelectionAutoScrollCaptureAfterFeed 刚采过的那一帧（本 tick
+                // trackAlternateSelectionContentAfterFeed 刚采过的那一帧（本 tick
                 // 还没转发、程序还没重绘），在这里重复采样纯属多余。CC 界面常见的 spinner/
                 // 闪烁光标会让「同一帧」的两次取样并非逐字节相同，重复采样反而可能让重叠比对
                 // 因为这点无关紧要的动画差异找不到真实重叠，误判成新内容而重复拼接。
                 captureAlternateSelectionAutoScrollText(direction: direction)
-                alternateSelectionAutoScrollLastScreen = visibleAlternateScreenLines()
+                // 基线若已在拖拽开始（mouseDragged）武装过则保持连续，否则此刻武装。
+                armAlternateSelectionTracking()
             }
             alternateSelectionAutoScrollNeedsCaptureAfterFeed = true
             sendAlternateSelectionScroll(delta: delta, point: point)
@@ -2358,10 +2369,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // Relay patch: 拖拽划选到屏幕边缘、想继续选屏外内容时——先看终端本地是否还有可滚的
         // 历史(canSelectionAutoScrollLocally：alt 若有 yBase>0 的历史就本地滚、扩选)。一旦
         // 本地滚到头(CC/codex 的 yBase==0，屏外内容不在终端手里)，就把滚轮转发给程序让它就地
-        // 重绘上/下一屏，并在重绘后(updateAlternateSelectionAutoScrollCaptureAfterFeed)捕获新屏
+        // 重绘上/下一屏，并在重绘后(trackAlternateSelectionContentAfterFeed)捕获新屏
         // 的可见选中文本拼进累积器(alternateSelectionAutoScrollText)。这样「拖到边缘继续拖」
         // 能连续选 CC 的长输出、松手 ⌘C 复制到的是完整拼接文本(selectedTextForCopy 走累积器)。
-        // 高亮：每帧合并时算出内容实际滚动的行数，锚点随之平移(shiftDragAnchor)，仍在屏内的
+        // 高亮：每个 feed 对一次整屏平移量，锚点随之平移(shiftDragAnchor)，仍在屏内的
         // 已选内容保持高亮；滚出屏幕的部分无格可高亮(alt 无真历史行)，靠累积器保证复制完整。
         // 只在「拖拽到边缘」这一刻按 20Hz 触发，不是 harvest 那种每帧 band-diff+prependScrollback，
         // 不拖边缘就零开销。主屏(!alt)永远 false：主屏有真 scrollback，本地滚即可。
@@ -2396,46 +2407,104 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
         alternateSelectionAutoScrollStalledTicks = 0
         alternateSelectionAutoScrollLastScreen = nil
+        alternateSelectionTrackingFailures = 0
     }
 
-    func updateAlternateSelectionAutoScrollCaptureAfterFeed ()
+    /// 武装内容跟踪：记录当前可见屏为基线。已武装则保持不动——基线连续性让撕裂帧之后
+    /// 仍能与老基线对出跨块累计平移量。
+    func armAlternateSelectionTracking ()
+    {
+        guard alternateSelectionAutoScrollLastScreen == nil else { return }
+        rebaseAlternateSelectionTracking()
+    }
+
+    private func rebaseAlternateSelectionTracking ()
+    {
+        alternateSelectionAutoScrollLastScreen = visibleAlternateScreenLines()
+        alternateSelectionTrackingYDisp = terminal.displayBuffer.yDisp
+        alternateSelectionTrackingFailures = 0
+    }
+
+    /// feedFinish 钩子：备用屏有活动选区且跟踪已武装时，每个 feed 都对一次「整屏平移量」，
+    /// 让选区跟着内容走。真实程序（CC）的一帧重绘常拆成多个 PTY 块到达：撕裂的半帧对不出
+    /// 可信平移量，保留基线等完整帧；对出后按拖拽/浏览两种形态分别平移锚点或整个选区。
+    func trackAlternateSelectionContentAfterFeed ()
     {
         guard terminal.isDisplayBufferAlternate else {
             resetAlternateSelectionAutoScrollCapture()
             return
         }
-        guard alternateSelectionAutoScrollText != nil, alternateSelectionAutoScrollNeedsCaptureAfterFeed else {
-            return
-        }
-        guard selection.active, let direction = alternateSelectionAutoScrollDirection else {
+        guard alternateSelectionAutoScrollLastScreen != nil else { return }
+        guard selection.active else {
             resetAlternateSelectionAutoScrollCapture()
             return
         }
-
+        // 程序重绘已到达（哪怕是撕裂的半帧）：上一次转发算被消化，转发节流放行下一 tick。
         alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-        extendSelectionToAutoScrollEdge(direction: direction)
 
+        let buffer = terminal.displayBuffer
+        guard buffer.yDisp == alternateSelectionTrackingYDisp else {
+            rebaseAlternateSelectionTracking()
+            return
+        }
         let currentScreen = visibleAlternateScreenLines()
-        let shift = alternateSelectionAutoScrollLastScreen.flatMap {
-            detectAlternateContentShift(previous: $0, current: currentScreen, direction: direction)
+        guard let previous = alternateSelectionAutoScrollLastScreen,
+              currentScreen.count == previous.count else {
+            rebaseAlternateSelectionTracking()      // resize 等行数变化：只能重建基线
+            return
         }
-        if let shift {
-            if shift > 0 {
-                // 高亮跟随：程序这帧把内容整屏平移了 shift 行，而锚点钉在终端行坐标上——
-                // 已选内容还在屏内挪动、高亮却原地罩住别的行，用户看到的就是「滚动过程中
-                // 之前选中的内容消失」。锚点随内容同步平移（.down 内容上移 → 行号减）。
-                selection.shiftDragAnchor(rowsBy: direction == .down ? -shift : shift)
-                // 累积器确定性追加：这帧新进屏的内容就是边缘侧那 shift 行（.down 屏底、
-                // .up 屏顶），直接拼接——不再依赖易受首末行截断/动画噪声干扰的文本重叠比对。
-                appendAlternateSelectionAutoScrollLines(from: currentScreen, count: shift, direction: direction)
+
+        let dragging = isSelectionDragInProgress
+        guard let shift = detectAlternateContentShift(previous: previous, current: currentScreen) else {
+            alternateSelectionTrackingFailures += 1
+            // 撕裂帧先不动：保留基线，等完整帧到齐后与老基线一次对出跨块累计平移量。
+            guard alternateSelectionTrackingFailures >= Self.alternateSelectionTrackingMaxFailures else { return }
+            // 连续多帧都对不上 = 内容真被整体换掉（翻整页/切视图），不是撕裂。
+            if dragging, alternateSelectionAutoScrollText != nil,
+               let direction = alternateSelectionAutoScrollDirection {
+                // 拖选累积中：退回文本重叠合并兜底，宁可偶尔重复一段也不静默丢内容；锚点不动。
+                if autoScrollDelta != 0 { extendSelectionToAutoScrollEdge(direction: direction) }
+                captureAlternateSelectionAutoScrollText(direction: direction)
+                rebaseAlternateSelectionTracking()
+            } else {
+                // 浏览/封存态：选区锚定的内容已整体不在屏上，留着只会高亮错误的行。
+                selection.selectNone()
+                resetAlternateSelectionAutoScrollCapture()
+                setNeedsDisplay(bounds)
             }
-            // shift == 0：程序只是原地重绘（spinner/计时器动画），内容没滚，无事可做。
-        } else {
-            // 整屏比对找不到可信平移量（重绘到一半/整屏换内容/行数变了）：退回文本重叠
-            // 合并兜底，宁可偶尔重复一段也不静默丢内容；锚点不动（错移会让后续捕获
-            // 罩进没选过的行）。
-            captureAlternateSelectionAutoScrollText(direction: direction)
+            return
         }
+
+        alternateSelectionTrackingFailures = 0
+        if shift != 0 {
+            if dragging {
+                // 高亮跟随：程序把内容整屏平移了 shift 行（正 = 内容上移），锚点随内容同步
+                // 平移；end 由拖拽逻辑钉在鼠标/边缘，不在这里动。
+                selection.shiftDragAnchor(rowsBy: -shift)
+                if autoScrollDelta != 0, let direction = alternateSelectionAutoScrollDirection {
+                    extendSelectionToAutoScrollEdge(direction: direction)
+                    // 累积器确定性追加：拖拽边缘侧这帧新进屏的 |shift| 行必在选区内，直接拼接
+                    // ——不依赖易受首末行截断/动画噪声干扰的文本重叠比对。只有平移方向与拖拽
+                    // 方向一致才追加（反向 = 程序回弹，进屏的是另一侧的行，不属于选区）。
+                    if alternateSelectionAutoScrollText != nil,
+                       (direction == .down && shift > 0) || (direction == .up && shift < 0) {
+                        appendAlternateSelectionAutoScrollLines(from: currentScreen, count: abs(shift), direction: direction)
+                    }
+                }
+            } else {
+                // 浏览/封存态（松手后程序继续流式输出、或选中后滚轮浏览）：选区两端一起随
+                // 内容平移，高亮继续罩住相同内容。整体滚出屏幕后：无累积文本就清掉；有累积
+                // 文本则保留贴边残段，⌘C 仍能拿到完整拼接内容。
+                if !selection.shiftSelectionTrackingContent(rowsBy: -shift),
+                   alternateSelectionAutoScrollText == nil {
+                    selection.selectNone()
+                    resetAlternateSelectionAutoScrollCapture()
+                }
+            }
+            setNeedsDisplay(bounds)
+        }
+        // shift == 0：程序只是原地重绘（spinner/计时器动画），内容没滚——也要换基线，
+        // 避免动画差异日积月累压过 80% 阈值。
         alternateSelectionAutoScrollLastScreen = currentScreen
     }
 
@@ -2452,13 +2521,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
 
-    /// 逐帧检测程序把整屏内容平移了几行：在 [0, n-3] 里找一个平移量，使前后两帧按其对齐后
-    /// 的重叠区满足「≥minTrustedMergeOverlapLines 行非空白精确相等，且相等行占比 ≥80%」。
-    /// CC 界面的 spinner/计时器行每帧都在变，逐字节全等做不到，按行打分即可稳判；而内容
-    /// 真滚动时错位对齐只有边框/空行这类恒等杂音能撞上，占比阈值天然挡掉。多个平移量都
-    /// 达标时取相等行数最多者（同分取更小平移量，宁可少动不可错动）。返回 nil 表示这帧
-    /// 没有可信对齐（重绘到一半/整屏换内容/行数变化），调用方走保守兜底。0 = 原地重绘。
-    func detectAlternateContentShift (previous: [String], current: [String], direction: AlternateSelectionAutoScrollDirection) -> Int?
+    /// 逐帧检测程序把整屏内容平移了几行，带符号：正 = 内容上移（向下翻），负 = 内容下移
+    /// （向上翻）。在 |shift| ∈ [0, n-3] 里找一个平移量，使前后两帧按其对齐后的重叠区满足
+    /// 「≥minTrustedMergeOverlapLines 行非空白精确相等，且相等行占比 ≥80%」。CC 界面的
+    /// spinner/计时器行每帧都在变，逐字节全等做不到，按行打分即可稳判；而内容真滚动时错位
+    /// 对齐只有边框/空行这类恒等杂音能撞上，占比阈值天然挡掉。多个平移量都达标时取相等行数
+    /// 最多者（同分取更小 |shift|，宁可少动不可错动）。返回 nil 表示这帧没有可信对齐
+    /// （重绘到一半的撕裂帧/整屏换内容/行数变化），调用方保留基线等完整帧或走保守兜底。
+    func detectAlternateContentShift (previous: [String], current: [String]) -> Int?
     {
         let n = previous.count
         guard n > 0, current.count == n else { return nil }
@@ -2466,28 +2536,30 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         guard maxShift >= 0 else { return nil }
 
         var best: (shift: Int, matched: Int)?
-        for shift in 0...maxShift {
-            let overlap = n - shift
-            var matched = 0
-            var matchedNonBlank = 0
-            for i in 0..<overlap {
-                // .down：内容上移，前一帧第 shift+i 行滚到当前帧第 i 行；.up 相反。
-                let prevLine = direction == .down ? previous[shift + i] : previous[i]
-                let currLine = direction == .down ? current[i] : current[shift + i]
-                guard prevLine == currLine else { continue }
-                matched += 1
-                if !prevLine.trimmingCharacters(in: .whitespaces).isEmpty {
-                    matchedNonBlank += 1
+        for magnitude in 0...maxShift {
+            for shift in (magnitude == 0 ? [0] : [magnitude, -magnitude]) {
+                let overlap = n - magnitude
+                var matched = 0
+                var matchedNonBlank = 0
+                for i in 0..<overlap {
+                    // shift > 0：内容上移，前一帧第 i+shift 行滚到当前帧第 i 行；shift < 0 相反。
+                    let prevLine = shift >= 0 ? previous[i + shift] : previous[i]
+                    let currLine = shift >= 0 ? current[i] : current[i - shift]
+                    guard prevLine == currLine else { continue }
+                    matched += 1
+                    if !prevLine.trimmingCharacters(in: .whitespaces).isEmpty {
+                        matchedNonBlank += 1
+                    }
                 }
+                guard matchedNonBlank >= Self.minTrustedMergeOverlapLines,
+                      matched * 5 >= overlap * 4 else {
+                    continue
+                }
+                if let sofar = best, sofar.matched >= matched {
+                    continue
+                }
+                best = (shift, matched)
             }
-            guard matchedNonBlank >= Self.minTrustedMergeOverlapLines,
-                  matched * 5 >= overlap * 4 else {
-                continue
-            }
-            if let sofar = best, sofar.matched >= matched {
-                continue
-            }
-            best = (shift, matched)
         }
         return best?.shift
     }
@@ -2749,11 +2821,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             captureAlternateSelectionAutoScrollText(direction: direction)
         }
         // Relay 回归（51a3fbc 曾点名的坑：「松手后流式输出污染 ⌘C」）：拖拽一旦结束，累积器必须
-        // 立刻封存。若此刻还欠一次 feedFinish 回调（alternateSelectionAutoScrollNeedsCaptureAfterFeed
-        // 仍为 true），松手后程序继续吐输出（哪怕只是常规流式刷新，不需要用户再拖动）会让
-        // updateAlternateSelectionAutoScrollCaptureAfterFeed 在用户已经放手之后又追加一次捕获，把拖拽
-        // 结束之后才出现的内容悄悄拼进复制文本。这里显式清掉待捕获标志，让后续任何 feedFinish 都
-        // no-op；mouseUp 这次 capture 就是本次拖拽累积器的最终值。
+        // 立刻封存——上面这次 capture 就是本次拖拽累积器的最终值。松手后 feed 钩子
+        // （trackAlternateSelectionContentAfterFeed）因 isSelectionDragInProgress 已复位只走
+        // 浏览分支：只平移选区高亮、永不追加累积器，天然不会把拖拽结束之后才出现的内容拼进
+        // 复制文本。这里顺手清掉待捕获标志，让转发节流状态干净复位。
         alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
         // 拖拽结束：恢复主屏「输出滚动时清选区」的原行为（备用屏由 feedPrepare/linefeed 自身判断保留）。
         isSelectionDragInProgress = false
@@ -2818,6 +2889,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // 标记拖拽划选进行中：在此期间 feedPrepare/linefeed 不会因流式输出清掉选区，
         // 这是「下拖自动滚动选中」和「Claude Code 里流式划选」能成立的前提。
         isSelectionDragInProgress = true
+        // 备用屏一开拖就武装内容跟踪：程序（CC）流式输出把内容顶上去时锚点随之平移，
+        // 拖拽中的选区不再和内容脱开（trackAlternateSelectionContentAfterFeed）。
+        if terminal.isDisplayBufferAlternate {
+            armAlternateSelectionTracking()
+        }
         updateSelectionAutoScroll(at: point)
         setNeedsDisplay(bounds)
     }
@@ -2999,14 +3075,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         if terminal.isDisplayBufferAlternate && !mouseReportingBypassed(with: event) {
             // Relay patch: 走到这里 = 备用屏本地没有可滚的历史(yBase==0)。CC/codex 就地重绘、
-            // yBase 恒 0（实测：滚 249 次全程 0），滚出的历史不进终端缓冲区，选区只能锚终端行
-            // 坐标。若保留选区并转发，CC 重绘会把选区锚定行的内容换掉（高亮框错、复制错位）；故
-            // 选中态滚轮先清选区、再转发滚动。CC 里选文本用「拖拽划选」一次到位（当前可见屏内），
-            // 滚轮则用于浏览、自动解除选区。「滚动时连续选中」在 CC 上物理做不到（需 harvest 捕获
-            // 每屏进 scrollback，已知会卡顿花屏）。无选区时照常转发滚动。
+            // yBase 恒 0（实测：滚 249 次全程 0），滚出的历史不进终端缓冲区，选区锚的是终端行
+            // 坐标。旧版为防高亮罩错行在这里直接清选区；现在改为武装内容跟踪：转发滚轮后程序
+            // 重绘，feed 钩子（trackAlternateSelectionContentAfterFeed）对出整屏平移量、让选区
+            // 两端随内容平移——高亮跟着内容走；选区整体滚出屏幕时才自动清除（有累积复制文本
+            // 则保留贴边残段，⌘C 仍拿到完整拼接内容）。
             if selection.active && !isSelectionDragInProgress {
-                selection.selectNone()
-                setNeedsDisplay(bounds)
+                armAlternateSelectionTracking()
             }
             // Discrete notched wheels report one tick at a time (velocity 1);
             // give them the xterm `alternateScroll` convention of ~3 lines per

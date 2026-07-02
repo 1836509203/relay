@@ -2014,7 +2014,7 @@ extension TerminalView {
     func feedFinish ()
     {
         #if os(macOS)
-        updateAlternateSelectionAutoScrollCaptureAfterFeed()
+        trackAlternateSelectionContentAfterFeed()
         #endif
         suspendDisplayUpdates ()
         queuePendingDisplay()

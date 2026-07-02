@@ -443,8 +443,9 @@ final class SelectionTests: TerminalDelegate {
 
     // MARK: - 备用屏拖选：整屏平移检测 + 高亮锚点跟随
 
-    // detectAlternateContentShift 是「高亮锚点跟随」和「累积器确定性追加」的共同地基：
-    // 它按行对齐前后两帧的整屏文本，容忍 spinner/计时器这类逐帧变化的动画行。
+    // detectAlternateContentShift 是「高亮选区跟随」和「累积器确定性追加」的共同地基：
+    // 它按行对齐前后两帧的整屏文本，容忍 spinner/计时器这类逐帧变化的动画行；
+    // 返回带符号平移量（正 = 内容上移，负 = 内容下移）。
     @Test func testDetectAlternateContentShiftFindsShiftDespiteAnimationNoise() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let previous = (0..<12).map { "content line \($0)" }
@@ -452,22 +453,22 @@ final class SelectionTests: TerminalDelegate {
         var current = Array(previous.dropFirst(3)) + ["new line 0", "new line 1", "new line 2"]
         current[4] = "⠧ thinking… (12s)"
 
-        #expect(view.detectAlternateContentShift(previous: previous, current: current, direction: .down) == 3)
+        #expect(view.detectAlternateContentShift(previous: previous, current: current) == 3)
         // 完全相同的两帧 = 原地重绘，平移量 0。
-        #expect(view.detectAlternateContentShift(previous: previous, current: previous, direction: .down) == 0)
-        // 整屏换成不相干内容：没有可信对齐，返回 nil 走保守兜底。
+        #expect(view.detectAlternateContentShift(previous: previous, current: previous) == 0)
+        // 整屏换成不相干内容：没有可信对齐，返回 nil（保留基线等完整帧/走保守兜底）。
         let unrelated = (0..<12).map { "other \($0)" }
-        #expect(view.detectAlternateContentShift(previous: previous, current: unrelated, direction: .down) == nil)
+        #expect(view.detectAlternateContentShift(previous: previous, current: unrelated) == nil)
         // 行数不一致（resize）：nil。
-        #expect(view.detectAlternateContentShift(previous: previous, current: Array(previous.dropLast()), direction: .down) == nil)
+        #expect(view.detectAlternateContentShift(previous: previous, current: Array(previous.dropLast())) == nil)
     }
 
     @Test func testDetectAlternateContentShiftUpDirection() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let previous = (0..<10).map { "content line \($0)" }
-        // 向上翻页：内容整体下移 2 行，顶部进 2 行历史。
+        // 向上翻页：内容整体下移 2 行，顶部进 2 行历史 → 带符号平移量为 -2。
         let current = ["history 0", "history 1"] + Array(previous.dropLast(2))
-        #expect(view.detectAlternateContentShift(previous: previous, current: current, direction: .up) == 2)
+        #expect(view.detectAlternateContentShift(previous: previous, current: current) == -2)
     }
 
     // 捕获文本的稳定性契约：边缘侧行必须取全宽。旧版按鼠标列截断末行，同一内容行下一帧
@@ -536,8 +537,9 @@ final class SelectionTests: TerminalDelegate {
         #expect(copied.components(separatedBy: "alpha line 5\n").count == 2)
     }
 
-    // 整屏比对找不到可信平移量（如程序整屏换内容）时：锚点必须原地不动——错移会让后续
-    // 捕获罩进没选过的行；复制走保守拼接兜底，宁可重复不可丢内容。
+    // 整屏比对找不到可信平移量时：单帧失败可能只是撕裂帧，锚点与基线都不动；连续多帧
+    // （alternateSelectionTrackingMaxFailures = 4）都对不上才判定内容真被整体换掉，此时
+    // 复制走保守拼接兜底（宁可重复不可丢内容），锚点仍原地不动——错移会罩进没选过的行。
     @Test func testAlternateSelectionAutoScrollKeepsAnchorWhenShiftUntrusted() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         let delegate = CapturingTerminalViewDelegate()
@@ -558,6 +560,14 @@ final class SelectionTests: TerminalDelegate {
         let frame2 = (0..<rows).map { "gamma line \($0)" }
         view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
 
+        // 前几帧被当作可能的撕裂帧：锚点不动、累积器不污染。
+        #expect(view.selection.start.row == 3)
+        #expect(view.selectedTextForCopy().contains("gamma") == false)
+
+        // 连续失败满 4 帧（含上面 1 帧）：判定内容真换掉，触发兜底拼接。
+        for _ in 0..<3 {
+            view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
+        }
         #expect(view.selection.start.row == 3)
         // 兜底拼接：老内容和新内容都在复制结果里。
         let copied = view.selectedTextForCopy()
@@ -588,6 +598,95 @@ final class SelectionTests: TerminalDelegate {
         // 越出屏底：钉在可见区底行、展开到行尾。
         selection.shiftDragAnchor(rowsBy: 99)
         #expect(selection.start == Position(col: terminal.cols - 1, row: 4))
+    }
+
+    // 真实 CC 的一帧重绘常拆成多个 PTY 块到达（每块都触发一次 feedFinish）。撕裂的半帧对
+    // 不出可信平移量时必须保留基线原地等待，等完整帧到齐后一次对出跨块累计平移量——
+    // v0.5.8 只处理转发后的第一个 feed，被撕裂帧打穿：半帧污染累积器（复制出重复块）、
+    // 真正滚动到位的完整帧被跳过（锚点从未平移、高亮当场脱开）。
+    @Test func testAlternateSelectionAutoScrollSurvivesTornFrames() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[?1000h")
+        let rows = view.terminal.rows
+        #expect(rows >= 8)
+        let frame1 = (0..<rows).map { "alpha line \($0)" }
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame1.joined(separator: "\r\n"))
+
+        view.selection.setSelection(start: Position(col: 2, row: 3), end: Position(col: 5, row: 4))
+        view.isSelectionDragInProgress = true
+        let bottomPoint = CGPoint(x: 20, y: 0)
+        view.updateSelectionAutoScroll(at: bottomPoint)
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+
+        // 程序响应滚动：内容上移 2 行，但这帧重绘拆成两个 PTY 块到达。
+        let frame2 = Array(frame1.dropFirst(2)) + ["beta line 0", "beta line 1"]
+        // 第一块：2J 清屏后只画了前 5 行——撕裂帧，对不出可信平移量。
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.prefix(5).joined(separator: "\r\n") + "\r\n")
+        #expect(view.selection.start.row == 3)
+        // 第二块补齐其余行：完整帧到齐，与保留的老基线一次对出平移量 2，锚点 3→1。
+        view.feed(text: frame2.dropFirst(5).joined(separator: "\r\n"))
+        #expect(view.selection.start.row == 1)
+        #expect(view.selection.start.col == 2)
+
+        // 复制无重复块：撕裂帧期间没有走兜底拼接污染累积器。
+        let copied = view.selectedTextForCopy()
+        #expect(copied.components(separatedBy: "beta line 0").count == 2)
+        #expect(copied.contains("beta line 1"))
+        #expect(copied.components(separatedBy: "alpha line 5\n").count == 2)
+    }
+
+    // 滚轮浏览/松手后程序继续流式输出（非拖拽态）：选区两端一起随内容平移，高亮继续罩住
+    // 相同内容；选区整体滚出屏幕且没有累积复制文本时才自动清除。取代旧的「选中态滚轮
+    // 立即清选区」。
+    @Test func testAlternateSelectionBrowseTrackingShiftsWholeSelection() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1B}[?1049h")
+        let rows = view.terminal.rows
+        #expect(rows >= 10)
+        let frame1 = (0..<rows).map { "alpha line \($0)" }
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame1.joined(separator: "\r\n"))
+
+        view.selection.setSelection(start: Position(col: 2, row: 3), end: Position(col: 5, row: 5))
+        // 浏览态（isSelectionDragInProgress == false）：滚轮转发路径会武装内容跟踪。
+        view.armAlternateSelectionTracking()
+
+        // 内容上移 2 行：选区两端同步平移，高亮跟着内容走。
+        let frame2 = Array(frame1.dropFirst(2)) + ["beta line 0", "beta line 1"]
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
+        #expect(view.selection.start == Position(col: 2, row: 1))
+        #expect(view.selection.end == Position(col: 5, row: 3))
+
+        // 再上移 4 行：选区整体滚出屏顶，无累积文本 → 自动清除。
+        let frame3 = Array(frame1.dropFirst(6)) + (0..<6).map { "beta line \($0)" }
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame3.joined(separator: "\r\n"))
+        #expect(view.selection.active == false)
+    }
+
+    // shiftSelectionTrackingContent 的钳位契约：两端随内容平移、越界端钉边展开；
+    // 整体滚出可见区时收敛成贴边残段并返回 false。
+    @Test func testShiftSelectionTrackingContentClampsAndReportsExit() {
+        let terminal = Terminal(delegate: self, options: TerminalOptions(cols: 10, rows: 5))
+        let selection = SelectionService(terminal: terminal)
+        terminal.feed(text: (0..<5).map { "line \($0)" }.joined(separator: "\r\n"))
+        selection.startSelection(row: 1, col: 2)
+        selection.dragExtend(row: 3, col: 4)
+
+        #expect(selection.shiftSelectionTrackingContent(rowsBy: -1) == true)
+        #expect(selection.start == Position(col: 2, row: 0))
+        #expect(selection.end == Position(col: 4, row: 2))
+
+        // 部分越出屏顶：越出端钉在顶行、展开到行首，另一端正常平移。
+        #expect(selection.shiftSelectionTrackingContent(rowsBy: -1) == true)
+        #expect(selection.start == Position(col: 0, row: 0))
+        #expect(selection.end == Position(col: 4, row: 1))
+
+        // 整体滚出：收敛为顶部贴边残段并报告 false（调用方决定清除或保留供 ⌘C）。
+        #expect(selection.shiftSelectionTrackingContent(rowsBy: -2) == false)
+        #expect(selection.start == Position(col: 0, row: 0))
+        #expect(selection.end == Position(col: 0, row: 0))
     }
 #endif
 

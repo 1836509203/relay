@@ -38,10 +38,10 @@ pkill -f "$DEV/Contents/MacOS/Relay" 2>/dev/null || true
 sleep 1
 
 mkdir -p "$DATA_DIR"
-# 直接拉起可执行（而非 open）：只有这样 RELAY_DATA_DIR / RELAY_ALT_HARVEST 环境变量
-# 才确实传进 app —— open 经 LaunchServices 启动会丢掉调用方 env。nohup + disown 让它
-# 在 Bash 工具调用结束后继续存活。
-RELAY_DATA_DIR="$DATA_DIR" RELAY_ALT_HARVEST=1 \
+# 直接拉起可执行（而非 open）：只有这样 RELAY_DATA_DIR 环境变量才确实传进 app ——
+# open 经 LaunchServices 启动会丢掉调用方 env。nohup + disown 让它在 Bash 工具调用
+# 结束后继续存活。（RELAY_ALT_HARVEST 已随收割代码删除，v0.5.7 起无此开关。）
+RELAY_DATA_DIR="$DATA_DIR" \
     nohup "$DEV/Contents/MacOS/Relay" >/tmp/relay-dev.log 2>&1 &
 disown || true
 
