@@ -499,13 +499,17 @@ final class SessionStore: ObservableObject {
         let screenLines = bound == nil ? (views[sid]?.visibleLines() ?? []) : []
         turnsQueue.async { [weak self] in
             guard let self else { return }
-            guard let url = bound ?? Self.bindTranscript(cwd: cwd, screenLines: screenLines) else { return }
+            guard let url = bound ?? Self.bindTranscript(cwd: cwd, screenLines: screenLines) else {
+                NSLog("RAIL bind(\(sid.prefix(5))) failed: screenLines=%d cwd=%@", screenLines.count, cwd)
+                return
+            }
             // 文件没有新写入就不重复解析（重会话尾窗可达 16MB，2 秒一次太浪费）。
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate
             if bound != nil, let mtime, self.turnsParsedMtime[sid] == mtime { return }
             if let mtime { self.turnsParsedMtime[sid] = mtime }
             let list = AgentTranscript.recentTurns(fromTranscript: url, limit: 32)
+            NSLog("RAIL parsed(\(sid.prefix(5))) %@ turns=%d", url.lastPathComponent, list.count)
             DispatchQueue.main.async {
                 if self.boundTranscript[sid] == nil { self.boundTranscript[sid] = url }
                 if self.turns[sid] != list { self.turns[sid] = list }
@@ -534,7 +538,10 @@ final class SessionStore: ObservableObject {
         guard probes.count >= 2 else { return nil }
         var best: (url: URL, score: Int)?
         for url in AgentTranscript.candidateTranscripts(forCwd: cwd) {
-            let tail = matchable(AgentTranscript.tailText(of: url))
+            // 搜索窗要大：恢复回放的屏幕内容对应的 jsonl 位置可能在几 MB 之前
+            //（高吞吐会话一轮就是 MB 级，尾 2MB 跟不上），窗口太小探针全脱靶、
+            // 永远绑不上。绑定是一次性成本（认对即锁定），16MB 扫得起。
+            let tail = matchable(AgentTranscript.tailText(of: url, maxBytes: 16 * 1024 * 1024))
             let score = probes.reduce(0) { $0 + (tail.contains($1) ? 1 : 0) }
             // 候选按 mtime 降序，平分时保留先见的（更近活跃的）。
             if score > (best?.score ?? 0) { best = (url, score) }
