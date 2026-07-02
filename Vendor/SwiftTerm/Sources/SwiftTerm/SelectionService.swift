@@ -96,6 +96,32 @@ class SelectionService: CustomDebugStringConvertible {
         end   = Position (col: end.col,   row: max (0, end.row + delta))
     }
 
+    /// Relay patch（备用屏拖选高亮跟随）：拖选中把滚轮转发给全屏程序（Claude Code/codex）后，
+    /// 程序整屏重绘使内容相对终端行坐标平移了若干行，而锚点(start)钉在行坐标上——已选内容
+    /// 还在屏内挪动时高亮就当场脱开，看起来像"滚动过程中之前选中的内容消失"。此方法把锚点
+    /// 行号随内容平移（end 由拖拽逻辑钉在屏幕边缘，不在这里动），让仍在屏内的已选内容保持
+    /// 高亮；锚点将要越出可见屏时钉在可见区边缘并展开到行首/行尾（内容已滚出屏幕、无格可
+    /// 高亮，复制由累积器兜底）。锚点若已位于真 scrollback（< yDisp 的冻结行，程序重绘动不了
+    /// 它们）则跳过——平移反而会脱锚。
+    public func shiftDragAnchor (rowsBy delta: Int)
+    {
+        guard active, delta != 0 else { return }
+        let buffer = terminal.displayBuffer
+        let visibleTop = buffer.yDisp
+        let visibleBottom = min (buffer.yDisp + buffer.rows - 1, max (0, buffer.lines.count - 1))
+        guard start.row >= visibleTop else { return }
+        var row = start.row + delta
+        var col = start.col
+        if row < visibleTop {
+            row = visibleTop
+            col = 0
+        } else if row > visibleBottom {
+            row = visibleBottom
+            col = max (0, terminal.cols - 1)
+        }
+        start = Position (col: col, row: row)
+    }
+
     /**
      * Starts the selection from the specific screen-relative location
      */

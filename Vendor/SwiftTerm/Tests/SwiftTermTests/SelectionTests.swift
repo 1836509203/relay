@@ -440,6 +440,155 @@ final class SelectionTests: TerminalDelegate {
         view.feed(text: "z\n")
         #expect(view.selection.active == false)
     }
+
+    // MARK: - 备用屏拖选：整屏平移检测 + 高亮锚点跟随
+
+    // detectAlternateContentShift 是「高亮锚点跟随」和「累积器确定性追加」的共同地基：
+    // 它按行对齐前后两帧的整屏文本，容忍 spinner/计时器这类逐帧变化的动画行。
+    @Test func testDetectAlternateContentShiftFindsShiftDespiteAnimationNoise() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let previous = (0..<12).map { "content line \($0)" }
+        // 内容上移 3 行、底部进 3 行新内容，且其中一行是每帧都在变的 spinner 行。
+        var current = Array(previous.dropFirst(3)) + ["new line 0", "new line 1", "new line 2"]
+        current[4] = "⠧ thinking… (12s)"
+
+        #expect(view.detectAlternateContentShift(previous: previous, current: current, direction: .down) == 3)
+        // 完全相同的两帧 = 原地重绘，平移量 0。
+        #expect(view.detectAlternateContentShift(previous: previous, current: previous, direction: .down) == 0)
+        // 整屏换成不相干内容：没有可信对齐，返回 nil 走保守兜底。
+        let unrelated = (0..<12).map { "other \($0)" }
+        #expect(view.detectAlternateContentShift(previous: previous, current: unrelated, direction: .down) == nil)
+        // 行数不一致（resize）：nil。
+        #expect(view.detectAlternateContentShift(previous: previous, current: Array(previous.dropLast()), direction: .down) == nil)
+    }
+
+    @Test func testDetectAlternateContentShiftUpDirection() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let previous = (0..<10).map { "content line \($0)" }
+        // 向上翻页：内容整体下移 2 行，顶部进 2 行历史。
+        let current = ["history 0", "history 1"] + Array(previous.dropLast(2))
+        #expect(view.detectAlternateContentShift(previous: previous, current: current, direction: .up) == 2)
+    }
+
+    // 捕获文本的稳定性契约：边缘侧行必须取全宽。旧版按鼠标列截断末行，同一内容行下一帧
+    // 变成内部行后文本就变了，重叠比对必然失配——几乎每帧都退化成保守拼接、复制出重复块。
+    @Test func testAlternateSelectionCaptureTextTakesFullWidthAtEdgeSide() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[Halpha line 0\r\nalpha line 1\r\nalpha line 2")
+
+        // 向下拖：末行（边缘侧）虽然 end 停在第 2 列，捕获仍取整行；首行从锚点列起。
+        view.selection.setSelection(start: Position(col: 6, row: 0), end: Position(col: 2, row: 2))
+        let downText = view.alternateSelectionCaptureText(direction: .down)
+        #expect(downText == "line 0\nalpha line 1\nalpha line 2")
+
+        // 向上拖：首行（边缘侧）取整行，末行（锚点侧）截到锚点列（含）。
+        view.selection.setSelection(start: Position(col: 3, row: 2), end: Position(col: 5, row: 0))
+        let upText = view.alternateSelectionCaptureText(direction: .up)
+        #expect(upText == "alpha line 0\nalpha line 1\nalph")
+    }
+
+    // 用户可感的核心行为（本次修复的主诉）：备用屏拖到边缘转发滚动后，程序整屏重绘使内容
+    // 上移，选区锚点必须随内容同步平移——仍在屏内的已选内容保持高亮，而不是"滚动过程中
+    // 之前选中的内容消失"；滚出屏幕后锚点钉在屏顶展开整行，复制由累积器保证完整、不重复。
+    @Test func testAlternateSelectionAutoScrollShiftsAnchorToFollowContent() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[?1000h")
+        let rows = view.terminal.rows
+        #expect(rows >= 8)
+        let frame1 = (0..<rows).map { "alpha line \($0)" }
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame1.joined(separator: "\r\n"))
+        #expect(view.terminal.displayBuffer.yBase == 0)
+
+        // 锚点按在第 3 行第 2 列，向下拖到底部边缘。
+        view.selection.setSelection(start: Position(col: 2, row: 3), end: Position(col: 5, row: 4))
+        view.isSelectionDragInProgress = true
+        let bottomPoint = CGPoint(x: 20, y: 0)
+        view.updateSelectionAutoScroll(at: bottomPoint)
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+        #expect(delegate.sent.isEmpty == false)
+        #expect(view.selection.start.row == 3)
+
+        // 程序响应滚动：整屏上移 2 行，底部露出 2 行新内容。
+        let frame2 = Array(frame1.dropFirst(2)) + ["beta line 0", "beta line 1"]
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
+
+        // 锚点随内容上移 2 行（3→1），列不变：屏内已选内容的高亮跟着内容走。
+        #expect(view.selection.start.row == 1)
+        #expect(view.selection.start.col == 2)
+
+        // 再滚一轮：锚点越出屏顶，钉在第 0 行并展开到行首。
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+        let frame3 = Array(frame1.dropFirst(4)) + (0..<4).map { "beta line \($0)" }
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame3.joined(separator: "\r\n"))
+        #expect(view.selection.start.row == 0)
+        #expect(view.selection.start.col == 0)
+
+        // 复制文本囊括从锚点行起被滚出的历史与新进内容，且确定性追加不产生重复块。
+        // 首行从锚点列（第 2 列）起截断，与普通选区复制语义一致。
+        let copied = view.selectedTextForCopy()
+        #expect(copied.hasPrefix("pha line 3\n"))
+        #expect(copied.contains("alpha line \(rows - 1)"))
+        #expect(copied.contains("beta line 3"))
+        #expect(copied.components(separatedBy: "alpha line 5\n").count == 2)
+    }
+
+    // 整屏比对找不到可信平移量（如程序整屏换内容）时：锚点必须原地不动——错移会让后续
+    // 捕获罩进没选过的行；复制走保守拼接兜底，宁可重复不可丢内容。
+    @Test func testAlternateSelectionAutoScrollKeepsAnchorWhenShiftUntrusted() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1049h")
+        view.feed(text: "\u{1B}[?1000h")
+        let rows = view.terminal.rows
+        let frame1 = (0..<rows).map { "alpha line \($0)" }
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame1.joined(separator: "\r\n"))
+
+        view.selection.setSelection(start: Position(col: 0, row: 3), end: Position(col: 5, row: 4))
+        view.isSelectionDragInProgress = true
+        let bottomPoint = CGPoint(x: 20, y: 0)
+        view.updateSelectionAutoScroll(at: bottomPoint)
+        #expect(view.performSelectionAutoScroll(delta: 2, point: bottomPoint) == true)
+
+        // 程序整屏换成不相干内容（大重绘/翻整页）：无可信对齐。
+        let frame2 = (0..<rows).map { "gamma line \($0)" }
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
+
+        #expect(view.selection.start.row == 3)
+        // 兜底拼接：老内容和新内容都在复制结果里。
+        let copied = view.selectedTextForCopy()
+        #expect(copied.contains("alpha line 3"))
+        #expect(copied.contains("gamma line \(rows - 1)"))
+    }
+
+    // shiftDragAnchor 的钳位契约：锚点只在可见屏内平移，越界钉边并展开整行；未激活不动。
+    @Test func testShiftDragAnchorClampsToVisibleScreen() {
+        let terminal = Terminal(delegate: self, options: TerminalOptions(cols: 10, rows: 5))
+        let selection = SelectionService(terminal: terminal)
+        terminal.feed(text: (0..<5).map { "line \($0)" }.joined(separator: "\r\n"))
+
+        // 未激活：no-op。
+        selection.shiftDragAnchor(rowsBy: -2)
+        #expect(selection.start == Position(col: 0, row: 0))
+
+        selection.startSelection(row: 3, col: 2)
+        selection.dragExtend(row: 4, col: 5)
+        selection.shiftDragAnchor(rowsBy: -1)
+        #expect(selection.start == Position(col: 2, row: 2))
+        #expect(selection.end == Position(col: 5, row: 4))
+
+        // 越出屏顶：钉在可见区顶行、展开到行首。
+        selection.shiftDragAnchor(rowsBy: -5)
+        #expect(selection.start == Position(col: 0, row: 0))
+
+        // 越出屏底：钉在可见区底行、展开到行尾。
+        selection.shiftDragAnchor(rowsBy: 99)
+        #expect(selection.start == Position(col: terminal.cols - 1, row: 4))
+    }
 #endif
 
     // MARK: - Selection Tests Ported from Ghostty

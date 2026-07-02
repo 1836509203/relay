@@ -2159,6 +2159,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private var alternateSelectionAutoScrollText: String?
     private var alternateSelectionAutoScrollDirection: AlternateSelectionAutoScrollDirection?
     private var alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
+    /// 上一次处理过的可见屏全宽文本（每行 trimRight），用于逐帧检测程序把内容实际滚了几行
+    /// （detectAlternateContentShift）——这是「高亮锚点跟随内容平移」和「累积器确定性追加」
+    /// 的共同依据。转发被 stall 跳过的帧也没关系：下次比对算出的是跨帧累计平移量。
+    private var alternateSelectionAutoScrollLastScreen: [String]?
     /// 连续多少个 20Hz tick 仍在等上一次转发的 feedFinish 回调。用于节流「至多一个在途转发」，
     /// 避免程序重绘跟不上时被连续糊进多个滚轮事件，导致前后两次捕获对不上、拼接静默丢段。
     private var alternateSelectionAutoScrollStalledTicks = 0
@@ -2316,6 +2320,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 // 闪烁光标会让「同一帧」的两次取样并非逐字节相同，重复采样反而可能让重叠比对
                 // 因为这点无关紧要的动画差异找不到真实重叠，误判成新内容而重复拼接。
                 captureAlternateSelectionAutoScrollText(direction: direction)
+                alternateSelectionAutoScrollLastScreen = visibleAlternateScreenLines()
             }
             alternateSelectionAutoScrollNeedsCaptureAfterFeed = true
             sendAlternateSelectionScroll(delta: delta, point: point)
@@ -2356,7 +2361,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // 重绘上/下一屏，并在重绘后(updateAlternateSelectionAutoScrollCaptureAfterFeed)捕获新屏
         // 的可见选中文本拼进累积器(alternateSelectionAutoScrollText)。这样「拖到边缘继续拖」
         // 能连续选 CC 的长输出、松手 ⌘C 复制到的是完整拼接文本(selectedTextForCopy 走累积器)。
-        // 代价：拖动过程中高亮框锚在终端坐标、CC 内容在滚，视觉上会跟不上(松手复制内容仍正确)。
+        // 高亮：每帧合并时算出内容实际滚动的行数，锚点随之平移(shiftDragAnchor)，仍在屏内的
+        // 已选内容保持高亮；滚出屏幕的部分无格可高亮(alt 无真历史行)，靠累积器保证复制完整。
         // 只在「拖拽到边缘」这一刻按 20Hz 触发，不是 harvest 那种每帧 band-diff+prependScrollback，
         // 不拖边缘就零开销。主屏(!alt)永远 false：主屏有真 scrollback，本地滚即可。
         guard terminal.isDisplayBufferAlternate else { return false }
@@ -2389,6 +2395,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         alternateSelectionAutoScrollDirection = nil
         alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
         alternateSelectionAutoScrollStalledTicks = 0
+        alternateSelectionAutoScrollLastScreen = nil
     }
 
     func updateAlternateSelectionAutoScrollCaptureAfterFeed ()
@@ -2407,7 +2414,125 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
         extendSelectionToAutoScrollEdge(direction: direction)
-        captureAlternateSelectionAutoScrollText(direction: direction)
+
+        let currentScreen = visibleAlternateScreenLines()
+        let shift = alternateSelectionAutoScrollLastScreen.flatMap {
+            detectAlternateContentShift(previous: $0, current: currentScreen, direction: direction)
+        }
+        if let shift {
+            if shift > 0 {
+                // 高亮跟随：程序这帧把内容整屏平移了 shift 行，而锚点钉在终端行坐标上——
+                // 已选内容还在屏内挪动、高亮却原地罩住别的行，用户看到的就是「滚动过程中
+                // 之前选中的内容消失」。锚点随内容同步平移（.down 内容上移 → 行号减）。
+                selection.shiftDragAnchor(rowsBy: direction == .down ? -shift : shift)
+                // 累积器确定性追加：这帧新进屏的内容就是边缘侧那 shift 行（.down 屏底、
+                // .up 屏顶），直接拼接——不再依赖易受首末行截断/动画噪声干扰的文本重叠比对。
+                appendAlternateSelectionAutoScrollLines(from: currentScreen, count: shift, direction: direction)
+            }
+            // shift == 0：程序只是原地重绘（spinner/计时器动画），内容没滚，无事可做。
+        } else {
+            // 整屏比对找不到可信平移量（重绘到一半/整屏换内容/行数变了）：退回文本重叠
+            // 合并兜底，宁可偶尔重复一段也不静默丢内容；锚点不动（错移会让后续捕获
+            // 罩进没选过的行）。
+            captureAlternateSelectionAutoScrollText(direction: direction)
+        }
+        alternateSelectionAutoScrollLastScreen = currentScreen
+    }
+
+    /// 可见屏的全宽文本（每行 trimRight），供逐帧平移检测与确定性追加使用。
+    func visibleAlternateScreenLines () -> [String]
+    {
+        let buffer = terminal.displayBuffer
+        guard buffer.rows > 0, buffer.lines.count > 0 else { return [] }
+        let top = max(0, buffer.yDisp)
+        let bottom = min(buffer.yDisp + buffer.rows - 1, buffer.lines.count - 1)
+        guard top <= bottom else { return [] }
+        return (top...bottom).map {
+            buffer.translateBufferLineToString(lineIndex: $0, trimRight: true, skipNullCellsFollowingWide: true)
+        }
+    }
+
+    /// 逐帧检测程序把整屏内容平移了几行：在 [0, n-3] 里找一个平移量，使前后两帧按其对齐后
+    /// 的重叠区满足「≥minTrustedMergeOverlapLines 行非空白精确相等，且相等行占比 ≥80%」。
+    /// CC 界面的 spinner/计时器行每帧都在变，逐字节全等做不到，按行打分即可稳判；而内容
+    /// 真滚动时错位对齐只有边框/空行这类恒等杂音能撞上，占比阈值天然挡掉。多个平移量都
+    /// 达标时取相等行数最多者（同分取更小平移量，宁可少动不可错动）。返回 nil 表示这帧
+    /// 没有可信对齐（重绘到一半/整屏换内容/行数变化），调用方走保守兜底。0 = 原地重绘。
+    func detectAlternateContentShift (previous: [String], current: [String], direction: AlternateSelectionAutoScrollDirection) -> Int?
+    {
+        let n = previous.count
+        guard n > 0, current.count == n else { return nil }
+        let maxShift = n - Self.minTrustedMergeOverlapLines
+        guard maxShift >= 0 else { return nil }
+
+        var best: (shift: Int, matched: Int)?
+        for shift in 0...maxShift {
+            let overlap = n - shift
+            var matched = 0
+            var matchedNonBlank = 0
+            for i in 0..<overlap {
+                // .down：内容上移，前一帧第 shift+i 行滚到当前帧第 i 行；.up 相反。
+                let prevLine = direction == .down ? previous[shift + i] : previous[i]
+                let currLine = direction == .down ? current[i] : current[shift + i]
+                guard prevLine == currLine else { continue }
+                matched += 1
+                if !prevLine.trimmingCharacters(in: .whitespaces).isEmpty {
+                    matchedNonBlank += 1
+                }
+            }
+            guard matchedNonBlank >= Self.minTrustedMergeOverlapLines,
+                  matched * 5 >= overlap * 4 else {
+                continue
+            }
+            if let sofar = best, sofar.matched >= matched {
+                continue
+            }
+            best = (shift, matched)
+        }
+        return best?.shift
+    }
+
+    /// 把这一帧新滚进屏的 count 行（.down 取屏底、.up 取屏顶）确定性拼进累积器。
+    private func appendAlternateSelectionAutoScrollLines (from screen: [String], count: Int, direction: AlternateSelectionAutoScrollDirection)
+    {
+        guard count > 0, !screen.isEmpty, let existing = alternateSelectionAutoScrollText else { return }
+        let n = min(count, screen.count)
+        switch direction {
+        case .down:
+            let fresh = screen.suffix(n).joined(separator: "\n")
+            alternateSelectionAutoScrollText = existing.isEmpty ? fresh : existing + "\n" + fresh
+        case .up:
+            let fresh = screen.prefix(n).joined(separator: "\n")
+            alternateSelectionAutoScrollText = existing.isEmpty ? fresh : fresh + "\n" + existing
+        }
+        alternateSelectionAutoScrollDirection = direction
+    }
+
+    /// 滚动累积期间的选区捕获文本：锚点侧按锚点列截断（该行内容与截断列跨帧恒定），
+    /// 边缘侧整行取全宽——边缘行下一帧就会变成选区内部行（内部行本取全行），若按鼠标列
+    /// 截断，同一内容行帧间文本不稳定，重叠比对必然失配（这正是旧版几乎每帧都退化成
+    /// 保守拼接、复制出重复块的原因）。每行 trimRight，行间以 \n 连接。
+    func alternateSelectionCaptureText (direction: AlternateSelectionAutoScrollDirection) -> String
+    {
+        let buffer = terminal.displayBuffer
+        guard selection.active, buffer.lines.count > 0 else { return "" }
+        let ordered = Position.compare(selection.start, selection.end) == .before
+            ? (upper: selection.start, lower: selection.end)
+            : (upper: selection.end, lower: selection.start)
+        let topRow = max(0, min(ordered.upper.row, buffer.lines.count - 1))
+        let bottomRow = max(0, min(ordered.lower.row, buffer.lines.count - 1))
+        guard topRow <= bottomRow else { return "" }
+
+        var lines: [String] = []
+        for row in topRow...bottomRow {
+            // .down 锚点在上端：首行从锚点列起；.up 锚点在下端：末行截到锚点列（含）。
+            let startCol = (direction == .down && row == topRow) ? max(0, ordered.upper.col) : 0
+            let endCol = (direction == .up && row == bottomRow) ? min(terminal.cols, ordered.lower.col + 1) : -1
+            lines.append(buffer.translateBufferLineToString(
+                lineIndex: row, trimRight: true, startCol: startCol, endCol: endCol,
+                skipNullCellsFollowingWide: true))
+        }
+        return lines.joined(separator: "\n")
     }
 
     func captureAlternateSelectionAutoScrollText (direction: AlternateSelectionAutoScrollDirection)
@@ -2415,7 +2540,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         guard terminal.isDisplayBufferAlternate, selection.active else {
             return
         }
-        let current = selection.getSelectedText()
+        let current = alternateSelectionCaptureText(direction: direction)
         guard !current.isEmpty else {
             return
         }
