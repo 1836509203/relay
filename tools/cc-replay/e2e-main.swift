@@ -53,19 +53,19 @@ while i < records.count {
     if r.kind == "out", let d = Data(base64Encoded: r.data) { phaseA.append([UInt8](d)) }
     i += 1
 }
+var downGroups: [[[UInt8]]] = []
+var parseMode = 0
 while i < records.count {
     let r = records[i]
     i += 1
-    if r.kind == "in", (r.note ?? "").hasPrefix("wheel-down") { break }
-    if r.kind == "in", (r.note ?? "").hasPrefix("wheel-up") {
-        upGroups.append([])
-        continue
-    }
-    if r.kind == "out", let d = Data(base64Encoded: r.data), !upGroups.isEmpty {
-        upGroups[upGroups.count - 1].append([UInt8](d))
+    if r.kind == "in", (r.note ?? "").hasPrefix("wheel-up") { upGroups.append([]); parseMode = 1; continue }
+    if r.kind == "in", (r.note ?? "").hasPrefix("wheel-down") { downGroups.append([]); parseMode = 2; continue }
+    if r.kind == "out", let d = Data(base64Encoded: r.data) {
+        if parseMode == 1 { upGroups[upGroups.count - 1].append([UInt8](d)) }
+        else if parseMode == 2 { downGroups[downGroups.count - 1].append([UInt8](d)) }
     }
 }
-print("phaseA=\(phaseA.count) 块, wheel-up 响应组=\(upGroups.count)")
+print("phaseA=\(phaseA.count) 块, wheel-up 响应组=\(upGroups.count), wheel-down 响应组=\(downGroups.count)")
 
 _ = NSApplication.shared
 let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 900, height: 600)))
@@ -159,6 +159,31 @@ print("---- 复制文本（\(lines.count) 行） ----")
 print(copied)
 print("----")
 
+// ---- Phase 2: 浏览态指纹跟随（真实 CC wheel-down 帧，mouseUp 已建指纹）----
+print("---- Phase 2: 浏览态 wheel-down \(downGroups.count) 组 ----")
+var browseFollowFrames = 0
+var browseHiddenAt = -1
+var prevBot = Int.max
+var browseMonotonic = true
+for (gi, g) in downGroups.enumerated() {
+    for chunk in g { view.feed(byteArray: chunk[...]) }
+    let s2 = view.selection!
+    let topRow = min(s2.start.row, s2.end.row)
+    let botRow = max(s2.start.row, s2.end.row)
+    let line1 = view.visibleAlternateScreenLines()[1].trimmingCharacters(in: .whitespaces)
+    print("  [down#\(gi + 1)] active=\(s2.active) rows=\(topRow)..\(botRow) 屏行1=\(line1)")
+    if s2.active {
+        if browseHiddenAt >= 0 { browseMonotonic = false }   // 隐藏后不该在继续远离时复活
+        browseFollowFrames += 1
+        if botRow > prevBot { browseMonotonic = false }       // 内容上移，选区底端应单调上移
+        prevBot = botRow
+    } else if browseHiddenAt < 0 {
+        browseHiddenAt = gi + 1
+    }
+}
+print("浏览跟随帧=\(browseFollowFrames) 隐藏于组#\(browseHiddenAt) 单调=\(browseMonotonic)")
+let browseOK = browseFollowFrames >= 15 && browseMonotonic
+
 // 完整性判定：提取纯数字行，应当严格 +1 连续、无重复。
 let nums = lines.compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
 var breaks = 0
@@ -166,4 +191,4 @@ for j in 1..<max(nums.count, 1) where j < nums.count && nums[j] != nums[j - 1] +
 let dups = nums.count - Set(nums).count
 print("数字行=\(nums.count) 首=\(nums.first ?? -1) 末=\(nums.last ?? -1) 断点=\(breaks) 重复=\(dups)")
 print(copied.contains("117") ? "锚点内容 117 在复制文本中 ✓" : "!! 锚点内容 117 丢失")
-exit((breaks == 0 && dups == 0 && copied.contains("117")) ? 0 : 3)
+exit((breaks == 0 && dups == 0 && copied.contains("117") && browseOK) ? 0 : 3)

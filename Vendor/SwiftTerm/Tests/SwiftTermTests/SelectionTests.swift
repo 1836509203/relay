@@ -684,55 +684,68 @@ final class SelectionTests: TerminalDelegate {
         #expect(copied.components(separatedBy: "alpha line 5\n").count == 2)
     }
 
-    // 滚轮浏览/松手后程序继续流式输出（非拖拽态）：选区两端一起随内容平移，高亮继续罩住
-    // 相同内容；选区整体滚出屏幕且没有累积复制文本时才自动清除。取代旧的「选中态滚轮
-    // 立即清选区」。
-    @Test func testAlternateSelectionBrowseTrackingShiftsWholeSelection() {
+    // 滚轮浏览/松手后程序继续流式输出（非拖拽态）：按「内容指纹」把选区绝对重定位——
+    // 增量对齐在快滚（触控板惯性一帧滚几十行，帧间零重叠）下有物理死角，真机表现为高亮
+    // 「悬浮」不跟内容、几帧后被刷掉。指纹制对快滚/撕裂帧/来回翻页免疫：滚出屏隐藏
+    // （指纹保留），滚回来自动恢复原范围。
+    @Test func testBrowseSelectionRelocatesByContentFingerprint() {
         let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
         view.feed(text: "\u{1B}[?1049h")
         let rows = view.terminal.rows
-        #expect(rows >= 10)
+        #expect(rows >= 12)
         let frame1 = (0..<rows).map { "alpha line \($0)" }
         view.feed(text: "\u{1B}[2J\u{1B}[H" + frame1.joined(separator: "\r\n"))
 
         view.selection.setSelection(start: Position(col: 2, row: 3), end: Position(col: 5, row: 5))
-        // 浏览态（isSelectionDragInProgress == false）：滚轮转发路径会武装内容跟踪。
-        view.armAlternateSelectionTracking()
+        // 浏览态（isSelectionDragInProgress == false）：滚轮转发路径/mouseUp 建立指纹。
+        view.ensureBrowseSelectionAnchor()
 
-        // 内容上移 2 行：选区两端同步平移，高亮跟着内容走。
+        // 内容上移 2 行：按内容找回，选区整体平移。
         let frame2 = Array(frame1.dropFirst(2)) + ["beta line 0", "beta line 1"]
         view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
         #expect(view.selection.start == Position(col: 2, row: 1))
         #expect(view.selection.end == Position(col: 5, row: 3))
 
-        // 再上移 4 行：选区整体滚出屏顶，无累积文本 → 自动清除。
-        let frame3 = Array(frame1.dropFirst(6)) + (0..<6).map { "beta line \($0)" }
+        // 快滚大跳：一帧滚出屏顶（增量对齐物理不可能）→ 高亮隐藏，指纹待命。
+        let frame3 = Array(frame1.dropFirst(9)) + (0..<9).map { "beta line \($0)" }
         view.feed(text: "\u{1B}[2J\u{1B}[H" + frame3.joined(separator: "\r\n"))
         #expect(view.selection.active == false)
+
+        // 滚回来：选中内容重新入屏 → 高亮自动恢复到原内容、原列。
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
+        #expect(view.selection.active == true)
+        #expect(view.selection.start == Position(col: 2, row: 1))
+        #expect(view.selection.end == Position(col: 5, row: 3))
+
+        // 部分越界：选区上端滚出屏顶 1 行 → 投影钳位（顶行行首），真实范围不丢。
+        let frame4 = Array(frame1.dropFirst(5)) + (0..<5).map { "beta line \($0)" }
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame4.joined(separator: "\r\n"))
+        #expect(view.selection.active == false || view.selection.start.row == 0)
+        // 滚回来恢复完整范围（钉边不再是不可逆的）。
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
+        #expect(view.selection.start == Position(col: 2, row: 1))
+        #expect(view.selection.end == Position(col: 5, row: 3))
     }
 
-    // shiftSelectionTrackingContent 的钳位契约：两端随内容平移、越界端钉边展开；
-    // 整体滚出可见区时收敛成贴边残段并返回 false。
-    @Test func testShiftSelectionTrackingContentClampsAndReportsExit() {
-        let terminal = Terminal(delegate: self, options: TerminalOptions(cols: 10, rows: 5))
-        let selection = SelectionService(terminal: terminal)
-        terminal.feed(text: (0..<5).map { "line \($0)" }.joined(separator: "\r\n"))
-        selection.startSelection(row: 1, col: 2)
-        selection.dragExtend(row: 3, col: 4)
+    // 指纹窗口允许 1 行失配：选区贴着 spinner/计时器这类每帧重画的动态行时不至于永久丢失。
+    @Test func testBrowseSelectionToleratesOneDynamicLineInFingerprint() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        view.feed(text: "\u{1B}[?1049h")
+        let rows = view.terminal.rows
+        var frame1 = (0..<rows).map { "alpha line \($0)" }
+        frame1[4] = "✻ Churned for 10s"
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame1.joined(separator: "\r\n"))
+        // 选区 3..6 罩住动态行 4，指纹窗口（3..6）含它。
+        view.selection.setSelection(start: Position(col: 0, row: 3), end: Position(col: 5, row: 6))
+        view.ensureBrowseSelectionAnchor()
 
-        #expect(selection.shiftSelectionTrackingContent(rowsBy: -1) == true)
-        #expect(selection.start == Position(col: 2, row: 0))
-        #expect(selection.end == Position(col: 4, row: 2))
-
-        // 部分越出屏顶：越出端钉在顶行、展开到行首，另一端正常平移。
-        #expect(selection.shiftSelectionTrackingContent(rowsBy: -1) == true)
-        #expect(selection.start == Position(col: 0, row: 0))
-        #expect(selection.end == Position(col: 4, row: 1))
-
-        // 整体滚出：收敛为顶部贴边残段并报告 false（调用方决定清除或保留供 ⌘C）。
-        #expect(selection.shiftSelectionTrackingContent(rowsBy: -2) == false)
-        #expect(selection.start == Position(col: 0, row: 0))
-        #expect(selection.end == Position(col: 0, row: 0))
+        // 内容上移 1 行且动态行文本同帧变化：窗口 4 行中 1 行失配，容错命中仍跟随。
+        var frame2 = Array(frame1.dropFirst(1)) + ["beta line 0"]
+        frame2[3] = "✻ Churned for 11s"
+        view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))
+        #expect(view.selection.active == true)
+        #expect(view.selection.start == Position(col: 0, row: 2))
+        #expect(view.selection.end == Position(col: 5, row: 5))
     }
 #endif
 

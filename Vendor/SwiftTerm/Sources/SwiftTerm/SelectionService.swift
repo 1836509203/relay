@@ -122,38 +122,6 @@ class SelectionService: CustomDebugStringConvertible {
         start = Position (col: col, row: row)
     }
 
-    /// Relay patch（备用屏浏览/封存选区跟随）：非拖拽状态下程序整屏重绘把内容平移了 delta 行
-    /// （松手后的流式输出、或选中后滚轮浏览），把选区两端一并平移，让高亮继续罩住相同内容。
-    /// 任一端已锚进真 scrollback（< yDisp 的冻结行，程序重绘动不了它们）则整体不动。返回 false
-    /// 表示选区已整体滚出可见区：两端被收敛成滚出侧边缘的贴边残段，由调用方决定清除还是保留
-    /// （复制累积器非空时保留，⌘C 仍能拿到完整拼接文本）。
-    public func shiftSelectionTrackingContent (rowsBy delta: Int) -> Bool
-    {
-        guard active, delta != 0 else { return true }
-        let buffer = terminal.displayBuffer
-        let visibleTop = buffer.yDisp
-        let visibleBottom = min (buffer.yDisp + buffer.rows - 1, max (0, buffer.lines.count - 1))
-        guard start.row >= visibleTop, end.row >= visibleTop else { return true }
-        let rawStart = start.row + delta
-        let rawEnd = end.row + delta
-        if (rawStart < visibleTop && rawEnd < visibleTop) || (rawStart > visibleBottom && rawEnd > visibleBottom) {
-            let edge = rawStart < visibleTop
-                ? Position (col: 0, row: visibleTop)
-                : Position (col: max (0, terminal.cols - 1), row: visibleBottom)
-            start = edge
-            end = edge
-            return false
-        }
-        func clamped (_ p: Position, raw: Int) -> Position {
-            if raw < visibleTop { return Position (col: 0, row: visibleTop) }
-            if raw > visibleBottom { return Position (col: max (0, terminal.cols - 1), row: visibleBottom) }
-            return Position (col: p.col, row: raw)
-        }
-        start = clamped (start, raw: rawStart)
-        end = clamped (end, raw: rawEnd)
-        return true
-    }
-
     /**
      * Starts the selection from the specific screen-relative location
      */

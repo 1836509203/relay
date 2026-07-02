@@ -2410,6 +2410,157 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         alternateSelectionTrackingFailures = 0
     }
 
+    /// 浏览/封存态选区的「内容指纹」。增量平移跟踪（detect K）在浏览态有物理死角：触控板
+    /// 惯性一次滚几十行，帧间重叠为零，任何逐帧对齐都对不出来——真机表现为高亮「悬浮」在
+    /// 屏幕上不跟内容、几帧失配后被清掉。指纹制改为绝对定位：记住选中内容上下两端的文本
+    /// 窗口，每个 feed 在当前屏直接找回这段内容——快滚、撕裂帧、来回翻页都免疫；选区滚出
+    /// 屏幕时隐藏高亮（指纹保留），滚回来自动恢复；端点越界只是投影钳位，真实范围不丢。
+    struct BrowseSelectionAnchor {
+        /// 规范化选区（upper 在前），行号是「真实」值，允许越出可见屏（显示时投影钳位）。
+        var upperRow: Int
+        var lowerRow: Int
+        let upperCol: Int
+        let lowerCol: Int
+        /// 内容窗口（≤4 行屏幕文本，至少含一行非空白）+ 窗口首行相对 upperRow 的行差。
+        /// 两条：upper 侧与 lower 侧各一，长选区只剩一端在屏内时也能找回。锚在固定 UI 区
+        /// （CC 底部状态栏）的窗口会在首个滚动帧被识别并剔除（见 relocateBrowseSelection）。
+        var fingerprints: [(lines: [String], offset: Int)]
+    }
+    var browseSelectionAnchor: BrowseSelectionAnchor?
+    static let browseFingerprintWindow = 4
+
+    /// 拖拽/点选结束或滚轮浏览开始时建立指纹。已有指纹或无选区时不动。
+    func ensureBrowseSelectionAnchor ()
+    {
+        guard terminal.isDisplayBufferAlternate, selection.active, browseSelectionAnchor == nil else { return }
+        let screen = visibleAlternateScreenLines()
+        guard !screen.isEmpty else { return }
+        let visTop = terminal.displayBuffer.yDisp
+        let ordered = Position.compare(selection.start, selection.end) == .before
+            ? (upper: selection.start, lower: selection.end)
+            : (upper: selection.end, lower: selection.start)
+        let upperIdx = ordered.upper.row - visTop
+        let lowerIdx = min(ordered.lower.row - visTop, screen.count - 1)
+        guard upperIdx >= 0, upperIdx < screen.count, lowerIdx >= upperIdx else { return }
+
+        func window (from idx: Int) -> (lines: [String], offset: Int)? {
+            guard idx >= 0, idx < screen.count else { return nil }
+            let lines = Array(screen[idx ..< min(idx + Self.browseFingerprintWindow, screen.count)])
+            guard lines.contains(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return nil }
+            return (lines, idx - upperIdx)
+        }
+
+        var prints: [(lines: [String], offset: Int)] = []
+        // 选区内每 4 行取一条窗口（按 offset 去重）：整屏选区的上端窗口贴屏顶一滚就整窗
+        // 滚出、下端窗口可能锚在固定状态栏——中部的多条窗口既提供「内容真的移动了」的
+        // 证据（固定区拉黑的依据，见 relocateBrowseSelection），也让长选区往回滚很远后
+        // 仍有窗口留在屏上可找回。
+        var candidates = Array(stride(from: upperIdx, through: lowerIdx, by: Self.browseFingerprintWindow))
+        candidates.append(max(lowerIdx - Self.browseFingerprintWindow + 1, 0))
+        candidates = Array(Set(candidates)).sorted()
+        for idx in candidates {
+            // 从候选点向下找首个含非空白内容的窗口（不越过选区底行）。
+            for probe in idx...max(idx, lowerIdx) {
+                if let w = window(from: probe) {
+                    if !prints.contains(where: { $0.offset == w.offset }) { prints.append(w) }
+                    break
+                }
+            }
+        }
+        guard !prints.isEmpty else { return }
+        browseSelectionAnchor = BrowseSelectionAnchor(
+            upperRow: ordered.upper.row, lowerRow: ordered.lower.row,
+            upperCol: ordered.upper.col, lowerCol: ordered.lower.col,
+            fingerprints: prints)
+    }
+
+    /// 每个 feed 在当前屏找回选中内容：命中→更新真实行号并投影（部分越界钳位、整体屏外
+    /// 隐藏）；多处命中先取精确全等、再取离上次位置最近的；找不到→隐藏高亮但保留指纹待命
+    /// （命中即恢复——高亮从不错罩内容）。窗口允许 1 行失配：选区贴着 spinner/计时器这类
+    /// 每帧重画的动态行时，指纹不至于永久失效。
+    func relocateBrowseSelection ()
+    {
+        guard let anchor = browseSelectionAnchor else { return }
+        var newAnchor = anchor
+        let screen = visibleAlternateScreenLines()
+        guard !screen.isEmpty else { return }
+        let buffer = terminal.displayBuffer
+        let visTop = buffer.yDisp
+        let visBottom = min(visTop + buffer.rows - 1, max(0, buffer.lines.count - 1))
+
+        func isBlank (_ s: String) -> Bool { s.trimmingCharacters(in: .whitespaces).isEmpty }
+        // 每条指纹独立求最优命中（exact 优先于容错，再比离上次位置的距离）。
+        var perFp: [(fpIndex: Int, row: Int, exact: Bool)] = []
+        for (fi, fp) in anchor.fingerprints.enumerated() {
+            let m = fp.lines.count
+            guard m > 0, m <= screen.count else { continue }
+            var best: (row: Int, exact: Bool, dist: Int)? = nil
+            for idx in 0...(screen.count - m) {
+                var mismatch = 0
+                var nonBlankEqual = 0
+                for k in 0..<m {
+                    if screen[idx + k] == fp.lines[k] {
+                        if !isBlank(fp.lines[k]) { nonBlankEqual += 1 }
+                    } else {
+                        mismatch += 1
+                        if mismatch > 1 { break }
+                    }
+                }
+                let exact = mismatch == 0
+                let fuzzyOk = m >= 3 && mismatch <= 1 && nonBlankEqual >= 2
+                guard exact || fuzzyOk else { continue }
+                let row = visTop + idx - fp.offset
+                let dist = abs(row - anchor.upperRow)
+                if best == nil || (exact && !best!.exact) || (exact == best!.exact && dist < best!.dist) {
+                    best = (row, exact, dist)
+                }
+            }
+            if let b = best { perFp.append((fi, b.row, b.exact)) }
+        }
+        // 固定 UI 区拉黑：一条指纹的命中移动了、另一条恒在原位 → 原位那条疑似锚在固定区
+        // （CC 底部输入框/状态栏滚动时不动，会把选区钉死在屏幕位置上），永久剔除。
+        let movedHits = perFp.filter { $0.row != anchor.upperRow }
+        let stayedHits = perFp.filter { $0.row == anchor.upperRow }
+        if !movedHits.isEmpty, !stayedHits.isEmpty {
+            for entry in stayedHits.sorted(by: { $0.fpIndex > $1.fpIndex }) {
+                newAnchor.fingerprints.remove(at: entry.fpIndex)
+            }
+            perFp = movedHits
+        }
+        let exactPool = perFp.filter { $0.exact }
+        let pool = (exactPool.isEmpty ? perFp : exactPool).map { $0.row }
+        guard let hit = pool.min(by: { abs($0 - anchor.upperRow) < abs($1 - anchor.upperRow) }) else {
+            // 选中内容不在当前屏（滚出/换页/被重画）：隐藏高亮，指纹待命，滚回来即恢复。
+            if selection.active {
+                selection.selectNone()
+                setNeedsDisplay(bounds)
+            }
+            return
+        }
+
+        let span = anchor.lowerRow - anchor.upperRow
+        newAnchor.upperRow = hit
+        newAnchor.lowerRow = hit + span
+        browseSelectionAnchor = newAnchor
+
+        if newAnchor.lowerRow < visTop || newAnchor.upperRow > visBottom {
+            // 整体滚出可见屏：隐藏高亮，指纹继续待命，滚回来自动恢复。
+            if selection.active {
+                selection.selectNone()
+                setNeedsDisplay(bounds)
+            }
+            return
+        }
+        let newStart = Position(col: newAnchor.upperRow >= visTop ? newAnchor.upperCol : 0,
+                                row: max(newAnchor.upperRow, visTop))
+        let newEnd = Position(col: newAnchor.lowerRow <= visBottom ? newAnchor.lowerCol : max(0, terminal.cols - 1),
+                              row: min(newAnchor.lowerRow, visBottom))
+        if !selection.active || selection.start != newStart || selection.end != newEnd {
+            selection.setSelection(start: newStart, end: newEnd)
+            setNeedsDisplay(bounds)
+        }
+    }
+
     /// 武装内容跟踪：记录当前可见屏为基线。已武装则保持不动——基线连续性让撕裂帧之后
     /// 仍能与老基线对出跨块累计平移量。
     func armAlternateSelectionTracking ()
@@ -2432,8 +2583,16 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     {
         guard terminal.isDisplayBufferAlternate else {
             resetAlternateSelectionAutoScrollCapture()
+            browseSelectionAnchor = nil
             return
         }
+        // 浏览/封存态（松手后滚轮浏览、程序继续流式输出）：内容指纹绝对重定位。
+        // 增量对齐在这里有物理死角（快滚帧间零重叠），不走 detect。
+        guard isSelectionDragInProgress else {
+            relocateBrowseSelection()
+            return
+        }
+        browseSelectionAnchor = nil    // 拖拽进行中选区在变，旧指纹作废（mouseUp 重建）
         guard alternateSelectionAutoScrollLastScreen != nil else { return }
         guard selection.active else {
             resetAlternateSelectionAutoScrollCapture()
@@ -2454,20 +2613,19 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
 
-        let dragging = isSelectionDragInProgress
         guard let contentShift = detectAlternateContentShift(previous: previous, current: currentScreen) else {
             alternateSelectionTrackingFailures += 1
             // 撕裂帧先不动：保留基线，等完整帧到齐后与老基线一次对出跨块累计平移量。
             guard alternateSelectionTrackingFailures >= Self.alternateSelectionTrackingMaxFailures else { return }
             // 连续多帧都对不上 = 内容真被整体换掉（翻整页/切视图），不是撕裂。
-            if dragging, alternateSelectionAutoScrollText != nil,
+            if alternateSelectionAutoScrollText != nil,
                let direction = alternateSelectionAutoScrollDirection {
                 // 拖选累积中：退回文本重叠合并兜底，宁可偶尔重复一段也不静默丢内容；锚点不动。
                 if autoScrollDelta != 0 { extendSelectionToAutoScrollEdge(direction: direction) }
                 captureAlternateSelectionAutoScrollText(direction: direction)
                 rebaseAlternateSelectionTracking()
             } else {
-                // 浏览/封存态：选区锚定的内容已整体不在屏上，留着只会高亮错误的行。
+                // 拖拽刚开始还没累积任何内容就被整屏换掉：选区锚定的内容已不在屏上。
                 selection.selectNone()
                 resetAlternateSelectionAutoScrollCapture()
                 setNeedsDisplay(bounds)
@@ -2478,28 +2636,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         alternateSelectionTrackingFailures = 0
         let shift = contentShift.shift
         if shift != 0 {
-            if dragging {
-                // 高亮跟随：程序把滚动区内容平移了 shift 行（正 = 内容上移），锚点随内容同步
-                // 平移；end 由拖拽逻辑钉在鼠标/边缘，不在这里动。
-                selection.shiftDragAnchor(rowsBy: -shift)
-                if autoScrollDelta != 0, let direction = alternateSelectionAutoScrollDirection {
-                    extendSelectionToAutoScrollEdge(direction: direction)
-                    // 累积器确定性追加：这帧新滚进滚动区的 |shift| 行必在选区内，直接拼接
-                    // ——不依赖易受首末行截断/动画噪声干扰的文本重叠比对。只有平移方向与拖拽
-                    // 方向一致才追加（反向 = 程序回弹，进屏的是另一侧的行，不属于选区）。
-                    if alternateSelectionAutoScrollText != nil,
-                       (direction == .down && shift > 0) || (direction == .up && shift < 0) {
-                        appendAlternateSelectionAutoScrollLines(from: currentScreen, contentShift: contentShift, direction: direction)
-                    }
-                }
-            } else {
-                // 浏览/封存态（松手后程序继续流式输出、或选中后滚轮浏览）：选区两端一起随
-                // 内容平移，高亮继续罩住相同内容。整体滚出屏幕后：无累积文本就清掉；有累积
-                // 文本则保留贴边残段，⌘C 仍能拿到完整拼接内容。
-                if !selection.shiftSelectionTrackingContent(rowsBy: -shift),
-                   alternateSelectionAutoScrollText == nil {
-                    selection.selectNone()
-                    resetAlternateSelectionAutoScrollCapture()
+            // 高亮跟随：程序把滚动区内容平移了 shift 行（正 = 内容上移），锚点随内容同步
+            // 平移；end 由拖拽逻辑钉在鼠标/边缘，不在这里动。
+            selection.shiftDragAnchor(rowsBy: -shift)
+            if autoScrollDelta != 0, let direction = alternateSelectionAutoScrollDirection {
+                extendSelectionToAutoScrollEdge(direction: direction)
+                // 累积器确定性追加：这帧新滚进滚动区的 |shift| 行必在选区内，直接拼接
+                // ——不依赖易受首末行截断/动画噪声干扰的文本重叠比对。只有平移方向与拖拽
+                // 方向一致才追加（反向 = 程序回弹，进屏的是另一侧的行，不属于选区）。
+                if alternateSelectionAutoScrollText != nil,
+                   (direction == .down && shift > 0) || (direction == .up && shift < 0) {
+                    appendAlternateSelectionAutoScrollLines(from: currentScreen, contentShift: contentShift, direction: direction)
                 }
             }
             setNeedsDisplay(bounds)
@@ -2853,6 +3000,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // 新一次按下：拖拽尚未开始，复位标志（真正开始划选时由 mouseDragged 置 true）。
         isSelectionDragInProgress = false
         resetAlternateSelectionAutoScrollCapture()
+        browseSelectionAnchor = nil
 
         switch event.clickCount {
         case 1:
@@ -2907,6 +3055,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
         // 拖拽结束：恢复主屏「输出滚动时清选区」的原行为（备用屏由 feedPrepare/linefeed 自身判断保留）。
         isSelectionDragInProgress = false
+        // 选区定格：为浏览态建立内容指纹——之后滚轮浏览/程序流式输出时高亮按内容绝对
+        // 重定位（快滚免疫），滚出屏隐藏、滚回来恢复。
+        browseSelectionAnchor = nil
+        if terminal.isDisplayBufferAlternate, selection.active {
+            ensureBrowseSelectionAnchor()
+        }
         let hit = calculateMouseHit(with: event).grid
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
@@ -3155,12 +3309,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if terminal.isDisplayBufferAlternate && !mouseReportingBypassed(with: event) {
             // Relay patch: 走到这里 = 备用屏本地没有可滚的历史(yBase==0)。CC/codex 就地重绘、
             // yBase 恒 0（实测：滚 249 次全程 0），滚出的历史不进终端缓冲区，选区锚的是终端行
-            // 坐标。旧版为防高亮罩错行在这里直接清选区；现在改为武装内容跟踪：转发滚轮后程序
-            // 重绘，feed 钩子（trackAlternateSelectionContentAfterFeed）对出整屏平移量、让选区
-            // 两端随内容平移——高亮跟着内容走；选区整体滚出屏幕时才自动清除（有累积复制文本
-            // 则保留贴边残段，⌘C 仍拿到完整拼接内容）。
+            // 坐标。旧版为防高亮罩错行在这里直接清选区；现在为选区建立内容指纹：转发滚轮后
+            // 程序重绘，feed 钩子（relocateBrowseSelection）在新屏上按内容把选区绝对重定位
+            // ——高亮跟着内容走，快滚/撕裂帧免疫；滚出屏幕隐藏、滚回来自动恢复。
             if selection.active && !isSelectionDragInProgress {
-                armAlternateSelectionTracking()
+                ensureBrowseSelectionAnchor()
             }
             // Discrete notched wheels report one tick at a time (velocity 1);
             // give them the xterm `alternateScroll` convention of ~3 lines per

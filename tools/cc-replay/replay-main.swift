@@ -109,7 +109,7 @@ guard term.isDisplayBufferAlternate else {
 // ---- Phase B: 模拟真实用户动作——从屏中下部起选，向上拖到顶边，随录制的滚轮回放 ----
 let buf = term.displayBuffer
 let rows = term.rows
-let anchorRow = buf.yDisp + rows - 4
+let anchorRow = buf.yDisp + 20   // 锚在 transcript 内容区中部（避开底部固定输入框/状态栏与空行）
 view.selection.setSelection(start: Position(col: 0, row: anchorRow), end: Position(col: 5, row: anchorRow - 1))
 view.isSelectionDragInProgress = true
 let topPoint = CGPoint(x: 20, y: view.bounds.height - 1)   // 顶边 → delta<0 → 向上
