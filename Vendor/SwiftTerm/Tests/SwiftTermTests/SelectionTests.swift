@@ -453,9 +453,9 @@ final class SelectionTests: TerminalDelegate {
         var current = Array(previous.dropFirst(3)) + ["new line 0", "new line 1", "new line 2"]
         current[4] = "⠧ thinking… (12s)"
 
-        #expect(view.detectAlternateContentShift(previous: previous, current: current) == 3)
+        #expect(view.detectAlternateContentShift(previous: previous, current: current)?.shift == 3)
         // 完全相同的两帧 = 原地重绘，平移量 0。
-        #expect(view.detectAlternateContentShift(previous: previous, current: previous) == 0)
+        #expect(view.detectAlternateContentShift(previous: previous, current: previous)?.shift == 0)
         // 整屏换成不相干内容：没有可信对齐，返回 nil（保留基线等完整帧/走保守兜底）。
         let unrelated = (0..<12).map { "other \($0)" }
         #expect(view.detectAlternateContentShift(previous: previous, current: unrelated) == nil)
@@ -468,7 +468,25 @@ final class SelectionTests: TerminalDelegate {
         let previous = (0..<10).map { "content line \($0)" }
         // 向上翻页：内容整体下移 2 行，顶部进 2 行历史 → 带符号平移量为 -2。
         let current = ["history 0", "history 1"] + Array(previous.dropLast(2))
-        #expect(view.detectAlternateContentShift(previous: previous, current: current) == -2)
+        #expect(view.detectAlternateContentShift(previous: previous, current: current)?.shift == -2)
+    }
+
+    // 真实 CC 布局（PTY 录制回放实证）：只有 transcript 区滚动，底部输入框/边框/状态栏
+    // 固定不动。整屏占比类判据会被固定区打穿（38 行里最多 30 行能对上 <80%，每帧 nil）；
+    // 「变化过」过滤后固定区不计分，检测只看真正滚动的区，且新进行取自滚动区尾部而非屏底。
+    @Test func testDetectAlternateContentShiftWithFixedFooter() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let footer = ["", "───────", "❯ ", "───────", "  [Model] │ proj", "  Usage ██ 23%"]
+        let prevBody = (10..<40).map { "  \($0)" }
+        let previous = prevBody + footer
+        // transcript 区上移 2 行、尾部进 2 行新内容，footer 纹丝不动。
+        let currBody = Array(prevBody.dropFirst(2)) + ["  40", "  41"]
+        let current = currBody + footer
+        let result = view.detectAlternateContentShift(previous: previous, current: current)
+        #expect(result?.shift == 2)
+        // 新进行的位置在滚动区尾部（行 28-29），不是屏幕底部。
+        #expect(result?.changedHi == currBody.count - 1)
+        #expect(result?.matchedHi == currBody.count - 3)
     }
 
     // 捕获文本的稳定性契约：边缘侧行必须取全宽。旧版按鼠标列截断末行，同一内容行下一帧

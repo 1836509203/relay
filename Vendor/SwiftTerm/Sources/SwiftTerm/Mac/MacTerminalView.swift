@@ -2455,7 +2455,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
 
         let dragging = isSelectionDragInProgress
-        guard let shift = detectAlternateContentShift(previous: previous, current: currentScreen) else {
+        guard let contentShift = detectAlternateContentShift(previous: previous, current: currentScreen) else {
             alternateSelectionTrackingFailures += 1
             // 撕裂帧先不动：保留基线，等完整帧到齐后与老基线一次对出跨块累计平移量。
             guard alternateSelectionTrackingFailures >= Self.alternateSelectionTrackingMaxFailures else { return }
@@ -2476,19 +2476,20 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
 
         alternateSelectionTrackingFailures = 0
+        let shift = contentShift.shift
         if shift != 0 {
             if dragging {
-                // 高亮跟随：程序把内容整屏平移了 shift 行（正 = 内容上移），锚点随内容同步
+                // 高亮跟随：程序把滚动区内容平移了 shift 行（正 = 内容上移），锚点随内容同步
                 // 平移；end 由拖拽逻辑钉在鼠标/边缘，不在这里动。
                 selection.shiftDragAnchor(rowsBy: -shift)
                 if autoScrollDelta != 0, let direction = alternateSelectionAutoScrollDirection {
                     extendSelectionToAutoScrollEdge(direction: direction)
-                    // 累积器确定性追加：拖拽边缘侧这帧新进屏的 |shift| 行必在选区内，直接拼接
+                    // 累积器确定性追加：这帧新滚进滚动区的 |shift| 行必在选区内，直接拼接
                     // ——不依赖易受首末行截断/动画噪声干扰的文本重叠比对。只有平移方向与拖拽
                     // 方向一致才追加（反向 = 程序回弹，进屏的是另一侧的行，不属于选区）。
                     if alternateSelectionAutoScrollText != nil,
                        (direction == .down && shift > 0) || (direction == .up && shift < 0) {
-                        appendAlternateSelectionAutoScrollLines(from: currentScreen, count: abs(shift), direction: direction)
+                        appendAlternateSelectionAutoScrollLines(from: currentScreen, contentShift: contentShift, direction: direction)
                     }
                 }
             } else {
@@ -2521,60 +2522,103 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
 
-    /// 逐帧检测程序把整屏内容平移了几行，带符号：正 = 内容上移（向下翻），负 = 内容下移
-    /// （向上翻）。在 |shift| ∈ [0, n-3] 里找一个平移量，使前后两帧按其对齐后的重叠区满足
-    /// 「≥minTrustedMergeOverlapLines 行非空白精确相等，且相等行占比 ≥80%」。CC 界面的
-    /// spinner/计时器行每帧都在变，逐字节全等做不到，按行打分即可稳判；而内容真滚动时错位
-    /// 对齐只有边框/空行这类恒等杂音能撞上，占比阈值天然挡掉。多个平移量都达标时取相等行数
-    /// 最多者（同分取更小 |shift|，宁可少动不可错动）。返回 nil 表示这帧没有可信对齐
-    /// （重绘到一半的撕裂帧/整屏换内容/行数变化），调用方保留基线等完整帧或走保守兜底。
-    func detectAlternateContentShift (previous: [String], current: [String]) -> Int?
+    /// 整屏平移检测结果。真实 CC 的关键事实（PTY 录制回放实证，2026-07-02）：滚动时只有
+    /// transcript 区（约屏幕上部 30 行）平移，底部输入框/状态栏固定不动，且用 Ink 增量 diff
+    /// 重绘（每帧仅数百字节、不清屏）——任何「整屏占比」类判据都会被固定 UI 区打穿。
+    struct AlternateContentShift {
+        /// 带符号平移量：正 = 内容上移（向下翻），负 = 内容下移（向上翻）。
+        let shift: Int
+        /// 平移匹配行（非空白且本帧变化过）在当前帧中的行号范围。
+        let matchedLo: Int
+        let matchedHi: Int
+        /// 本帧发生变化的行号范围——滚动区边界的估计（固定 UI 区通常整帧不变）。
+        let changedLo: Int
+        let changedHi: Int
+    }
+
+    /// 逐帧检测程序把滚动区内容平移了几行。对每个候选 K 统计「非空白、本帧变化过、且按 K
+    /// 对齐后与前一帧精确相等」的行数：
+    /// - 「变化过」过滤是核心：固定 UI 区（输入框/边框/状态栏）整帧不变，若不过滤，重复的
+    ///   边框线会给错误的 K 灌水；过滤后它们对任何 K≠0 都不计分，检测只看真正滚动的区。
+    /// - 取匹配数最多且领先次优 ≥2 的 K（歧义帧宁可返回 nil 不错动）；K=0（原地重绘/spinner
+    ///   帧）按「未变化的非空白行数」计分，天然胜出。
+    /// - 撕裂否决：整屏被清到一半（非空白行骤降 >1/3）时返回 nil 等画完——真实 CC 增量重绘
+    ///   不清屏，不会触发；防的是 2J 全量重绘型程序的半帧。
+    /// 返回 nil = 无可信对齐（撕裂/整屏换内容/行数变化/歧义），调用方保留基线或走保守兜底。
+    func detectAlternateContentShift (previous: [String], current: [String]) -> AlternateContentShift?
     {
         let n = previous.count
         guard n > 0, current.count == n else { return nil }
         let maxShift = n - Self.minTrustedMergeOverlapLines
         guard maxShift >= 0 else { return nil }
 
-        var best: (shift: Int, matched: Int)?
+        func isBlank (_ s: String) -> Bool { s.trimmingCharacters(in: .whitespaces).isEmpty }
+        let prevNonBlank = previous.lazy.filter { !isBlank($0) }.count
+        let currNonBlank = current.lazy.filter { !isBlank($0) }.count
+        guard currNonBlank * 3 >= prevNonBlank * 2 else { return nil }
+
+        var changedLo = Int.max
+        var changedHi = -1
+        for i in 0..<n where current[i] != previous[i] {
+            changedLo = min(changedLo, i)
+            changedHi = max(changedHi, i)
+        }
+
+        var candidates: [(shift: Int, matched: Int, lo: Int, hi: Int)] = []
         for magnitude in 0...maxShift {
             for shift in (magnitude == 0 ? [0] : [magnitude, -magnitude]) {
                 let overlap = n - magnitude
                 var matched = 0
-                var matchedNonBlank = 0
+                var lo = Int.max
+                var hi = -1
                 for i in 0..<overlap {
-                    // shift > 0：内容上移，前一帧第 i+shift 行滚到当前帧第 i 行；shift < 0 相反。
-                    let prevLine = shift >= 0 ? previous[i + shift] : previous[i]
-                    let currLine = shift >= 0 ? current[i] : current[i - shift]
-                    guard prevLine == currLine else { continue }
+                    // shift > 0：内容上移，前一帧第 ci+shift 行滚到当前帧第 ci 行；shift < 0 相反。
+                    let ci = shift >= 0 ? i : i - shift
+                    let pi = shift >= 0 ? i + shift : i
+                    let line = current[ci]
+                    guard line == previous[pi], !isBlank(line) else { continue }
+                    guard shift == 0 || line != previous[ci] else { continue }
                     matched += 1
-                    if !prevLine.trimmingCharacters(in: .whitespaces).isEmpty {
-                        matchedNonBlank += 1
-                    }
+                    lo = min(lo, ci)
+                    hi = max(hi, ci)
                 }
-                guard matchedNonBlank >= Self.minTrustedMergeOverlapLines,
-                      matched * 5 >= overlap * 4 else {
-                    continue
-                }
-                if let sofar = best, sofar.matched >= matched {
-                    continue
-                }
-                best = (shift, matched)
+                guard matched >= Self.minTrustedMergeOverlapLines else { continue }
+                candidates.append((shift, matched, lo, hi))
             }
         }
-        return best?.shift
+        let sorted = candidates.sorted { $0.matched > $1.matched }
+        guard let best = sorted.first else { return nil }
+        if sorted.count > 1, best.matched < sorted[1].matched + 2 {
+            return nil
+        }
+        return AlternateContentShift(shift: best.shift, matchedLo: best.lo, matchedHi: best.hi,
+                                     changedLo: changedLo == Int.max ? 0 : changedLo,
+                                     changedHi: max(changedHi, 0))
     }
 
-    /// 把这一帧新滚进屏的 count 行（.down 取屏底、.up 取屏顶）确定性拼进累积器。
-    private func appendAlternateSelectionAutoScrollLines (from screen: [String], count: Int, direction: AlternateSelectionAutoScrollDirection)
+    /// 把这一帧新滚进滚动区的 |shift| 行确定性拼进累积器。新行的位置不是屏幕边缘，而是
+    /// **滚动区边缘**（真实 CC 底部有固定状态栏，向下翻时新行出现在 transcript 区尾部、
+    /// 不是屏底）：向下翻取变化区尾部 |shift| 行（下界不越过匹配区），向上翻取变化区头部。
+    private func appendAlternateSelectionAutoScrollLines (from screen: [String], contentShift: AlternateContentShift, direction: AlternateSelectionAutoScrollDirection)
     {
-        guard count > 0, !screen.isEmpty, let existing = alternateSelectionAutoScrollText else { return }
-        let n = min(count, screen.count)
+        guard contentShift.shift != 0, !screen.isEmpty, let existing = alternateSelectionAutoScrollText else { return }
+        let n = screen.count
+        let lower: Int
+        let upper: Int
+        if contentShift.shift > 0 {
+            upper = min(contentShift.changedHi, n - 1)
+            lower = max(upper - contentShift.shift + 1, contentShift.matchedHi + 1)
+        } else {
+            let m = -contentShift.shift
+            lower = max(contentShift.changedLo, 0)
+            upper = min(lower + m - 1, contentShift.matchedLo - 1)
+        }
+        guard lower <= upper, lower >= 0, upper < n else { return }
+        let fresh = screen[lower...upper].joined(separator: "\n")
         switch direction {
         case .down:
-            let fresh = screen.suffix(n).joined(separator: "\n")
             alternateSelectionAutoScrollText = existing.isEmpty ? fresh : existing + "\n" + fresh
         case .up:
-            let fresh = screen.prefix(n).joined(separator: "\n")
             alternateSelectionAutoScrollText = existing.isEmpty ? fresh : fresh + "\n" + existing
         }
         alternateSelectionAutoScrollDirection = direction
