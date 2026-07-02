@@ -489,6 +489,25 @@ final class SelectionTests: TerminalDelegate {
         #expect(result?.matchedHi == currBody.count - 3)
     }
 
+    // 真机漂移根因（2026-07-02 浏览态）：Ink 的 diff 按行文本对比，代码/diff 类内容大量行
+    // 重复（"}"/缩进），滚动 1 行后多数行新旧文本恰好相同、不被重画——「变化过」的行寥寥。
+    // 若 K=0 按「未变化行」计分会稳赢真实 K，检测判成原地重绘，选区每滚一次漂 1 行。
+    // 变化行证据制：只信变化行的对齐，重复行的巧合匹配靠「领先次优 ≥2」压制。
+    @Test func testDetectAlternateContentShiftWithSparseInkRedraw() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        // 周期 6 的高重复内容：5/6 是重复的 "}"，1/6 是独特行。
+        func pattern(_ i: Int) -> String { i % 6 == 0 ? "func block\(i)() {" : "}" }
+        let previous = (0..<30).map { pattern($0) }
+        // 内容上移 1 行：只有 1/3 的行文本实际变化（其余 "}" 对 "}" 恰好相同，Ink 不重画）。
+        let current = (0..<30).map { pattern($0 + 1) }
+        #expect(view.detectAlternateContentShift(previous: previous, current: current)?.shift == 1)
+        // 原地重绘（只有 spinner/状态行这类少量可见变化、且对不齐任何 K）仍判 0。
+        var spinner = previous
+        spinner[4] = "⠧ thinking… (12s)"
+        spinner[29] = "  Usage ██ 24%"
+        #expect(view.detectAlternateContentShift(previous: previous, current: spinner)?.shift == 0)
+    }
+
     // CC/Ink「CUP 跳列画字」留下的前导 null cell 会被 translate 成 \0：同一行一帧带 NUL
     // 一帧带空格，逐字节比较摇摆失配，且 NUL 会混进 ⌘C 剪贴板文本。统一成空格并剪尾。
     @Test func testSanitizedScreenLineStripsNulPadding() {

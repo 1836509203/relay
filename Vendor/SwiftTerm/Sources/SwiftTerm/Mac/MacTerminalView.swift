@@ -2553,21 +2553,25 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let changedHi: Int
     }
 
-    /// 逐帧检测程序把滚动区内容平移了几行。对每个候选 K 统计「非空白、本帧变化过、且按 K
-    /// 对齐后与前一帧精确相等」的行数：
+    /// 逐帧检测程序把滚动区内容平移了几行。**只以「本帧变化过的行」为证据**，对每个候选
+    /// K≠0 统计「非空白、本帧变化过、且按 K 对齐后与前一帧精确相等」的行数：
     /// - 「变化过」过滤是核心：固定 UI 区（输入框/边框/状态栏）整帧不变，若不过滤，重复的
-    ///   边框线会给错误的 K 灌水；过滤后它们对任何 K≠0 都不计分，检测只看真正滚动的区。
-    /// - 取匹配数最多且领先次优 ≥2 的 K（歧义帧宁可返回 nil 不错动）；K=0（原地重绘/spinner
-    ///   帧）按「未变化的非空白行数」计分，天然胜出。
+    ///   边框线会给错误的 K 灌水；过滤后它们对任何 K 都不计分，检测只看真正滚动的区。
+    /// - K=0 不参与计分。真机踩过的坑（2026-07-02 浏览态漂移）：Ink 的 diff 按行文本对比，
+    ///   代码/diff 类内容大量行重复（"}"/缩进/前缀），滚动 1 行后多数行新旧文本恰好相同、
+    ///   根本不被重画——若 K=0 按「未变化行」计分会稳赢真实的 K，选区每滚一次漂 1 行。
+    ///   视觉语义上高亮只需跟随「肉眼可见的移动」：变化行对齐到哪个 K 就信哪个 K；
+    ///   可见变化寥寥且无对齐 = 原地重绘（spinner/光标/状态栏动画）→ 0；
+    ///   可见变化大量却无法对齐 = 撕裂半帧/整屏换内容 → nil（保基线等完整帧/走兜底）。
+    /// - 采信条件：匹配 ≥2、领先次优 ≥2（歧义帧宁可不动）、且解释了至少一半可见变化行。
     /// - 撕裂否决：整屏被清到一半（非空白行骤降 >1/3）时返回 nil 等画完——真实 CC 增量重绘
     ///   不清屏，不会触发；防的是 2J 全量重绘型程序的半帧。
-    /// 返回 nil = 无可信对齐（撕裂/整屏换内容/行数变化/歧义），调用方保留基线或走保守兜底。
     func detectAlternateContentShift (previous: [String], current: [String]) -> AlternateContentShift?
     {
         let n = previous.count
         guard n > 0, current.count == n else { return nil }
         let maxShift = n - Self.minTrustedMergeOverlapLines
-        guard maxShift >= 0 else { return nil }
+        guard maxShift >= 1 else { return nil }
 
         func isBlank (_ s: String) -> Bool { s.trimmingCharacters(in: .whitespaces).isEmpty }
         let prevNonBlank = previous.lazy.filter { !isBlank($0) }.count
@@ -2576,14 +2580,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         var changedLo = Int.max
         var changedHi = -1
+        var changedVisible = 0
         for i in 0..<n where current[i] != previous[i] {
             changedLo = min(changedLo, i)
             changedHi = max(changedHi, i)
+            if !isBlank(current[i]) || !isBlank(previous[i]) {
+                changedVisible += 1
+            }
         }
 
         var candidates: [(shift: Int, matched: Int, lo: Int, hi: Int)] = []
-        for magnitude in 0...maxShift {
-            for shift in (magnitude == 0 ? [0] : [magnitude, -magnitude]) {
+        for magnitude in 1...maxShift {
+            for shift in [magnitude, -magnitude] {
                 let overlap = n - magnitude
                 var matched = 0
                 var lo = Int.max
@@ -2593,22 +2601,26 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                     let ci = shift >= 0 ? i : i - shift
                     let pi = shift >= 0 ? i + shift : i
                     let line = current[ci]
-                    guard line == previous[pi], !isBlank(line) else { continue }
-                    guard shift == 0 || line != previous[ci] else { continue }
+                    guard line == previous[pi], !isBlank(line), line != previous[ci] else { continue }
                     matched += 1
                     lo = min(lo, ci)
                     hi = max(hi, ci)
                 }
-                guard matched >= Self.minTrustedMergeOverlapLines else { continue }
+                guard matched >= 2 else { continue }
                 candidates.append((shift, matched, lo, hi))
             }
         }
         let sorted = candidates.sorted { $0.matched > $1.matched }
-        guard let best = sorted.first else { return nil }
-        if sorted.count > 1, best.matched < sorted[1].matched + 2 {
-            return nil
+        if let best = sorted.first,
+           sorted.count < 2 || best.matched >= sorted[1].matched + 2,
+           best.matched * 2 >= changedVisible {
+            return AlternateContentShift(shift: best.shift, matchedLo: best.lo, matchedHi: best.hi,
+                                         changedLo: changedLo == Int.max ? 0 : changedLo,
+                                         changedHi: max(changedHi, 0))
         }
-        return AlternateContentShift(shift: best.shift, matchedLo: best.lo, matchedHi: best.hi,
+        // 无可信平移对齐：可见变化很少 = 原地重绘；变化不少却对不齐 = 撕裂/换屏，返 nil。
+        guard changedVisible <= max(2, n / 6) else { return nil }
+        return AlternateContentShift(shift: 0, matchedLo: 0, matchedHi: -1,
                                      changedLo: changedLo == Int.max ? 0 : changedLo,
                                      changedHi: max(changedHi, 0))
     }
