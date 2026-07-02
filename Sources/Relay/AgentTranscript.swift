@@ -213,7 +213,9 @@ extension AgentTranscript {
 
     /// 从 transcript 尾部窗口解析轮次。工具输出重的会话一轮可占数 MB，2MB 起步、
     /// 轮次不够就翻倍扩窗，封顶 16MB（再早的轮次放弃——刻度条只展示近端）。
-    static func recentTurns(fromTranscript url: URL, limit: Int) -> [ConversationTurn] {
+    static func recentTurns(
+        fromTranscript url: URL, limit: Int, startedAt: Date? = nil
+    ) -> [ConversationTurn] {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? handle.close() }
         guard let end = try? handle.seekToEnd(), end > 0 else { return [] }
@@ -229,7 +231,8 @@ extension AgentTranscript {
                 text = String(text[text.index(after: nl)...])
             }
             let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-            let turns = parseTurns(lines: lines, limit: limit, droppedHead: start > 0)
+            let turns = parseTurns(
+                lines: lines, limit: limit, droppedHead: start > 0, startedAt: startedAt)
             if turns.count >= limit || isWhole || window >= cap { return turns }
             window *= 2
         }
@@ -238,13 +241,17 @@ extension AgentTranscript {
     private enum TurnEvent {
         case prompt(String, Date?)
         case reply(String)
-        case compactBoundary
+        case compactBoundary(Date?)
     }
 
     /// userPrompt 开新轮，随后的 assistantText 累进该轮回答摘要（摘要够长即止）。
-    /// 上下文压缩（compact）边界清空累积：CC 恢复/压缩后只重绘边界之后的内容，
-    /// 更早的轮次在终端里滚不到——刻度条与 CC 的可浏览范围对齐，点击才可达。
-    static func parseTurns(lines: [Substring], limit: Int, droppedHead: Bool) -> [ConversationTurn] {
+    /// 上下文压缩（compact）边界的截断规则看它发生在 agent 本次启动前还是后：
+    /// 启动时 CC 只重绘最近边界之后的内容（更早的滚不到，必须截掉）；但启动后
+    /// 进行中的 compact 不清屏，边界之前的轮次仍在屏上可浏览可跳达，不截。
+    /// startedAt=nil 或边界无时间戳时保守截断（宁少显示不给跳不到的刻度）。
+    static func parseTurns(
+        lines: [Substring], limit: Int, droppedHead: Bool, startedAt: Date? = nil
+    ) -> [ConversationTurn] {
         var acc: [(prompt: String, reply: String, ts: Date?)] = []
         // 窗口从中间截断时，第一个提问之前的行属于上一轮的残段，丢弃。
         var sawBoundary = !droppedHead
@@ -258,9 +265,11 @@ extension AgentTranscript {
                 guard sawBoundary, !acc.isEmpty, acc[acc.count - 1].reply.count < 400 else { continue }
                 let prev = acc[acc.count - 1].reply
                 acc[acc.count - 1].reply = prev.isEmpty ? r : prev + "\n" + r
-            case .compactBoundary:
+            case .compactBoundary(let ts):
                 sawBoundary = true
-                acc.removeAll()
+                let cutsOff: Bool
+                if let startedAt, let ts { cutsOff = ts < startedAt } else { cutsOff = true }
+                if cutsOff { acc.removeAll() }
             }
         }
         return acc.suffix(limit).map { t in
@@ -274,7 +283,9 @@ extension AgentTranscript {
     private static func turnEvent(_ line: Substring) -> TurnEvent? {
         guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
               let type = obj["type"] as? String else { return nil }
-        if obj["isCompactSummary"] as? Bool == true { return .compactBoundary }
+        if obj["isCompactSummary"] as? Bool == true {
+            return .compactBoundary(parseTimestamp(obj["timestamp"] as? String))
+        }
         if obj["isSidechain"] as? Bool == true { return nil }
         if obj["isMeta"] as? Bool == true { return nil }
         guard let message = obj["message"] as? [String: Any] else { return nil }
@@ -297,7 +308,9 @@ extension AgentTranscript {
             }
             guard var t = text?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty
             else { return nil }
-            if t.hasPrefix("This session is being continued") { return .compactBoundary }
+            if t.hasPrefix("This session is being continued") {
+                return .compactBoundary(parseTimestamp(obj["timestamp"] as? String))
+            }
             if t.hasPrefix("<command-") || t.hasPrefix("<local-command")
                 || t.hasPrefix("[Request interrupted") { return nil }
             t = t.replacingOccurrences(of: "\n", with: " ")
