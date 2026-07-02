@@ -40,6 +40,14 @@ struct RootView: View {
                         mainContent
                     }
                     .background(mainBackground)
+                    // 侧栏收起时的对话时间轴（Codex 式）：左缘小横线，一条线
+                    // = 活动 Claude 会话的一轮对话，hover 预览提问与回答摘要。
+                    // 无轮次数据（非 Claude 会话）时 rail 自身不渲染。
+                    .overlay(alignment: .leading) {
+                        if !store.settings.sidebarVisible {
+                            TimelineRail(store: store)
+                        }
+                    }
                 }
             }
         }
@@ -97,10 +105,15 @@ struct RootView: View {
         }
     }
 
+    /// 侧栏收起时左右留白带宽（Codex 式 gutter）：左带容纳刻度条（鱼眼峰值
+    /// 7+26+13=46pt），右带对称，保证刻度线永不压在终端文字上。
+    private static let railGutter: CGFloat = 48
+
     private var mainContent: some View {
         let padding = CGFloat(store.settings.padding)
+        let gutter = store.settings.sidebarVisible ? padding : max(padding, Self.railGutter)
         return terminalArea
-            .padding(EdgeInsets(top: max(4, padding - 2), leading: padding, bottom: padding, trailing: padding))
+            .padding(EdgeInsets(top: max(4, padding - 2), leading: gutter, bottom: padding, trailing: gutter))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 

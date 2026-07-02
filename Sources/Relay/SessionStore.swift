@@ -447,6 +447,245 @@ final class SessionStore: ObservableObject {
     /// RELAY_DEBUG 排障入口用：只读暴露常驻视图表（relay.dump 转储 cols/rows）。
     var debugViews: [String: RelayTerminalView] { views }
 
+    // MARK: - 对话轮次（左缘时间轴刻度条数据）
+
+    /// 会话 id → 最近的对话轮次（读自 CC transcript，见 AgentTranscript.recentTurns）。
+    @Published private(set) var turns: [String: [ConversationTurn]] = [:]
+    private var turnsRefreshedAt: [String: Date] = [:]
+    private let turnsQueue = DispatchQueue(label: "relay.turns", qos: .utility)
+    /// 本次运行是否已确认「会话里真跑着 claude」（进程树/hook 任一先到）。
+    private var claudeSince: [String: Date] = [:]
+    /// 会话 → 已认定的 transcript 文件。哪个 jsonl 属于这个终端里的 CC 不能按
+    /// 文件时间猜（同 cwd 可并发多会话、--continue 沿用旧文件追加），用屏幕上
+    /// 的对话指纹到候选文件里匹配，认对一次后锁定。claude 退出即失效。
+    private var boundTranscript: [String: URL] = [:]
+    /// 上次解析时 transcript 的 mtime（只在 turnsQueue 上读写）。
+    private var turnsParsedMtime: [String: Date] = [:]
+
+    /// 见 claudeSince。首次确认时顺带强刷轮次（此前 refreshTurns 一直被 guard 挡着）。
+    private func markClaudeAlive(_ sid: String) {
+        guard claudeSince[sid] == nil else { return }
+        claudeSince[sid] = Date()
+        refreshTurns(sid, force: true)
+    }
+
+    /// claude 退出（进程树降级）：轮次归属失效，全部清掉。
+    private func clearClaudeTurns(_ sid: String) {
+        claudeSince.removeValue(forKey: sid)
+        boundTranscript.removeValue(forKey: sid)
+        turnsRefreshedAt.removeValue(forKey: sid)
+        turnsQueue.async { [weak self] in self?.turnsParsedMtime.removeValue(forKey: sid) }
+        if turns[sid] != nil { turns.removeValue(forKey: sid) }
+        if locatedSession == sid {
+            locatedSession = nil
+            viewportTurnId = nil
+        }
+    }
+
+    /// 重读活动 Claude 会话的轮次列表（后台解析、主线程发布）。onTick 每秒
+    /// 轮询兜底，内部节流 2 秒；切会话/刻度条出现时 force 强刷。
+    /// 未绑定 transcript 时先做屏幕指纹匹配绑定；屏幕上还没有可辨认的对话
+    ///（如 CC 刚启动的欢迎屏）就等下一轮——没有对话本来也没有刻度可显示。
+    /// codex 暂无 transcript 支持。
+    func refreshTurns(_ sid: String, force: Bool = false) {
+        guard let s = sessions.first(where: { $0.id == sid }), s.kind == .claude,
+              claudeSince[sid] != nil else { return }
+        let now = Date()
+        if !force, let last = turnsRefreshedAt[sid], now.timeIntervalSince(last) < 2 { return }
+        turnsRefreshedAt[sid] = now
+        guard let cwd = liveCwd[sid] ?? s.cwd, !cwd.isEmpty else { return }
+        let bound = boundTranscript[sid]
+        // 屏幕行主线程取（视图非线程安全），绑定匹配用。
+        let screenLines = bound == nil ? (views[sid]?.visibleLines() ?? []) : []
+        turnsQueue.async { [weak self] in
+            guard let self else { return }
+            guard let url = bound ?? Self.bindTranscript(cwd: cwd, screenLines: screenLines) else { return }
+            // 文件没有新写入就不重复解析（重会话尾窗可达 16MB，2 秒一次太浪费）。
+            let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            if bound != nil, let mtime, self.turnsParsedMtime[sid] == mtime { return }
+            if let mtime { self.turnsParsedMtime[sid] = mtime }
+            let list = AgentTranscript.recentTurns(fromTranscript: url, limit: 32)
+            DispatchQueue.main.async {
+                if self.boundTranscript[sid] == nil { self.boundTranscript[sid] = url }
+                if self.turns[sid] != list { self.turns[sid] = list }
+            }
+        }
+    }
+
+    /// 只留字母/数字（含 CJK）：抹掉 CC 渲染装饰（⏺ ⎿ 框线、空白、标点）和
+    /// JSON 转义符，屏幕行与 transcript 原文才能 contains 对上。
+    private static func matchable(_ s: String) -> String {
+        String(s.filter { $0.isLetter || $0.isNumber })
+    }
+
+    /// 在 cwd 的候选会话文件里找「屏幕上正显示的那个会话」。判据：屏幕行
+    /// （提问、回答、工具输出、diff……）必定原样存在于本会话的 jsonl 里，
+    /// 而不在别的会话文件里——取若干屏幕行做探针，到候选文件尾部原始文本里
+    /// contains 计数，命中最多者胜。全部脱靶返回 nil（宁可暂不显示，不猜错
+    /// 文件把别的会话当成自己的历史）；CC 自身 UI 行（输入框、状态栏）不在
+    /// transcript 里，只拉低命中数、不产生假阳性。
+    private static func bindTranscript(cwd: String, screenLines: [String]) -> URL? {
+        let probes = screenLines
+            .map(matchable)
+            .filter { $0.count >= 16 }
+            .suffix(24)
+            .map { String($0.prefix(32)) }
+        guard probes.count >= 2 else { return nil }
+        var best: (url: URL, score: Int)?
+        for url in AgentTranscript.candidateTranscripts(forCwd: cwd) {
+            let tail = matchable(AgentTranscript.tailText(of: url))
+            let score = probes.reduce(0) { $0 + (tail.contains($1) ? 1 : 0) }
+            // 候选按 mtime 降序，平分时保留先见的（更近活跃的）。
+            if score > (best?.score ?? 0) { best = (url, score) }
+        }
+        return best?.url
+    }
+
+    // MARK: - 视口轮次定位 + 点击跳转
+
+    /// 活动会话视口当前所在的对话轮 id（屏幕文本指纹匹配，onTick 每秒定位；
+    /// 匹配不到时保持旧值——满屏工具输出没有提问文本是常态）。
+    @Published private(set) var viewportTurnId: String?
+    private var locatedSession: String?
+    private var jumpTargetId: String?
+    private var jumpDeadline = Date.distantPast
+    private var jumpTimer: Timer?
+    private var jumpLastScreen: String?
+    private var jumpStallTicks = 0
+
+    /// 一轮对话的屏幕指纹：提问（或提问过短时回答）前缀，只留字母/数字——
+    /// CC 渲染会加 "❯ " 前缀、按宽度折行、吃掉 markdown 标记（反引号/星号），
+    /// 空白和标点一概不可信，滤掉后 contains 才稳。过短指纹（如「继续」）
+    /// 误匹配率高，返回 nil = 该轮不可定位。
+    static func turnKey(_ t: ConversationTurn) -> String? {
+        for source in [t.prompt, t.reply] {
+            let key = String(matchable(source).prefix(24))
+            if key.count >= 6 { return key }
+        }
+        return nil
+    }
+
+    /// 屏幕文本（已去空白拼接）→ 所在轮次 id。多轮同屏时取最新的一轮。
+    static func locateTurn(screen: String, turns: [ConversationTurn]) -> String? {
+        guard !screen.isEmpty else { return nil }
+        var found: String?
+        for t in turns {
+            guard let key = turnKey(t) else { continue }
+            if screen.contains(key) { found = t.id }
+        }
+        return found
+    }
+
+    /// 定位活动 Claude 会话视口所在轮（时间轴亮线跟随浏览位置）。
+    /// onTick 每秒兜底 + 输出驱动（scheduleViewportLocate）快速跟随。
+    private func locateViewportTurn() {
+        guard let aid = activeId,
+              sessions.first(where: { $0.id == aid })?.kind == .claude,
+              let v = views[aid], let list = turns[aid], !list.isEmpty else { return }
+        if locatedSession != aid {
+            locatedSession = aid
+            viewportTurnId = nil
+        }
+        let screen = Self.matchable(v.visibleLines().joined())
+        if let located = Self.locateTurn(screen: screen, turns: list),
+           located != viewportTurnId {
+            viewportTurnId = located
+        }
+    }
+
+    private var locatePending = false
+
+    /// 滚动/输出后的快速定位：150ms 防抖（CC 滚一屏会连发多帧重绘，抖动期
+    /// 只定位一次），比 1s 的 tick 兜底灵敏一个量级，亮线才能跟手。
+    func scheduleViewportLocate() {
+        guard !locatePending else { return }
+        locatePending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            self.locatePending = false
+            self.locateViewportTurn()
+        }
+    }
+
+    /// 点击刻度线：闭环滚动到目标轮。两阶段——目标指纹不在屏时按轮距大步
+    /// 粗滚逼近；上屏后小步微调，把该轮开头推进屏幕上部才算「点到哪定位到哪」。
+    /// 10 秒超时 + 屏幕连续不动（滚到尽头）兜底，不无限抢滚。
+    func jumpToTurn(_ turnId: String) {
+        guard let aid = activeId, let list = turns[aid],
+              let target = list.first(where: { $0.id == turnId }),
+              Self.turnKey(target) != nil, views[aid] != nil else { return }
+        jumpTargetId = turnId
+        jumpDeadline = Date().addingTimeInterval(10)
+        jumpLastScreen = nil
+        jumpStallTicks = 0
+        if jumpTimer == nil {
+            jumpTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+                self?.onJumpTick()
+            }
+        }
+        onJumpTick()
+    }
+
+    private func stopJump() {
+        jumpTimer?.invalidate()
+        jumpTimer = nil
+        jumpTargetId = nil
+        jumpLastScreen = nil
+        jumpStallTicks = 0
+    }
+
+    /// 目标轮开头需进入屏幕的头部区域（前 1/3，至少 3 行）才停——只做到
+    /// 「指纹在屏上某处」时，目标可能刚在底缘露头，观感是没定位到。
+    private static func jumpSettleRow(totalRows: Int) -> Int { max(3, totalRows / 3) }
+
+    /// key 所在屏幕行（相邻两行拼接匹配，提问折行跨界也认得出）；不在屏返回 nil。
+    static func keyRow(in lines: [String], key: String) -> Int? {
+        let squeezed = lines.map { line in matchable(line) }
+        for i in squeezed.indices {
+            let pair = i + 1 < squeezed.count ? squeezed[i] + squeezed[i + 1] : squeezed[i]
+            if pair.contains(key) { return i }
+        }
+        return nil
+    }
+
+    private func onJumpTick() {
+        guard let targetId = jumpTargetId, Date() < jumpDeadline,
+              let aid = activeId, let v = views[aid], let list = turns[aid],
+              let targetIdx = list.firstIndex(where: { $0.id == targetId }),
+              let targetKey = Self.turnKey(list[targetIdx]) else { stopJump(); return }
+        let lines = v.visibleLines()
+        let screen = Self.matchable(lines.joined())
+        // 每拍实时更新当前定位：方向判断才不用陈旧位置（滞后 = 顿挫/过冲），
+        // 亮线也随跳转过程连续移动。
+        if let located = Self.locateTurn(screen: screen, turns: list) {
+            viewportTurnId = located
+        }
+        // 屏幕连续不动 = 滚到尽头/CC 不响应，接受现状收手。
+        if screen == jumpLastScreen {
+            jumpStallTicks += 1
+            if jumpStallTicks >= 6 { stopJump(); return }
+        } else {
+            jumpStallTicks = 0
+            jumpLastScreen = screen
+        }
+        if let row = Self.keyRow(in: lines, key: targetKey) {
+            // 精调：目标已上屏。行号偏下就继续向新方向小步推（滚轮 down 让
+            // 内容上移、行号变小），进入头部区域即settle。
+            viewportTurnId = targetId
+            if row <= Self.jumpSettleRow(totalRows: lines.count) { stopJump(); return }
+            v.sendProgrammaticAltScroll(up: false, lines: 2)
+            return
+        }
+        // 粗滚：方向 = 视口当前轮 → 目标轮；未定位时视为在底部（CC 默认跟随尾部）。
+        let curIdx = viewportTurnId.flatMap { id in list.firstIndex(where: { $0.id == id }) }
+            ?? (list.count - 1)
+        let up = targetIdx <= curIdx
+        let dist = abs(targetIdx - curIdx)
+        let step = dist > 4 ? 48 : (dist > 1 ? 24 : 10)
+        v.sendProgrammaticAltScroll(up: up, lines: step)
+    }
+
     /// ⌘⇧C：把活动 Claude 会话最近一条回复的纯文本写入剪贴板（直接读 CC 的 transcript，
     /// 见 AgentTranscript）。返回 false 表示当前不是 Claude 会话、定位不到 cwd、或没找到回复。
     /// 备用屏自管滚动、终端里抓不全长回复，故走结构化原文这条路。codex 暂未支持。
@@ -697,6 +936,12 @@ final class SessionStore: ObservableObject {
         ds.lastFeed = Date()
         ds.quietRefreshed = false
 
+        // 活动 Claude 会话的输出（含滚动重绘）驱动视口轮次快速定位（防抖 150ms），
+        // 时间轴亮线跟手；非活动会话不定位（刻度条只显示活动会话）。
+        if id == activeId, sessions[i].kind == .claude {
+            scheduleViewportLocate()
+        }
+
         // 普通 shell：有输出即 Working，沉寂后由 onTick 收回 Idle。
         let s = sessions[i]
         if !ds.hookSeen, !s.kind.isAgent {
@@ -748,6 +993,10 @@ final class SessionStore: ObservableObject {
         default: mapped = nil
         }
         if let (st, ph) = mapped { applyStatus(sid, st, ph) }
+        // hook 只可能来自 claude：比进程树（5s 一轮）更早确认 claude 活着。
+        markClaudeAlive(sid)
+        // hook 事件即对话推进的信号：顺带刷新时间轴刻度条的轮次数据（内部节流）。
+        refreshTurns(sid)
     }
 
     // MARK: - ticker：结算 / 类型识别 / 增量落盘
@@ -810,6 +1059,12 @@ final class SessionStore: ObservableObject {
                 cwdDirty = true
             }
         }
+        // 活动 Claude 会话：定位视口所在的对话轮（时间轴亮线跟随浏览位置）。
+        locateViewportTurn()
+        // 轮次数据常态刷新：对话推进（新轮写入 transcript）没有推送信号
+        //（hook 未必配置），每秒轮询兜底——内部 2s 节流、后台解析、
+        // 列表不变不发布，常态成本可忽略。
+        if let aid = activeId { refreshTurns(aid) }
         // ps 全表 fork+exec 不便宜：5s 一次足以跟上 claude/ssh 的启停。
         if tick % 5 == 0 { reclassifyTypes() }
         if tick % 5 == 2 { flushDirtyScrollback() }
@@ -843,6 +1098,13 @@ final class SessionStore: ObservableObject {
             if let ds = det[id] {
                 ds.kindConfirmed = kind.isAgent
                 if kind != .claude { ds.hookSeen = false }
+            }
+            // 时间轴轮次的归属边界：进程树确认 claude 起了才开始读会话文件，
+            // 退了立刻清（防止下一个 claude 把上一个会话当自己的历史）。
+            if kind == .claude {
+                markClaudeAlive(id)
+            } else if claudeSince[id] != nil {
+                clearClaudeTurns(id)
             }
             guard sessions[i].kind != kind else { continue }
             let wasAgent = sessions[i].kind.isAgent

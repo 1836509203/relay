@@ -3344,15 +3344,33 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// Relay patch: alternate-scroll — translate the wheel into cursor Up/Down
     /// key presses for apps that don't track the mouse (default `vim`, `less`,
     /// `man`). Honors DECCKM (applicationCursor) like real keystrokes do.
-    private func sendAlternateScrollKeys(up: Bool, lines: Int) {
+    private func sendAlternateScrollKeys(up: Bool, lines: Int, cap: Int = alternateScrollLineCap) {
         let seq = up
             ? (terminal.applicationCursor ? EscapeSequences.moveUpApp : EscapeSequences.moveUpNormal)
             : (terminal.applicationCursor ? EscapeSequences.moveDownApp : EscapeSequences.moveDownNormal)
-        let count = max (1, min (lines, Self.alternateScrollLineCap))
+        let count = max (1, min (lines, cap))
         var bytes: [UInt8] = []
         bytes.reserveCapacity(seq.count * count)
         for _ in 0..<count { bytes.append(contentsOf: seq) }
         send(bytes)
+    }
+
+    /// Relay patch: 编程触发的备用屏滚动（时间轴刻度条「点击跳转到某轮对话」
+    /// 的执行器）。与真实滚轮完全同路径：程序开鼠标跟踪时发滚轮上报（按钮 4/5），
+    /// 否则退化为方向键。非备用屏 no-op。限幅比手势路径宽（跳转跨几轮对话动辄
+    /// 数千行，10 行/拍到不了），步长节奏由调用方闭环控制。
+    public func sendProgrammaticAltScroll(up: Bool, lines: Int) {
+        guard terminal.isDisplayBufferAlternate else { return }
+        if selection.active && !isSelectionDragInProgress {
+            ensureBrowseSelectionAnchor()
+        }
+        let cap = 64
+        let point = CGPoint(x: bounds.midX, y: bounds.midY)
+        if allowMouseReporting && terminal.mouseMode != .off {
+            sendAlternateMouseWheel(up: up, lines: lines, at: point, modifierFlags: [], cap: cap)
+        } else {
+            sendAlternateScrollKeys(up: up, lines: lines, cap: cap)
+        }
     }
 
     /// Relay patch: send the wheel as mouse-button reports (button 4 = up,
@@ -3362,14 +3380,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         sendAlternateMouseWheel(up: up, lines: lines, at: convert(event.locationInWindow, from: nil), modifierFlags: event.modifierFlags)
     }
 
-    private func sendAlternateMouseWheel(up: Bool, lines: Int, at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
+    private func sendAlternateMouseWheel(up: Bool, lines: Int, at point: CGPoint, modifierFlags: NSEvent.ModifierFlags, cap: Int = alternateScrollLineCap) {
         let displayBuffer = terminal.displayBuffer
         let hit = calculateMouseHit(at: point)
         let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
         let buttonFlags = terminal.encodeButton(
             button: up ? 4 : 5, release: false,
             shift: modifierFlags.contains(.shift), meta: modifierFlags.contains(.option), control: modifierFlags.contains(.control))
-        let count = max (1, min (lines, Self.alternateScrollLineCap))
+        let count = max (1, min (lines, cap))
         for _ in 0..<count {
             terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }

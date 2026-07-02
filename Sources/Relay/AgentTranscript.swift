@@ -35,6 +35,8 @@ enum AgentTranscript {
     }
 
     /// 目录里 mtime 最新的 .jsonl —— 即当前/最近活跃的会话 transcript。
+    /// 注意 --continue 沿用原文件追加（实测不新建），按文件创建时间界定
+    /// 「当前进程的会话」必误杀；进程边界用轮次 timestamp 过滤（见调用方）。
     /// 局限：同一 cwd 并发多个 CC 会话时只能取最近写入的那个（v1 取舍，精确映射需 hook 透传 sessionId）。
     static func newestTranscript(in dir: URL) -> URL? {
         let fm = FileManager.default
@@ -165,5 +167,175 @@ enum AgentTranscript {
             s = s.replacingOccurrences(of: "\n\n\n", with: "\n\n")
         }
         return s.isEmpty ? nil : s
+    }
+}
+
+// MARK: - 对话轮次（左缘时间轴刻度条的数据源）
+
+/// 一轮对话：用户提问 + assistant 回答摘要。回答进行中时 reply 为空。
+struct ConversationTurn: Identifiable, Equatable {
+    let prompt: String
+    let reply: String
+    let timestamp: Date?
+    /// 内容派生的稳定 id：读取窗口大小变化时轮次序号会漂，时间戳（毫秒级）
+    /// + 提问前缀跨刷新稳定。
+    var id: String { "\(timestamp?.timeIntervalSince1970 ?? 0)|\(prompt.prefix(32))" }
+}
+
+extension AgentTranscript {
+
+    /// 给定工作目录，列出候选会话文件（mtime 降序前 limit 个）。哪个才是
+    /// 「这个终端里跑着的 CC」不能按文件时间猜（同 cwd 可并发多个会话、
+    /// --continue 沿用旧文件），由调用方拿屏幕内容匹配后绑定。
+    static func candidateTranscripts(forCwd cwd: String, limit: Int = 4) -> [URL] {
+        let dir = claudeProjectDir(forCwd: cwd)
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return items
+            .filter { $0.pathExtension == "jsonl" }
+            .sorted(by: { modDate($0) > modDate($1) })
+            .prefix(limit)
+            .map { $0 }
+    }
+
+    /// 读 transcript 尾部原始文本（不解析），供屏幕内容归属匹配用。
+    static func tailText(of url: URL, maxBytes: UInt64 = 2 * 1024 * 1024) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd(), end > 0 else { return "" }
+        let start = end > maxBytes ? end - maxBytes : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.readToEnd() else { return "" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// 从 transcript 尾部窗口解析轮次。工具输出重的会话一轮可占数 MB，2MB 起步、
+    /// 轮次不够就翻倍扩窗，封顶 16MB（再早的轮次放弃——刻度条只展示近端）。
+    static func recentTurns(fromTranscript url: URL, limit: Int) -> [ConversationTurn] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd(), end > 0 else { return [] }
+        var window: UInt64 = 2 * 1024 * 1024
+        let cap: UInt64 = 16 * 1024 * 1024
+        while true {
+            let isWhole = window >= end
+            let start = isWhole ? 0 : end - window
+            guard (try? handle.seek(toOffset: start)) != nil,
+                  let data = try? handle.readToEnd() else { return [] }
+            var text = String(decoding: data, as: UTF8.self)
+            if start > 0, let nl = text.firstIndex(of: "\n") {
+                text = String(text[text.index(after: nl)...])
+            }
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+            let turns = parseTurns(lines: lines, limit: limit, droppedHead: start > 0)
+            if turns.count >= limit || isWhole || window >= cap { return turns }
+            window *= 2
+        }
+    }
+
+    private enum TurnEvent {
+        case prompt(String, Date?)
+        case reply(String)
+        case compactBoundary
+    }
+
+    /// userPrompt 开新轮，随后的 assistantText 累进该轮回答摘要（摘要够长即止）。
+    /// 上下文压缩（compact）边界清空累积：CC 恢复/压缩后只重绘边界之后的内容，
+    /// 更早的轮次在终端里滚不到——刻度条与 CC 的可浏览范围对齐，点击才可达。
+    static func parseTurns(lines: [Substring], limit: Int, droppedHead: Bool) -> [ConversationTurn] {
+        var acc: [(prompt: String, reply: String, ts: Date?)] = []
+        // 窗口从中间截断时，第一个提问之前的行属于上一轮的残段，丢弃。
+        var sawBoundary = !droppedHead
+        for line in lines {
+            guard let event = turnEvent(line) else { continue }
+            switch event {
+            case .prompt(let p, let ts):
+                sawBoundary = true
+                acc.append((prompt: p, reply: "", ts: ts))
+            case .reply(let r):
+                guard sawBoundary, !acc.isEmpty, acc[acc.count - 1].reply.count < 400 else { continue }
+                let prev = acc[acc.count - 1].reply
+                acc[acc.count - 1].reply = prev.isEmpty ? r : prev + "\n" + r
+            case .compactBoundary:
+                sawBoundary = true
+                acc.removeAll()
+            }
+        }
+        return acc.suffix(limit).map { t in
+            ConversationTurn(
+                prompt: snip(t.prompt, 160), reply: snip(t.reply, 400), timestamp: t.ts)
+        }
+    }
+
+    /// 单行 → 轮次事件。与 classify 同规则，但带出文本与时间戳；额外过滤
+    /// 斜杠命令回显 / 注入元信息 / 中断标记这三类非真实提问。
+    private static func turnEvent(_ line: Substring) -> TurnEvent? {
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let type = obj["type"] as? String else { return nil }
+        if obj["isCompactSummary"] as? Bool == true { return .compactBoundary }
+        if obj["isSidechain"] as? Bool == true { return nil }
+        if obj["isMeta"] as? Bool == true { return nil }
+        guard let message = obj["message"] as? [String: Any] else { return nil }
+        let content = message["content"]
+
+        switch type {
+        case "user":
+            var text: String?
+            if let s = content as? String {
+                text = s
+            } else if let arr = content as? [[String: Any]] {
+                let hasToolResult = arr.contains { ($0["type"] as? String) == "tool_result" }
+                if !hasToolResult {
+                    let parts = arr.compactMap { block -> String? in
+                        guard (block["type"] as? String) == "text" else { return nil }
+                        return block["text"] as? String
+                    }
+                    if !parts.isEmpty { text = parts.joined(separator: "\n") }
+                }
+            }
+            guard var t = text?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty
+            else { return nil }
+            if t.hasPrefix("This session is being continued") { return .compactBoundary }
+            if t.hasPrefix("<command-") || t.hasPrefix("<local-command")
+                || t.hasPrefix("[Request interrupted") { return nil }
+            t = t.replacingOccurrences(of: "\n", with: " ")
+            return .prompt(t, parseTimestamp(obj["timestamp"] as? String))
+
+        case "assistant":
+            if let arr = content as? [[String: Any]] {
+                let texts = arr.compactMap { block -> String? in
+                    guard (block["type"] as? String) == "text" else { return nil }
+                    let t = (block["text"] as? String) ?? ""
+                    return t.isEmpty ? nil : t
+                }
+                if !texts.isEmpty { return .reply(texts.joined(separator: "\n")) }
+            } else if let s = content as? String, !s.isEmpty {
+                return .reply(s)
+            }
+            return nil
+
+        default:
+            return nil
+        }
+    }
+
+    private static let isoParser: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private static func parseTimestamp(_ raw: String?) -> Date? {
+        guard let raw else { return nil }
+        return isoParser.date(from: raw)
+            ?? ISO8601DateFormatter().date(from: raw)
+    }
+
+    private static func snip(_ s: String, _ max: Int) -> String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.count > max else { return t }
+        return String(t.prefix(max)) + "…"
     }
 }

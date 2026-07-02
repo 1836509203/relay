@@ -152,8 +152,10 @@ struct AppSettings: Codable {
     var sidebarWidth: Double = 232
     /// 自动检查更新（启动后台 + 每 24h 查 GitHub Releases，有新版发通知）。
     var autoUpdateCheck: Bool = true
-    /// Codex 风格外观设置。
-    var translucentSidebar: Bool = true
+    /// Codex 风格外观设置。默认关闭：侧栏与主工作区同取主题实底、聚焦失焦
+    /// 观感一致；开启后侧栏在聚焦时走 behind-window 毛玻璃（会与主区实底产生
+    /// 明暗差，介意割裂感就保持关闭）。
+    var translucentSidebar: Bool = false
     /// 侧栏任务聚合方式：默认按工具类型聚合，让 Codex/Claude/OpenCode 任务分开。
     var taskGrouping: SidebarTaskGrouping = .type
     var uiContrast: Double = 60
@@ -189,7 +191,7 @@ struct AppSettings: Codable {
         sidebarVisible = (try? c.decode(Bool.self, forKey: .sidebarVisible)) ?? true
         sidebarWidth = (try? c.decode(Double.self, forKey: .sidebarWidth)) ?? 232
         autoUpdateCheck = (try? c.decode(Bool.self, forKey: .autoUpdateCheck)) ?? true
-        translucentSidebar = (try? c.decode(Bool.self, forKey: .translucentSidebar)) ?? true
+        translucentSidebar = (try? c.decode(Bool.self, forKey: .translucentSidebar)) ?? false
         taskGrouping = (try? c.decode(SidebarTaskGrouping.self, forKey: .taskGrouping)) ?? .type
         uiContrast = (try? c.decode(Double.self, forKey: .uiContrast)) ?? 60
         customAccentHex = try? c.decode(UInt32.self, forKey: .customAccentHex)
