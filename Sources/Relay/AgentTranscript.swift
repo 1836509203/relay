@@ -271,8 +271,20 @@ extension AgentTranscript {
         }
     }
 
-    /// 单行 → 轮次事件。与 classify 同规则，但带出文本与时间戳；额外过滤
-    /// 斜杠命令回显 / 注入元信息 / 中断标记这三类非真实提问。
+    /// 提取 <tag>…</tag> 的内容（去首尾空白、剥 ANSI 转义——命令 stdout
+    /// 回显常带 ESC[2m 之类装饰）；无闭合标签返回 nil。
+    private static func tagContent(_ s: String, _ tag: String) -> String? {
+        guard let open = s.range(of: "<\(tag)>"),
+              let close = s.range(of: "</\(tag)>", range: open.upperBound..<s.endIndex)
+        else { return nil }
+        let inner = String(s[open.upperBound..<close.lowerBound])
+            .replacingOccurrences(of: "\u{1b}\\[[0-9;]*m", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return inner.isEmpty ? nil : inner
+    }
+
+    /// 单行 → 轮次事件。与 classify 同规则，但带出文本与时间戳；注入元信息、
+    /// 中断标记等非真实输入过滤，斜杠命令回显转为轮次。
     private static func turnEvent(_ line: Substring) -> TurnEvent? {
         guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
               let type = obj["type"] as? String else { return nil }
@@ -300,6 +312,19 @@ extension AgentTranscript {
             guard var t = text?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty
             else { return nil }
             if t.hasPrefix("This session is being continued") { return .compactBoundary }
+            // 斜杠命令回显也算一轮：屏幕上它是用户的一次输入（/compact、/model…），
+            // 刻度按输入导航；命令的 stdout 回显累进为该轮「回答」。
+            if t.hasPrefix("<command-name>") {
+                guard let name = tagContent(t, "command-name"), !name.isEmpty else { return nil }
+                let args = tagContent(t, "command-args") ?? ""
+                let cmd = args.isEmpty ? name : "\(name) \(args)"
+                return .prompt(cmd, parseTimestamp(obj["timestamp"] as? String))
+            }
+            if t.hasPrefix("<local-command-stdout>") {
+                guard let out = tagContent(t, "local-command-stdout"), !out.isEmpty
+                else { return nil }
+                return .reply(out)
+            }
             if t.hasPrefix("<command-") || t.hasPrefix("<local-command")
                 || t.hasPrefix("[Request interrupted") { return nil }
             t = t.replacingOccurrences(of: "\n", with: " ")
