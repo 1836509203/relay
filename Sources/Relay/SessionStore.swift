@@ -507,9 +507,6 @@ final class SessionStore: ObservableObject {
         turnsRefreshedAt[sid] = now
         guard let cwd = liveCwd[sid] ?? s.cwd, !cwd.isEmpty else { return }
         let bound = boundTranscript[sid]
-        // claude 本次启动时刻（进程树/hook 首次确认）：决定 compact 边界是否
-        // 截断——启动前的边界截（重绘范围外滚不到），启动后的不截（不清屏）。
-        let started = claudeSince[sid]
         // 屏幕行主线程取（视图非线程安全），绑定匹配用。
         let screenLines = bound == nil ? (views[sid]?.visibleLines() ?? []) : []
         turnsQueue.async { [weak self] in
@@ -526,9 +523,8 @@ final class SessionStore: ObservableObject {
                 return
             }
             if let mtime { self.turnsParsedMtime[sid] = mtime }
-            let list = AgentTranscript.recentTurns(
-                fromTranscript: url, limit: 32, startedAt: started)
-            Self.railLog("parsed(\(sid.prefix(5))) \(url.lastPathComponent) turns=\(list.count) started=\(started.map { "\($0)" } ?? "nil")")
+            let list = AgentTranscript.recentTurns(fromTranscript: url, limit: 32)
+            Self.railLog("parsed(\(sid.prefix(5))) \(url.lastPathComponent) turns=\(list.count)")
             DispatchQueue.main.async {
                 if self.boundTranscript[sid] == nil { self.boundTranscript[sid] = url }
                 if self.turns[sid] != list {

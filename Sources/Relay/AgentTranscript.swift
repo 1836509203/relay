@@ -213,9 +213,7 @@ extension AgentTranscript {
 
     /// 从 transcript 尾部窗口解析轮次。工具输出重的会话一轮可占数 MB，2MB 起步、
     /// 轮次不够就翻倍扩窗，封顶 16MB（再早的轮次放弃——刻度条只展示近端）。
-    static func recentTurns(
-        fromTranscript url: URL, limit: Int, startedAt: Date? = nil
-    ) -> [ConversationTurn] {
+    static func recentTurns(fromTranscript url: URL, limit: Int) -> [ConversationTurn] {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? handle.close() }
         guard let end = try? handle.seekToEnd(), end > 0 else { return [] }
@@ -231,8 +229,7 @@ extension AgentTranscript {
                 text = String(text[text.index(after: nl)...])
             }
             let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-            let turns = parseTurns(
-                lines: lines, limit: limit, droppedHead: start > 0, startedAt: startedAt)
+            let turns = parseTurns(lines: lines, limit: limit, droppedHead: start > 0)
             if turns.count >= limit || isWhole || window >= cap { return turns }
             window *= 2
         }
@@ -245,13 +242,12 @@ extension AgentTranscript {
     }
 
     /// userPrompt 开新轮，随后的 assistantText 累进该轮回答摘要（摘要够长即止）。
-    /// 上下文压缩（compact）边界的截断规则看它发生在 agent 本次启动前还是后：
-    /// 启动时 CC 只重绘最近边界之后的内容（更早的滚不到，必须截掉）；但启动后
-    /// 进行中的 compact 不清屏，边界之前的轮次仍在屏上可浏览可跳达，不截。
-    /// startedAt=nil 或边界无时间戳时保守截断（宁少显示不给跳不到的刻度）。
-    static func parseTurns(
-        lines: [Substring], limit: Int, droppedHead: Bool, startedAt: Date? = nil
-    ) -> [ConversationTurn] {
+    /// 一次问答 = 一条刻度：近 limit 轮全部显示，不按 compact 边界截断——
+    /// 用户的心智模型是「聊了几轮就有几条」，刻度缺失比跳转不精确更伤。
+    /// 压缩点之前的轮次可能在 CC 重绘范围外，点击跳转 best effort（粗滚到
+    /// 可浏览最顶由 stall 检测收手）。compactBoundary 仍需识别：恢复注入的
+    /// 续接摘要不是真实提问，不能当成一轮。
+    static func parseTurns(lines: [Substring], limit: Int, droppedHead: Bool) -> [ConversationTurn] {
         var acc: [(prompt: String, reply: String, ts: Date?)] = []
         // 窗口从中间截断时，第一个提问之前的行属于上一轮的残段，丢弃。
         var sawBoundary = !droppedHead
@@ -265,11 +261,8 @@ extension AgentTranscript {
                 guard sawBoundary, !acc.isEmpty, acc[acc.count - 1].reply.count < 400 else { continue }
                 let prev = acc[acc.count - 1].reply
                 acc[acc.count - 1].reply = prev.isEmpty ? r : prev + "\n" + r
-            case .compactBoundary(let ts):
+            case .compactBoundary:
                 sawBoundary = true
-                let cutsOff: Bool
-                if let startedAt, let ts { cutsOff = ts < startedAt } else { cutsOff = true }
-                if cutsOff { acc.removeAll() }
             }
         }
         return acc.suffix(limit).map { t in
