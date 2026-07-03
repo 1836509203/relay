@@ -155,9 +155,11 @@ private struct TimelineTick: View {
     private var tickColor: Color {
         // 当前所在轮始终满亮；其余静默时是半透明主色（视觉为灰但要一眼可见，
         // 0.38 在深底上近乎隐形），被光标带起时向满亮白过渡——Codex 的 hover
-        // 中心是白线，不是亮灰。
+        // 中心是白线，不是亮灰。压缩点之前（跳转到不了）的轮次打暗一半，
+        // 视觉上就能分出「可精确跳达」与「best effort」两段。
         if isCurrent { return Theme.sidebarPrimary }
-        return Theme.sidebarPrimary.opacity(0.52 + 0.48 * lift)
+        let base = turn.reachable ? 0.52 : 0.26
+        return Theme.sidebarPrimary.opacity(base + (1 - base) * lift)
     }
 
     private var preview: some View {
@@ -170,11 +172,16 @@ private struct TimelineTick: View {
                 .font(Theme.uiFont(size: 11.5))
                 .foregroundColor(Theme.sidebarSecondary)
                 .lineLimit(4)
-            if let ts = turn.timestamp {
-                Text(Self.relativeTime(ts))
-                    .font(Theme.uiFont(size: 10.5))
-                    .foregroundColor(Theme.sidebarSecondary.opacity(0.7))
+            HStack(spacing: 6) {
+                if let ts = turn.timestamp {
+                    Text(Self.relativeTime(ts))
+                }
+                if !turn.reachable {
+                    Text("已压缩 · 点击滚到最早可见处")
+                }
             }
+            .font(Theme.uiFont(size: 10.5))
+            .foregroundColor(Theme.sidebarSecondary.opacity(0.7))
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 10)

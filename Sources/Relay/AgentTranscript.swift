@@ -177,6 +177,9 @@ struct ConversationTurn: Identifiable, Equatable {
     let prompt: String
     let reply: String
     let timestamp: Date?
+    /// 是否在 CC 当前重绘范围内（最后一个 compact 边界之后）。压缩点之前的
+    /// 轮次终端里物理滚不到：刻度打暗、点击 best effort 滚到最早可见处。
+    var reachable: Bool = true
     /// 内容派生的稳定 id：读取窗口大小变化时轮次序号会漂，时间戳（毫秒级）
     /// + 提问前缀跨刷新稳定。
     var id: String { "\(timestamp?.timeIntervalSince1970 ?? 0)|\(prompt.prefix(32))" }
@@ -251,6 +254,8 @@ extension AgentTranscript {
         var acc: [(prompt: String, reply: String, ts: Date?)] = []
         // 窗口从中间截断时，第一个提问之前的行属于上一轮的残段，丢弃。
         var sawBoundary = !droppedHead
+        // 最后一个 compact 边界出现时已积累的轮数：之前的轮次在 CC 重绘范围外。
+        var boundaryAt = 0
         for line in lines {
             guard let event = turnEvent(line) else { continue }
             switch event {
@@ -263,11 +268,14 @@ extension AgentTranscript {
                 acc[acc.count - 1].reply = prev.isEmpty ? r : prev + "\n" + r
             case .compactBoundary:
                 sawBoundary = true
+                boundaryAt = acc.count
             }
         }
-        return acc.suffix(limit).map { t in
+        let dropped = max(0, acc.count - limit)
+        return acc.suffix(limit).enumerated().map { i, t in
             ConversationTurn(
-                prompt: snip(t.prompt, 160), reply: snip(t.reply, 400), timestamp: t.ts)
+                prompt: snip(t.prompt, 160), reply: snip(t.reply, 400), timestamp: t.ts,
+                reachable: dropped + i >= boundaryAt)
         }
     }
 
