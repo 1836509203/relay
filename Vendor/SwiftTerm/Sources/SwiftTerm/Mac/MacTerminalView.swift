@@ -327,7 +327,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             NotificationCenter.default.removeObserver (resignMainObserver)
         }
         progressReportTimer?.invalidate()
-        selectionAutoScrollTimer?.invalidate()
     }
     
     func setupFocusNotification() {
@@ -617,13 +616,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func linefeed(source: Terminal) {
-        // Relay patch: 普通拖拽现在默认本地划选，含运行中的 Claude Code/Codex 等
-        // 全屏 TUI（见 mouseReportingRequested）。备用屏幕里输出会持续刷新换行，
-        // 若每个换行都 selectNone()，用户刚从流式 agent 输出里划下的选区会被瞬间
-        // 抹掉，等于选不了。故备用屏幕保留选区（键入时 keyDown 已会清选区，不冲突）；
-        // 主屏幕维持原行为：换行入滚动历史时清选区，避免选区坐标随内容上滚而错位——
-        // 但拖拽划选进行中（isSelectionDragInProgress）也保留，以支持「下拖自动滚动选中」。
-        if allowMouseReporting && !terminal.isCurrentBufferAlternate && !isSelectionDragInProgress {
+        // Relay patch: 主屏维持原行为（换行入滚动历史时清选区，避免选区坐标随内容
+        // 上滚而错位）；备用屏（Claude Code/codex 等全屏 TUI）坐标稳定且输出持续
+        // 刷新，若每个换行都 selectNone()，用户按 ⌥ 划下的选区会被瞬间抹掉。
+        if allowMouseReporting && !terminal.isCurrentBufferAlternate {
             selection.selectNone()
         }
     }
@@ -1818,7 +1814,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             case Int(NSFindPanelAction.previous.rawValue):
                 return true
             case Int(NSFindPanelAction.setFindString.rawValue):
-                return hasCopyableSelection()
+                return selection.active
             default:
                 return false
             }
@@ -1838,7 +1834,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 case .previousMatch:
                     return true
                 case .setSearchString:
-                    return hasCopyableSelection()
+                    return selection.active
                 default:
                     return false
                 }
@@ -1849,7 +1845,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         case #selector(selectAll(_:)):
             return true
         case #selector(copy(_:)):
-            return hasCopyableSelection()
+            return selection.active
         default:
             print ("Validating User Interface Item: \(item)")
             return false
@@ -1913,7 +1909,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     private func setFindPasteboardFromSelection() {
-        let selected = selectedTextForCopy()
+        let selected = selection.getSelectedText()
         guard !selected.isEmpty else {
             return
         }
@@ -1970,7 +1966,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private func showFindBar(prefillSelection: Bool) {
         let bar = ensureFindBar()
         bar.isHidden = false
-        let selectedText = prefillSelection ? selectedTextForCopy() : nil
+        let selectedText = prefillSelection ? selection.getSelectedText() : nil
         let initial = (selectedText?.isEmpty == false) ? selectedText : findPasteboardString()
         if let initial {
             bar.searchText = initial
@@ -2002,9 +1998,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func selectionChanged(source: Terminal) {
-        if selection == nil || !selection.active || !terminal.isDisplayBufferAlternate {
-            resetAlternateSelectionAutoScrollCapture()
-        }
         #if canImport(MetalKit)
         if metalView != nil {
             let buffer = terminal.displayBuffer
@@ -2061,22 +2054,23 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     open func copy(_ sender: Any)
     {
         // find the selected range of text in the buffer and put in the clipboard
-        let str = selectedTextForCopy()
+        let str = selection.getSelectedText()
         guard !str.isEmpty else {
             return
         }
-        
+
         let clipboard = NSPasteboard.general
         clipboard.clearContents()
         clipboard.setString(str, forType: .string)
     }
 
+    // Relay patch: 右键菜单（拷贝/粘贴/全选）。
     open override func menu(for event: NSEvent) -> NSMenu? {
         let menu = NSMenu()
 
         let copyItem = menu.addItem(withTitle: "拷贝", action: #selector(copy(_:)), keyEquivalent: "")
         copyItem.target = self
-        copyItem.isEnabled = hasCopyableSelection()
+        copyItem.isEnabled = selection.active
 
         let pasteItem = menu.addItem(withTitle: "粘贴", action: #selector(paste(_:)), keyEquivalent: "")
         pasteItem.target = self
@@ -2087,11 +2081,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         selectAllItem.target = self
         return menu
     }
-    
+
     public override func selectAll(_ sender: Any?)
     {
-        resetAlternateSelectionAutoScrollCapture()
-        browseSelectionAnchor = nil
         selectAll ()
     }
     
@@ -2144,865 +2136,28 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     private var autoScrollDelta = 0
-    private var selectionAutoScrollTimer: Timer?
-    private var selectionAutoScrollPoint: CGPoint = .zero
-    // mouseDown 记录的选区锚点：保证拖拽划选从「真正按下的格子」开始，而非拖动第一帧的采样点。
-    private var pendingSelectionAnchor: Position?
-
-    enum MouseInteractionOwner {
-        case none
-        case localSelection
-        case localSelectionAutoScrolling
-        case terminalApp
-    }
-
-    // 拖拽划选进行中标志：为 true 时，流式输出（feedPrepare / linefeed）不得清掉选区，
-    // 否则在 Claude Code/codex 等持续刷新的程序里，用户刚划下的选区会被下一帧抹掉，根本选不中。
-    // mouseDragged 置 true，mouseDown / mouseUp 复位。非 private：feedPrepare 在
-    // AppleTerminalView.swift 的同模块扩展里需读取它。
-    var isSelectionDragInProgress = false
-    private var mouseInteractionOwner: MouseInteractionOwner = .none
-
-    enum AlternateSelectionAutoScrollDirection {
-        case up
-        case down
-    }
-
-    private var alternateSelectionAutoScrollText: String?
-    private var alternateSelectionAutoScrollDirection: AlternateSelectionAutoScrollDirection?
-    private var alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-    /// 内容跟踪基线：上一次可信帧的可见屏全宽文本（每行 trimRight），用于逐帧检测程序把内容
-    /// 实际滚了几行（detectAlternateContentShift）——这是「高亮选区跟随内容平移」和「累积器
-    /// 确定性追加」的共同依据。非 nil 即「跟踪已武装」。撕裂帧（检测失败）不换基线：等完整帧
-    /// 到齐后与老基线一次对出跨块累计平移量。
-    private var alternateSelectionAutoScrollLastScreen: [String]?
-    /// 基线对应的 yDisp：本地视口滚动（yDisp 变化）也会让整屏 dump 平移，但那不是程序滚内容，
-    /// 拿去对齐会骗出假平移量——yDisp 一变就只重建基线、不平移选区。
-    private var alternateSelectionTrackingYDisp = 0
-    /// 连续检测失败（撕裂帧/整屏换内容）次数。真实 CC 的一帧重绘常拆成多个 PTY 块到达，每块
-    /// 都触发一次 feedFinish——只画了一半的撕裂帧对不出可信平移量是常态（v0.5.8 只看转发后第
-    /// 一个 feed，正是被这点打穿：半帧污染累积器、完整帧被跳过、锚点永远没平移）。连续多次
-    /// 失败才判定内容真被整体换掉。
-    private var alternateSelectionTrackingFailures = 0
-    private static let alternateSelectionTrackingMaxFailures = 4
-    /// 连续多少个 20Hz tick 仍在等上一次转发的 feedFinish 回调。用于节流「至多一个在途转发」，
-    /// 避免程序重绘跟不上时被连续糊进多个滚轮事件，导致前后两次捕获对不上、拼接静默丢段。
-    private var alternateSelectionAutoScrollStalledTicks = 0
-    /// 自愈上限：约 150ms（20Hz）。程序正常重绘远快于此；真等到这个数就当它没吃这次滚轮，
-    /// 放弃等待照常推进，避免拖拽整段卡死（对齐旧 harvest 看门狗的自愈精神，但不必单开 Timer）。
-    private static let alternateSelectionAutoScrollMaxStalledTicks = 3
-
-    // 测试钩子：选区自动滚动 timer 是否处于武装状态。守护"驱动自动滚动的 timer 接线"。
-    var selectionAutoScrollIsActive: Bool { selectionAutoScrollTimer != nil }
-
-    func selectionAutoScrollVelocity (distanceFromEdge: CGFloat) -> Int
-    {
-        let cellHeight = max(cellDimension?.height ?? 1, 1)
-        let cellDistance = max(1, Int(ceil(distanceFromEdge / cellHeight)))
-        // 越往窗口外拖，滚得越快——长日志里靠近边缘是精修、拖远是快进，不会"像卡住"。
-        switch cellDistance {
-        case 0...1:
-            return 1
-        case 2...3:
-            return 2
-        case 4...6:
-            return 4
-        case 7...12:
-            return 8
-        default:
-            return 16
-        }
-    }
-
-    private func selectionAutoScrollDeltaIgnoringSelectionState (for point: CGPoint) -> Int
-    {
-        guard terminal.displayBuffer.rows > 0 else {
-            return 0
-        }
-        // 备用屏现在也有 scrollback（见 Terminal init），故和主屏一样参与划选自动滚动：
-        // 拖到边缘时本地滚动露出历史行，选区连续延伸进 scrollback（iTerm2 式）。
-        let edgeInset = max((cellDimension?.height ?? 1) * 1.5, 24)
-        if point.y < edgeInset {
-            return selectionAutoScrollVelocity(distanceFromEdge: edgeInset - point.y)
-        }
-        if point.y > bounds.height - edgeInset {
-            return -selectionAutoScrollVelocity(distanceFromEdge: point.y - (bounds.height - edgeInset))
-        }
-        return 0
-    }
-
-    func selectionAutoScrollDelta (for point: CGPoint) -> Int
-    {
-        guard selection?.active == true else {
-            return 0
-        }
-        return selectionAutoScrollDeltaIgnoringSelectionState(for: point)
-    }
-
-    private func selectionPosition (for point: CGPoint) -> Position
-    {
-        let displayBuffer = terminal.displayBuffer
-        let cellWidth = max(cellDimension.width, 1)
-        let cellHeight = max(cellDimension.height, 1)
-        let x = min(max(point.x, 0), max(bounds.width - 1, 0))
-        let y = min(max(point.y, 0), max(bounds.height - 1, 0))
-        let col = min(max(0, Int(x / cellWidth)), terminal.cols - 1)
-        let screenRow = Int((bounds.height - y) / cellHeight)
-        let clampedScreenRow = min(max(0, screenRow), max(0, displayBuffer.rows - 1))
-        let maxRow = max(0, displayBuffer.lines.count - 1)
-        let row = min(max(0, displayBuffer.yDisp + clampedScreenRow), maxRow)
-        return Position(col: col, row: row)
-    }
-
-    private func selectionAutoScrollEdgePosition (delta: Int, point: CGPoint) -> Position
-    {
-        let displayBuffer = terminal.displayBuffer
-        let cellWidth = max(cellDimension.width, 1)
-        let x = min(max(point.x, 0), max(bounds.width - 1, 0))
-        let col = min(max(0, Int(x / cellWidth)), terminal.cols - 1)
-        let edgeScreenRow = delta < 0 ? 0 : max(0, displayBuffer.rows - 1)
-        let maxRow = max(0, displayBuffer.lines.count - 1)
-        let row = min(max(0, displayBuffer.yDisp + edgeScreenRow), maxRow)
-        return Position(col: col, row: row)
-    }
-
-    private func selectionDragPosition (for point: CGPoint) -> Position
-    {
-        let delta = selectionAutoScrollDeltaIgnoringSelectionState(for: point)
-        if delta != 0 {
-            return selectionAutoScrollEdgePosition(delta: delta, point: point)
-        }
-        return selectionPosition(for: point)
-    }
-
-    private func extendSelectionToAutoScrollEdge (direction: AlternateSelectionAutoScrollDirection, point: CGPoint? = nil)
-    {
-        let delta = direction == .up ? -1 : 1
-        selection.dragExtend(bufferPosition: selectionAutoScrollEdgePosition(delta: delta, point: point ?? selectionAutoScrollPoint))
-    }
-
-    private func ensureSelectionAutoScrollTimer ()
-    {
-        guard selectionAutoScrollTimer == nil else {
-            return
-        }
-        if mouseInteractionOwner == .localSelection {
-            mouseInteractionOwner = .localSelectionAutoScrolling
-        }
-        let timer = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] timer in
-            self?.scrollingTimerElapsed(source: timer)
-        }
-        selectionAutoScrollTimer = timer
-        RunLoop.main.add(timer, forMode: .eventTracking)
-        RunLoop.main.add(timer, forMode: .common)
-    }
-
-    private func stopSelectionAutoScroll ()
-    {
-        autoScrollDelta = 0
-        selectionAutoScrollTimer?.invalidate()
-        selectionAutoScrollTimer = nil
-        if mouseInteractionOwner == .localSelectionAutoScrolling {
-            mouseInteractionOwner = .localSelection
-        }
-    }
-
-    func updateSelectionAutoScroll (at point: CGPoint)
-    {
-        selectionAutoScrollPoint = point
-        autoScrollDelta = selectionAutoScrollDelta(for: point)
-        if autoScrollDelta == 0 {
-            stopSelectionAutoScroll()
-        } else {
-            ensureSelectionAutoScrollTimer()
-        }
-    }
-
-    @discardableResult
-    func performSelectionAutoScroll (delta: Int, point: CGPoint) -> Bool
-    {
-        guard selection.active, delta != 0 else {
-            return false
-        }
-
-        let direction: AlternateSelectionAutoScrollDirection = delta < 0 ? .up : .down
-        if shouldForwardAlternateSelectionAutoScroll(delta: delta) {
-            if alternateSelectionAutoScrollNeedsCaptureAfterFeed {
-                alternateSelectionAutoScrollStalledTicks += 1
-                if alternateSelectionAutoScrollStalledTicks < Self.alternateSelectionAutoScrollMaxStalledTicks {
-                    // 上一次转发还没等到程序重绘回调（trackAlternateSelectionContentAfterFeed
-                    // 尚未清掉这个标志）：本 tick 不追发，避免糊入第二个滚轮事件后两次捕获窗口错位、
-                    // joinedSelectionBlocks 找不到重叠而静默丢段。等下个 tick 再看，feed 一到位就正常推进。
-                    return false
-                }
-                // 等满自愈上限仍未等到回调：程序大概率没吃这次滚轮（忙/到顶/忽略），别再空等，
-                // 照常推进，避免拖拽整段卡死。
-            }
-            alternateSelectionAutoScrollStalledTicks = 0
-            extendSelectionToAutoScrollEdge(direction: direction, point: point)
-            if alternateSelectionAutoScrollText == nil {
-                // 只有本次拖拽第一次转发需要在这里补一次「转发前」快照——此时累积器还是空的，
-                // 没有任何历史可用。后续每个 tick 开头，屏幕内容其实还是上一 tick 结尾
-                // trackAlternateSelectionContentAfterFeed 刚采过的那一帧（本 tick
-                // 还没转发、程序还没重绘），在这里重复采样纯属多余。CC 界面常见的 spinner/
-                // 闪烁光标会让「同一帧」的两次取样并非逐字节相同，重复采样反而可能让重叠比对
-                // 因为这点无关紧要的动画差异找不到真实重叠，误判成新内容而重复拼接。
-                captureAlternateSelectionAutoScrollText(direction: direction)
-                // 基线若已在拖拽开始（mouseDragged）武装过则保持连续，否则此刻武装。
-                armAlternateSelectionTracking()
-            }
-            alternateSelectionAutoScrollNeedsCaptureAfterFeed = true
-            sendAlternateSelectionScroll(delta: delta, point: point)
-            didSelectionDrag = true
-            return true
-        }
-
-        if terminal.isDisplayBufferAlternate {
-            resetAlternateSelectionAutoScrollCapture()
-        }
-
-        let oldYDisp = terminal.displayBuffer.yDisp
-        let oldEnd = selection.end
-        if delta < 0 {
-            scrollUp(lines: -delta)
-        } else {
-            scrollDown(lines: delta)
-        }
-
-        extendSelectionToAutoScrollEdge(direction: direction, point: point)
-        didSelectionDrag = true
-        return terminal.displayBuffer.yDisp != oldYDisp || selection.end != oldEnd
-    }
-
-    private func canSelectionAutoScrollLocally(delta: Int) -> Bool {
-        let displayBuffer = terminal.displayBuffer
-        // Relay patch: 程序自管滚动（鼠标上报开启）且视图在实时屏时，拖选到边缘
-        // 不进本地 scrollback——里面是就地重绘的中间态（树枝装饰/半行），选到的是
-        // 脏行；返回 false 走转发路径让程序翻页+累积器拼接（与 scrollWheel 同语义）。
-        // 视图已在历史区（逃生舱显式进入的）则保持本地滚动，继续选历史行。
-        if terminal.isDisplayBufferAlternate && allowMouseReporting && terminal.mouseMode != .off
-            && displayBuffer.yDisp >= displayBuffer.yBase {
-            return false
-        }
-        let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
-        if delta < 0 {
-            return displayBuffer.yDisp > 0
-        }
-        return displayBuffer.yDisp < maxScrollback
-    }
-
-    private func shouldForwardAlternateSelectionAutoScroll(delta: Int) -> Bool {
-        // Relay patch: 拖拽划选到屏幕边缘、想继续选屏外内容时——先看终端本地是否还有可滚的
-        // 历史(canSelectionAutoScrollLocally：alt 若有 yBase>0 的历史就本地滚、扩选)。一旦
-        // 本地滚到头(CC/codex 的 yBase==0，屏外内容不在终端手里)，就把滚轮转发给程序让它就地
-        // 重绘上/下一屏，并在重绘后(trackAlternateSelectionContentAfterFeed)捕获新屏
-        // 的可见选中文本拼进累积器(alternateSelectionAutoScrollText)。这样「拖到边缘继续拖」
-        // 能连续选 CC 的长输出、松手 ⌘C 复制到的是完整拼接文本(selectedTextForCopy 走累积器)。
-        // 高亮：每个 feed 对一次整屏平移量，锚点随之平移(shiftDragAnchor)，仍在屏内的
-        // 已选内容保持高亮；滚出屏幕的部分无格可高亮(alt 无真历史行)，靠累积器保证复制完整。
-        // 只在「拖拽到边缘」这一刻按 20Hz 触发，不是 harvest 那种每帧 band-diff+prependScrollback，
-        // 不拖边缘就零开销。主屏(!alt)永远 false：主屏有真 scrollback，本地滚即可。
-        guard terminal.isDisplayBufferAlternate else { return false }
-        return !canSelectionAutoScrollLocally(delta: delta)
-    }
-
-    private func sendAlternateSelectionScroll (delta: Int, point: CGPoint)
-    {
-        let lines = max(1, min(abs(delta), Self.alternateScrollLineCap))
-        let goingUp = delta < 0
-        if allowMouseReporting && terminal.mouseMode != .off {
-            sendAlternateMouseWheel(up: goingUp, lines: lines, at: point, modifierFlags: [])
-        } else {
-            sendAlternateScrollKeys(up: goingUp, lines: lines)
-        }
-    }
-
-    func selectedTextForCopy () -> String
-    {
-        if selection.active, terminal.isDisplayBufferAlternate,
-           let text = alternateSelectionAutoScrollText, !text.isEmpty {
-            return text
-        }
-        if !selection.active, terminal.isDisplayBufferAlternate,
-           let text = browseSelectionAnchor?.text, !text.isEmpty {
-            return text
-        }
-        return Self.sanitizedCopiedText(selection.getSelectedText())
-    }
-
-    func hasCopyableSelection () -> Bool
-    {
-        if selection?.active == true {
-            return !selectedTextForCopy().isEmpty
-        }
-        if terminal.isDisplayBufferAlternate, let text = browseSelectionAnchor?.text {
-            return !text.isEmpty
-        }
-        return false
-    }
-
-    private func resetAlternateSelectionAutoScrollCapture ()
-    {
-        alternateSelectionAutoScrollText = nil
-        alternateSelectionAutoScrollDirection = nil
-        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-        alternateSelectionAutoScrollStalledTicks = 0
-        alternateSelectionAutoScrollLastScreen = nil
-        alternateSelectionTrackingFailures = 0
-    }
-
-    /// 浏览/封存态选区的「内容指纹」。增量平移跟踪（detect K）在浏览态有物理死角：触控板
-    /// 惯性一次滚几十行，帧间重叠为零，任何逐帧对齐都对不出来——真机表现为高亮「悬浮」在
-    /// 屏幕上不跟内容、几帧失配后被清掉。指纹制改为绝对定位：记住选中内容上下两端的文本
-    /// 窗口，每个 feed 在当前屏直接找回这段内容——快滚、撕裂帧、来回翻页都免疫；选区滚出
-    /// 屏幕时隐藏高亮（指纹保留），滚回来自动恢复；端点越界只是投影钳位，真实范围不丢。
-    struct BrowseSelectionAnchor {
-        /// 规范化选区（upper 在前），行号是「真实」值，允许越出可见屏（显示时投影钳位）。
-        var upperRow: Int
-        var lowerRow: Int
-        let upperCol: Int
-        let lowerCol: Int
-        /// 选区暂时滚出屏幕时仍可复制的封存文本。视觉高亮是当前屏幕投影，
-        /// 复制语义是用户原本框住的内容，二者不能绑死在 selection.active 上。
-        let text: String
-        /// 内容窗口（≤4 行屏幕文本，至少含一行非空白）+ 窗口首行相对 upperRow 的行差。
-        /// 两条：upper 侧与 lower 侧各一，长选区只剩一端在屏内时也能找回。锚在固定 UI 区
-        /// （CC 底部状态栏）的窗口会在首个滚动帧被识别并剔除（见 relocateBrowseSelection）。
-        var fingerprints: [(lines: [String], offset: Int)]
-    }
-    var browseSelectionAnchor: BrowseSelectionAnchor?
-    static let browseFingerprintWindow = 4
-
-    /// 拖拽/点选结束或滚轮浏览开始时建立指纹。已有指纹或无选区时不动。
-    func ensureBrowseSelectionAnchor ()
-    {
-        guard terminal.isDisplayBufferAlternate, selection.active, browseSelectionAnchor == nil else { return }
-        let screen = visibleAlternateScreenLines()
-        guard !screen.isEmpty else { return }
-        let visTop = terminal.displayBuffer.yDisp
-        let ordered = Position.compare(selection.start, selection.end) == .before
-            ? (upper: selection.start, lower: selection.end)
-            : (upper: selection.end, lower: selection.start)
-        let upperIdx = ordered.upper.row - visTop
-        let lowerIdx = min(ordered.lower.row - visTop, screen.count - 1)
-        guard upperIdx >= 0, upperIdx < screen.count, lowerIdx >= upperIdx else { return }
-
-        func window (from idx: Int) -> (lines: [String], offset: Int)? {
-            guard idx >= 0, idx < screen.count else { return nil }
-            let lines = Array(screen[idx ..< min(idx + Self.browseFingerprintWindow, screen.count)])
-            guard lines.contains(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return nil }
-            return (lines, idx - upperIdx)
-        }
-
-        var prints: [(lines: [String], offset: Int)] = []
-        // 选区内每 4 行取一条窗口（按 offset 去重）：整屏选区的上端窗口贴屏顶一滚就整窗
-        // 滚出、下端窗口可能锚在固定状态栏——中部的多条窗口既提供「内容真的移动了」的
-        // 证据（固定区拉黑的依据，见 relocateBrowseSelection），也让长选区往回滚很远后
-        // 仍有窗口留在屏上可找回。
-        var candidates = Array(stride(from: upperIdx, through: lowerIdx, by: Self.browseFingerprintWindow))
-        candidates.append(max(lowerIdx - Self.browseFingerprintWindow + 1, 0))
-        candidates = Array(Set(candidates)).sorted()
-        for idx in candidates {
-            // 从候选点向下找首个含非空白内容的窗口（不越过选区底行）。
-            for probe in idx...max(idx, lowerIdx) {
-                if let w = window(from: probe) {
-                    if !prints.contains(where: { $0.offset == w.offset }) { prints.append(w) }
-                    break
-                }
-            }
-        }
-        guard !prints.isEmpty else { return }
-        let selectedText = Self.sanitizedCopiedText(selection.getSelectedText())
-        guard !selectedText.isEmpty else { return }
-        browseSelectionAnchor = BrowseSelectionAnchor(
-            upperRow: ordered.upper.row, lowerRow: ordered.lower.row,
-            upperCol: ordered.upper.col, lowerCol: ordered.lower.col,
-            text: selectedText,
-            fingerprints: prints)
-    }
-
-    /// 每个 feed 在当前屏找回选中内容：命中→更新真实行号并投影（部分越界钳位、整体屏外
-    /// 隐藏）；多处命中先取精确全等、再取离上次位置最近的；找不到→隐藏高亮但保留指纹待命
-    /// （命中即恢复——高亮从不错罩内容）。窗口允许 1 行失配：选区贴着 spinner/计时器这类
-    /// 每帧重画的动态行时，指纹不至于永久失效。
-    func relocateBrowseSelection ()
-    {
-        guard let anchor = browseSelectionAnchor else { return }
-        var newAnchor = anchor
-        let screen = visibleAlternateScreenLines()
-        guard !screen.isEmpty else { return }
-        let buffer = terminal.displayBuffer
-        let visTop = buffer.yDisp
-        let visBottom = min(visTop + buffer.rows - 1, max(0, buffer.lines.count - 1))
-
-        func isBlank (_ s: String) -> Bool { s.trimmingCharacters(in: .whitespaces).isEmpty }
-        // 每条指纹独立求最优命中（exact 优先于容错，再比离上次位置的距离）。
-        var perFp: [(fpIndex: Int, row: Int, exact: Bool)] = []
-        for (fi, fp) in anchor.fingerprints.enumerated() {
-            let m = fp.lines.count
-            guard m > 0, m <= screen.count else { continue }
-            var best: (row: Int, exact: Bool, dist: Int)? = nil
-            for idx in 0...(screen.count - m) {
-                var mismatch = 0
-                var nonBlankEqual = 0
-                for k in 0..<m {
-                    if screen[idx + k] == fp.lines[k] {
-                        if !isBlank(fp.lines[k]) { nonBlankEqual += 1 }
-                    } else {
-                        mismatch += 1
-                        if mismatch > 1 { break }
-                    }
-                }
-                let exact = mismatch == 0
-                let fuzzyOk = m >= 3 && mismatch <= 1 && nonBlankEqual >= 2
-                guard exact || fuzzyOk else { continue }
-                let row = visTop + idx - fp.offset
-                let dist = abs(row - anchor.upperRow)
-                if best == nil || (exact && !best!.exact) || (exact == best!.exact && dist < best!.dist) {
-                    best = (row, exact, dist)
-                }
-            }
-            if let b = best { perFp.append((fi, b.row, b.exact)) }
-        }
-        // 固定 UI 区拉黑：一条指纹的命中移动了、另一条恒在原位 → 原位那条疑似锚在固定区
-        // （CC 底部输入框/状态栏滚动时不动，会把选区钉死在屏幕位置上），永久剔除。
-        let movedHits = perFp.filter { $0.row != anchor.upperRow }
-        let stayedHits = perFp.filter { $0.row == anchor.upperRow }
-        if !movedHits.isEmpty, !stayedHits.isEmpty {
-            for entry in stayedHits.sorted(by: { $0.fpIndex > $1.fpIndex }) {
-                newAnchor.fingerprints.remove(at: entry.fpIndex)
-            }
-            perFp = movedHits
-        }
-        let exactPool = perFp.filter { $0.exact }
-        let pool = (exactPool.isEmpty ? perFp : exactPool).map { $0.row }
-        guard let hit = pool.min(by: { abs($0 - anchor.upperRow) < abs($1 - anchor.upperRow) }) else {
-            // 选中内容不在当前屏（滚出/换页/被重画）：隐藏高亮，指纹待命，滚回来即恢复。
-            if selection.active {
-                selection.selectNone()
-                setNeedsDisplay(bounds)
-            }
-            return
-        }
-
-        let span = anchor.lowerRow - anchor.upperRow
-        newAnchor.upperRow = hit
-        newAnchor.lowerRow = hit + span
-        browseSelectionAnchor = newAnchor
-
-        if newAnchor.lowerRow < visTop || newAnchor.upperRow > visBottom {
-            // 整体滚出可见屏：隐藏高亮，指纹继续待命，滚回来自动恢复。
-            if selection.active {
-                selection.selectNone()
-                setNeedsDisplay(bounds)
-            }
-            return
-        }
-        let newStart = Position(col: newAnchor.upperRow >= visTop ? newAnchor.upperCol : 0,
-                                row: max(newAnchor.upperRow, visTop))
-        let newEnd = Position(col: newAnchor.lowerRow <= visBottom ? newAnchor.lowerCol : max(0, terminal.cols - 1),
-                              row: min(newAnchor.lowerRow, visBottom))
-        if !selection.active || selection.start != newStart || selection.end != newEnd {
-            selection.setSelection(start: newStart, end: newEnd)
-            setNeedsDisplay(bounds)
-        }
-    }
-
-    /// 武装内容跟踪：记录当前可见屏为基线。已武装则保持不动——基线连续性让撕裂帧之后
-    /// 仍能与老基线对出跨块累计平移量。
-    func armAlternateSelectionTracking ()
-    {
-        guard alternateSelectionAutoScrollLastScreen == nil else { return }
-        rebaseAlternateSelectionTracking()
-    }
-
-    private func rebaseAlternateSelectionTracking ()
-    {
-        alternateSelectionAutoScrollLastScreen = visibleAlternateScreenLines()
-        alternateSelectionTrackingYDisp = terminal.displayBuffer.yDisp
-        alternateSelectionTrackingFailures = 0
-    }
-
-    /// feedFinish 钩子：备用屏有活动选区且跟踪已武装时，每个 feed 都对一次「整屏平移量」，
-    /// 让选区跟着内容走。真实程序（CC）的一帧重绘常拆成多个 PTY 块到达：撕裂的半帧对不出
-    /// 可信平移量，保留基线等完整帧；对出后按拖拽/浏览两种形态分别平移锚点或整个选区。
-    func trackAlternateSelectionContentAfterFeed ()
-    {
-        guard terminal.isDisplayBufferAlternate else {
-            resetAlternateSelectionAutoScrollCapture()
-            browseSelectionAnchor = nil
-            return
-        }
-        // 浏览/封存态（松手后滚轮浏览、程序继续流式输出）：内容指纹绝对重定位。
-        // 增量对齐在这里有物理死角（快滚帧间零重叠），不走 detect。
-        guard isSelectionDragInProgress else {
-            relocateBrowseSelection()
-            return
-        }
-        browseSelectionAnchor = nil    // 拖拽进行中选区在变，旧指纹作废（mouseUp 重建）
-        guard alternateSelectionAutoScrollLastScreen != nil else { return }
-        guard selection.active else {
-            resetAlternateSelectionAutoScrollCapture()
-            return
-        }
-        // 程序重绘已到达（哪怕是撕裂的半帧）：上一次转发算被消化，转发节流放行下一 tick。
-        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-
-        let buffer = terminal.displayBuffer
-        guard buffer.yDisp == alternateSelectionTrackingYDisp else {
-            rebaseAlternateSelectionTracking()
-            return
-        }
-        let currentScreen = visibleAlternateScreenLines()
-        guard let previous = alternateSelectionAutoScrollLastScreen,
-              currentScreen.count == previous.count else {
-            rebaseAlternateSelectionTracking()      // resize 等行数变化：只能重建基线
-            return
-        }
-
-        guard let contentShift = detectAlternateContentShift(previous: previous, current: currentScreen) else {
-            alternateSelectionTrackingFailures += 1
-            // 撕裂帧先不动：保留基线，等完整帧到齐后与老基线一次对出跨块累计平移量。
-            guard alternateSelectionTrackingFailures >= Self.alternateSelectionTrackingMaxFailures else { return }
-            // 连续多帧都对不上 = 内容真被整体换掉（翻整页/切视图），不是撕裂。
-            if alternateSelectionAutoScrollText != nil,
-               let direction = alternateSelectionAutoScrollDirection {
-                // 拖选累积中：退回文本重叠合并兜底，宁可偶尔重复一段也不静默丢内容；锚点不动。
-                if autoScrollDelta != 0 { extendSelectionToAutoScrollEdge(direction: direction) }
-                captureAlternateSelectionAutoScrollText(direction: direction)
-                rebaseAlternateSelectionTracking()
-            } else {
-                // 拖拽刚开始还没累积任何内容就被整屏换掉：选区锚定的内容已不在屏上。
-                selection.selectNone()
-                resetAlternateSelectionAutoScrollCapture()
-                setNeedsDisplay(bounds)
-            }
-            return
-        }
-
-        alternateSelectionTrackingFailures = 0
-        let shift = contentShift.shift
-        if shift != 0 {
-            // 高亮跟随：程序把滚动区内容平移了 shift 行（正 = 内容上移），锚点随内容同步
-            // 平移；end 由拖拽逻辑钉在鼠标/边缘，不在这里动。
-            selection.shiftDragAnchor(rowsBy: -shift)
-            if autoScrollDelta != 0, let direction = alternateSelectionAutoScrollDirection {
-                extendSelectionToAutoScrollEdge(direction: direction)
-                // 累积器确定性追加：这帧新滚进滚动区的 |shift| 行必在选区内，直接拼接
-                // ——不依赖易受首末行截断/动画噪声干扰的文本重叠比对。只有平移方向与拖拽
-                // 方向一致才追加（反向 = 程序回弹，进屏的是另一侧的行，不属于选区）。
-                if alternateSelectionAutoScrollText != nil,
-                   (direction == .down && shift > 0) || (direction == .up && shift < 0) {
-                    appendAlternateSelectionAutoScrollLines(from: currentScreen, contentShift: contentShift, direction: direction)
-                }
-            }
-            setNeedsDisplay(bounds)
-        }
-        // shift == 0：程序只是原地重绘（spinner/计时器动画），内容没滚——也要换基线，
-        // 避免动画差异日积月累压过 80% 阈值。
-        alternateSelectionAutoScrollLastScreen = currentScreen
-    }
-
-    /// 可见屏的全宽文本（每行 trimRight），供逐帧平移检测与确定性追加使用。
-    /// CC/Ink 用「CUP 跳列画字」渲染，跳过的前导格是 null cell，translateBufferLineToString
-    /// 会原样输出 NUL（\0）。同一行内容一帧带 NUL 一帧带空格（取决于该帧 diff 是否重画了它），
-    /// 逐字节比较会摇摆失配；NUL 混进累积器还会污染 ⌘C 出去的剪贴板文本。统一 NUL→空格再
-    /// 剪尾，让屏幕行比较与复制文本都以「肉眼所见」为准。
-    static func sanitizedScreenLine (_ line: String) -> String
-    {
-        var s = line
-        if s.contains("\u{0}") {
-            s = s.replacingOccurrences(of: "\u{0}", with: " ")
-        }
-        while s.hasSuffix(" ") {
-            s.removeLast()
-        }
-        return s
-    }
-
-    static func sanitizedCopiedText (_ text: String) -> String
-    {
-        if text.contains("\u{0}") {
-            return text.replacingOccurrences(of: "\u{0}", with: " ")
-        }
-        return text
-    }
-
-    func visibleAlternateScreenLines () -> [String]
-    {
-        let buffer = terminal.displayBuffer
-        guard buffer.rows > 0, buffer.lines.count > 0 else { return [] }
-        let top = max(0, buffer.yDisp)
-        let bottom = min(buffer.yDisp + buffer.rows - 1, buffer.lines.count - 1)
-        guard top <= bottom else { return [] }
-        return (top...bottom).map {
-            Self.sanitizedScreenLine(buffer.translateBufferLineToString(
-                lineIndex: $0, trimRight: true, skipNullCellsFollowingWide: true))
-        }
-    }
-
-    /// 整屏平移检测结果。真实 CC 的关键事实（PTY 录制回放实证，2026-07-02）：滚动时只有
-    /// transcript 区（约屏幕上部 30 行）平移，底部输入框/状态栏固定不动，且用 Ink 增量 diff
-    /// 重绘（每帧仅数百字节、不清屏）——任何「整屏占比」类判据都会被固定 UI 区打穿。
-    struct AlternateContentShift {
-        /// 带符号平移量：正 = 内容上移（向下翻），负 = 内容下移（向上翻）。
-        let shift: Int
-        /// 平移匹配行（非空白且本帧变化过）在当前帧中的行号范围。
-        let matchedLo: Int
-        let matchedHi: Int
-        /// 本帧发生变化的行号范围——滚动区边界的估计（固定 UI 区通常整帧不变）。
-        let changedLo: Int
-        let changedHi: Int
-    }
-
-    /// 逐帧检测程序把滚动区内容平移了几行。**只以「本帧变化过的行」为证据**，对每个候选
-    /// K≠0 统计「非空白、本帧变化过、且按 K 对齐后与前一帧精确相等」的行数：
-    /// - 「变化过」过滤是核心：固定 UI 区（输入框/边框/状态栏）整帧不变，若不过滤，重复的
-    ///   边框线会给错误的 K 灌水；过滤后它们对任何 K 都不计分，检测只看真正滚动的区。
-    /// - K=0 不参与计分。真机踩过的坑（2026-07-02 浏览态漂移）：Ink 的 diff 按行文本对比，
-    ///   代码/diff 类内容大量行重复（"}"/缩进/前缀），滚动 1 行后多数行新旧文本恰好相同、
-    ///   根本不被重画——若 K=0 按「未变化行」计分会稳赢真实的 K，选区每滚一次漂 1 行。
-    ///   视觉语义上高亮只需跟随「肉眼可见的移动」：变化行对齐到哪个 K 就信哪个 K；
-    ///   可见变化寥寥且无对齐 = 原地重绘（spinner/光标/状态栏动画）→ 0；
-    ///   可见变化大量却无法对齐 = 撕裂半帧/整屏换内容 → nil（保基线等完整帧/走兜底）。
-    /// - 采信条件：匹配 ≥2、领先次优 ≥2（歧义帧宁可不动）、且解释了至少一半可见变化行。
-    /// - 撕裂否决：整屏被清到一半（非空白行骤降 >1/3）时返回 nil 等画完——真实 CC 增量重绘
-    ///   不清屏，不会触发；防的是 2J 全量重绘型程序的半帧。
-    func detectAlternateContentShift (previous: [String], current: [String]) -> AlternateContentShift?
-    {
-        let n = previous.count
-        guard n > 0, current.count == n else { return nil }
-        let maxShift = n - Self.minTrustedMergeOverlapLines
-        guard maxShift >= 1 else { return nil }
-
-        func isBlank (_ s: String) -> Bool { s.trimmingCharacters(in: .whitespaces).isEmpty }
-        let prevNonBlank = previous.lazy.filter { !isBlank($0) }.count
-        let currNonBlank = current.lazy.filter { !isBlank($0) }.count
-        guard currNonBlank * 3 >= prevNonBlank * 2 else { return nil }
-
-        var changedLo = Int.max
-        var changedHi = -1
-        var changedVisible = 0
-        for i in 0..<n where current[i] != previous[i] {
-            changedLo = min(changedLo, i)
-            changedHi = max(changedHi, i)
-            if !isBlank(current[i]) || !isBlank(previous[i]) {
-                changedVisible += 1
-            }
-        }
-
-        var candidates: [(shift: Int, matched: Int, lo: Int, hi: Int)] = []
-        for magnitude in 1...maxShift {
-            for shift in [magnitude, -magnitude] {
-                let overlap = n - magnitude
-                var matched = 0
-                var lo = Int.max
-                var hi = -1
-                for i in 0..<overlap {
-                    // shift > 0：内容上移，前一帧第 ci+shift 行滚到当前帧第 ci 行；shift < 0 相反。
-                    let ci = shift >= 0 ? i : i - shift
-                    let pi = shift >= 0 ? i + shift : i
-                    let line = current[ci]
-                    guard line == previous[pi], !isBlank(line), line != previous[ci] else { continue }
-                    matched += 1
-                    lo = min(lo, ci)
-                    hi = max(hi, ci)
-                }
-                guard matched >= 2 else { continue }
-                candidates.append((shift, matched, lo, hi))
-            }
-        }
-        let sorted = candidates.sorted { $0.matched > $1.matched }
-        if let best = sorted.first,
-           sorted.count < 2 || best.matched >= sorted[1].matched + 2,
-           best.matched * 2 >= changedVisible {
-            return AlternateContentShift(shift: best.shift, matchedLo: best.lo, matchedHi: best.hi,
-                                         changedLo: changedLo == Int.max ? 0 : changedLo,
-                                         changedHi: max(changedHi, 0))
-        }
-        // 无可信平移对齐：可见变化很少 = 原地重绘；变化不少却对不齐 = 撕裂/换屏，返 nil。
-        guard changedVisible <= max(2, n / 6) else { return nil }
-        return AlternateContentShift(shift: 0, matchedLo: 0, matchedHi: -1,
-                                     changedLo: changedLo == Int.max ? 0 : changedLo,
-                                     changedHi: max(changedHi, 0))
-    }
-
-    /// 把这一帧新滚进滚动区的 |shift| 行确定性拼进累积器。新行的位置不是屏幕边缘，而是
-    /// **滚动区边缘**（真实 CC 底部有固定状态栏，向下翻时新行出现在 transcript 区尾部、
-    /// 不是屏底）：向下翻取变化区尾部 |shift| 行（下界不越过匹配区），向上翻取变化区头部。
-    private func appendAlternateSelectionAutoScrollLines (from screen: [String], contentShift: AlternateContentShift, direction: AlternateSelectionAutoScrollDirection)
-    {
-        guard contentShift.shift != 0, !screen.isEmpty, let existing = alternateSelectionAutoScrollText else { return }
-        let n = screen.count
-        let lower: Int
-        let upper: Int
-        if contentShift.shift > 0 {
-            upper = min(contentShift.changedHi, n - 1)
-            lower = max(upper - contentShift.shift + 1, contentShift.matchedHi + 1)
-        } else {
-            let m = -contentShift.shift
-            lower = max(contentShift.changedLo, 0)
-            upper = min(lower + m - 1, contentShift.matchedLo - 1)
-        }
-        guard lower <= upper, lower >= 0, upper < n else { return }
-        let fresh = screen[lower...upper].joined(separator: "\n")
-        switch direction {
-        case .down:
-            alternateSelectionAutoScrollText = existing.isEmpty ? fresh : existing + "\n" + fresh
-        case .up:
-            alternateSelectionAutoScrollText = existing.isEmpty ? fresh : fresh + "\n" + existing
-        }
-        alternateSelectionAutoScrollDirection = direction
-    }
-
-    /// 滚动累积期间的选区捕获文本：锚点侧按锚点列截断（该行内容与截断列跨帧恒定），
-    /// 边缘侧整行取全宽——边缘行下一帧就会变成选区内部行（内部行本取全行），若按鼠标列
-    /// 截断，同一内容行帧间文本不稳定，重叠比对必然失配（这正是旧版几乎每帧都退化成
-    /// 保守拼接、复制出重复块的原因）。每行 trimRight，行间以 \n 连接。
-    func alternateSelectionCaptureText (direction: AlternateSelectionAutoScrollDirection) -> String
-    {
-        let buffer = terminal.displayBuffer
-        guard selection.active, buffer.lines.count > 0 else { return "" }
-        let ordered = Position.compare(selection.start, selection.end) == .before
-            ? (upper: selection.start, lower: selection.end)
-            : (upper: selection.end, lower: selection.start)
-        let topRow = max(0, min(ordered.upper.row, buffer.lines.count - 1))
-        let bottomRow = max(0, min(ordered.lower.row, buffer.lines.count - 1))
-        guard topRow <= bottomRow else { return "" }
-
-        var lines: [String] = []
-        for row in topRow...bottomRow {
-            // .down 锚点在上端：首行从锚点列起；.up 锚点在下端：末行截到锚点列（含）。
-            let startCol = (direction == .down && row == topRow) ? max(0, ordered.upper.col) : 0
-            let endCol = (direction == .up && row == bottomRow) ? min(terminal.cols, ordered.lower.col + 1) : -1
-            lines.append(Self.sanitizedScreenLine(buffer.translateBufferLineToString(
-                lineIndex: row, trimRight: true, startCol: startCol, endCol: endCol,
-                skipNullCellsFollowingWide: true)))
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    func captureAlternateSelectionAutoScrollText (direction: AlternateSelectionAutoScrollDirection)
-    {
-        guard terminal.isDisplayBufferAlternate, selection.active else {
-            return
-        }
-        let current = alternateSelectionCaptureText(direction: direction)
-        guard !current.isEmpty else {
-            return
-        }
-        guard let existing = alternateSelectionAutoScrollText else {
-            alternateSelectionAutoScrollText = current
-            alternateSelectionAutoScrollDirection = direction
-            return
-        }
-
-        alternateSelectionAutoScrollText = mergedAlternateSelectionAutoScrollText(existing: existing, current: current, direction: direction)
-        alternateSelectionAutoScrollDirection = direction
-    }
-
-    func mergedAlternateSelectionAutoScrollText (existing: String, current: String, direction: AlternateSelectionAutoScrollDirection) -> String
-    {
-        guard !existing.isEmpty else {
-            return current
-        }
-        guard !current.isEmpty, current != existing else {
-            return existing
-        }
-
-        switch direction {
-        case .down:
-            return joinedSelectionBlocks(existing, current)
-        case .up:
-            return joinedSelectionBlocks(current, existing)
-        }
-    }
-
-    /// Relay 历史坑（51a3fbc 点名："按任意长度（含 1 字符）overlap 拼接易误删行"）：早期版本
-    /// 的合并算法允许短至 1 行的重叠就采信，两帧恰好在某个短公共行（复用的分隔符/提示符/空行）
-    /// 处巧合相同时会被误判成"同一行的延续"，把 current 里紧跟着的那次独立重复吞掉——两次真实
-    /// 出现的内容被错并成一次。这里要求最短可信重叠行数，短于这个阈值宁可直接拼接（顶多偶尔
-    /// 重复一行），也不要悄悄丢内容或对错位置。
-    private static let minTrustedMergeOverlapLines = 3
-
-    private func joinedSelectionBlocks (_ upper: String, _ lower: String) -> String
-    {
-        if upper.isEmpty {
-            return lower
-        }
-        if lower.isEmpty {
-            return upper
-        }
-
-        let upperLines = upper.components(separatedBy: "\n")
-        let lowerLines = lower.components(separatedBy: "\n")
-        let maxOverlap = min(upperLines.count, lowerLines.count)
-        if maxOverlap >= Self.minTrustedMergeOverlapLines {
-            for count in stride(from: maxOverlap, through: Self.minTrustedMergeOverlapLines, by: -1) {
-                let upperTail = Array(upperLines.suffix(count))
-                guard upperTail == Array(lowerLines.prefix(count)) else {
-                    continue
-                }
-                // 空白行/边框行恒等会制造伪重叠（与旧 harvest 方案 detectRevealedTopLine 同一条
-                // 防线），重叠区间必须包含至少一行实际内容才采信。
-                guard upperTail.contains(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else {
-                    continue
-                }
-                return (upperLines + lowerLines.dropFirst(count)).joined(separator: "\n")
-            }
-        }
-        if upper.hasSuffix("\n") || lower.hasPrefix("\n") {
-            return upper + lower
-        }
-        return upper + "\n" + lower
-    }
-
     // Callback from when the mouseDown autoscrolling timer goes off
     private func scrollingTimerElapsed (source: Timer)
     {
-        guard selection.active, autoScrollDelta != 0 else {
-            stopSelectionAutoScroll()
+        if autoScrollDelta == 0 {
             return
         }
-
-        let changed = performSelectionAutoScroll(delta: autoScrollDelta, point: selectionAutoScrollPoint)
-        autoScrollDelta = selectionAutoScrollDelta(for: selectionAutoScrollPoint)
-        if changed {
-            setNeedsDisplay(bounds)
+        if autoScrollDelta < 0 {
+            scrollUp(lines: autoScrollDelta * -1)
+        } else {
+            scrollUp(lines: autoScrollDelta)
         }
     }
     
-    /// 滚轮专用：按住 Shift / Option / ⌘ 滚动时，绕过「把滚轮转发给程序」，改走
-    /// 本地滚动历史（scrollback）。普通滚动仍转发给全屏 TUI（vim/less/Claude Code）
-    /// 让其内容滚动，见 scrollWheel。注意：点击/拖拽划选走的是**相反**的优先级
-    /// （普通拖拽即本地划选），见 mouseReportingRequested —— 两者刻意不共用一套语义。
+    /// 终端通用约定：按住 Shift / Option / ⌘ 时，临时绕过鼠标上报
+    /// （mouse reporting），改走本地手势。这样即使 TUI（vim/tmux/
+    /// Claude Code/Codex 等）开启了鼠标追踪，用户仍可：Shift/Option 选中复制，
+    /// ⌘ 点击打开屏幕里的文件路径（见 mouseUp 的 ⌘-click 分支）。⌘ 是 GUI 修饰键，
+    /// 本就不该把点击泄漏给 TUI，对应 iTerm2 ⌘-click 语义历史的本地手势约定。
     @inline(__always)
     func mouseReportingBypassed(with event: NSEvent) -> Bool {
         let f = event.modifierFlags
         return f.contains(.shift) || f.contains(.option) || f.contains(.command)
-    }
-
-    private func terminalMouseOwnsNewGesture(with event: NSEvent) -> Bool {
-        allowMouseReporting && terminal.mouseMode.sendButtonPress() && mouseReportingRequested(with: event)
-    }
-
-    private func sendTerminalMouseDrag(with event: NSEvent, hit: (grid: Position, pixels: Position)) {
-        let displayBuffer = terminal.displayBuffer
-        let flags = encodeMouseEvent(with: event)
-        let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
-        terminal.sendMotion(buttonFlags: flags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
-    }
-
-    /// Relay patch（划选优先）：本产品是 AI agent 终端，从运行中的 Claude Code/
-    /// Codex 输出里划选、复制是高频核心动作。因此点击/拖拽反转了终端默认优先级——
-    /// 普通拖拽 **始终本地划选**，即使 TUI（vim/tmux/Claude Code/Codex 等）开了
-    /// 鼠标追踪；只有按住 ⌥(Option) 拖拽，才把鼠标交还给程序（让其自身的点击/拖拽
-    /// UI 仍可用）。⇧ 走本地选区扩展、⌘ 走链接/路径点击（见 mouseUp 的 ⌘-click
-    /// 分支），二者都不转发。返回 true 表示「这一手势要交给程序上报」。
-    /// （滚轮是另一套优先级——普通滚动转发给程序，见 mouseReportingBypassed。）
-    @inline(__always)
-    func mouseReportingRequested(with event: NSEvent) -> Bool {
-        return event.modifierFlags.contains(.option)
     }
 
     /// Relay patch: ⌘-click 命中的「裸文件路径」回调（非 URL，与 OSC 8 超链接分开）。
@@ -3054,43 +2209,29 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     public override func mouseDown(with event: NSEvent) {
-        stopSelectionAutoScroll()
-        mouseInteractionOwner = terminalMouseOwnsNewGesture(with: event) ? .terminalApp : .localSelection
-        if mouseInteractionOwner == .terminalApp {
-            pendingSelectionAnchor = nil
-            isSelectionDragInProgress = false
-            if terminal.mouseMode.sendButtonPress() {
-                sharedMouseEvent(with: event)
-            }
-            setNeedsDisplay(bounds)
+        if allowMouseReporting && terminal.mouseMode.sendButtonPress() && !mouseReportingBypassed(with: event) {
+            sharedMouseEvent(with: event)
             return
         }
-
-        let point = convert(event.locationInWindow, from: nil)
+        
         let hit = calculateMouseHit(with: event).grid
-
-        // 新一次按下：拖拽尚未开始，复位标志（真正开始划选时由 mouseDragged 置 true）。
-        isSelectionDragInProgress = false
-        resetAlternateSelectionAutoScrollCapture()
-        browseSelectionAnchor = nil
-
+        
         switch event.clickCount {
         case 1:
-            if selection.active == true && event.modifierFlags.contains(.shift) {
-                selection.shiftExtend(bufferPosition: selectionPosition(for: point))
-            } else {
-                // 清掉旧选区，并把「按下的格子」记为锚点：随后的拖拽划选从这里开始，
-                // 而不是从拖动第一帧的采样点开始，否则选区起点会偏出最多一个字符。
-                if selection.active { selection.active = false }
-                pendingSelectionAnchor = selectionPosition(for: point)
+            if selection.active == true {
+                if event.modifierFlags.contains(.shift) {
+                    selection.shiftExtend(bufferPosition: Position(col: hit.col, row: hit.row))
+                } else {
+                    selection.active = false
+                }
             }
         case 2:
             let displayBuffer = terminal.displayBuffer
             selection.selectWordOrExpression(at: Position(col: hit.col, row: hit.row), in: displayBuffer)
-
+            
         default:
             // 3 and higher
-
+            
             selection.select(row: hit.row)
         }
         setNeedsDisplay(bounds)
@@ -3107,46 +2248,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var didSelectionDrag: Bool = false
     
     public override func mouseUp(with event: NSEvent) {
-        let owner = mouseInteractionOwner
-        defer {
-            mouseInteractionOwner = .none
-            didSelectionDrag = false
-        }
-
-        stopSelectionAutoScroll()
-        pendingSelectionAnchor = nil
-        if terminal.isDisplayBufferAlternate, isSelectionDragInProgress,
-           let direction = alternateSelectionAutoScrollDirection,
-           alternateSelectionAutoScrollLastScreen == nil || alternateSelectionTrackingFailures > 0 {
-            // 兜底封存：仅在内容跟踪不可用（基线丢失/最近帧失配）时才整选区补捕一次。
-            // 跟踪健康时累积器已由初始捕获 + 每 feed 确定性追加拼完整；此刻锚点通常已被
-            // 钳到屏幕边缘，整选区再捕一遍会连 prompt/固定状态栏一起圈进来，与累积器
-            // 端点重叠必然对不上（joinedSelectionBlocks 只认端点重叠），整屏垃圾直接
-            // 前插进复制文本——进程内 NSEvent 闭环 e2e（真实 CC 字节流）抓到的真机路径。
-            captureAlternateSelectionAutoScrollText(direction: direction)
-        }
-        // Relay 回归（51a3fbc 曾点名的坑：「松手后流式输出污染 ⌘C」）：拖拽一旦结束，累积器必须
-        // 立刻封存——上面这次 capture 就是本次拖拽累积器的最终值。松手后 feed 钩子
-        // （trackAlternateSelectionContentAfterFeed）因 isSelectionDragInProgress 已复位只走
-        // 浏览分支：只平移选区高亮、永不追加累积器，天然不会把拖拽结束之后才出现的内容拼进
-        // 复制文本。这里顺手清掉待捕获标志，让转发节流状态干净复位。
-        alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
-        // 拖拽结束：恢复主屏「输出滚动时清选区」的原行为（备用屏由 feedPrepare/linefeed 自身判断保留）。
-        isSelectionDragInProgress = false
         let hit = calculateMouseHit(with: event).grid
-        if owner == .terminalApp {
-            resetAlternateSelectionAutoScrollCapture()
-            if allowMouseReporting && terminal.mouseMode.sendButtonRelease() {
-                sharedMouseEvent(with: event)
-            }
-            return
-        }
-        // 选区定格：为浏览态建立内容指纹——之后滚轮浏览/程序流式输出时高亮按内容绝对
-        // 重定位（快滚免疫），滚出屏隐藏、滚回来恢复。
-        browseSelectionAnchor = nil
-        if terminal.isDisplayBufferAlternate, selection.active {
-            ensureBrowseSelectionAnchor()
-        }
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
             terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
@@ -3159,54 +2261,52 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             onRequestOpenLocalPath?(token)
             return
         }
+        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() && !mouseReportingBypassed(with: event) {
+            sharedMouseEvent(with: event)
+            return
+        }
         
         #if DEBUG
         // let hit = calculateMouseHit(with: event)
         //print ("Up at col=\(hit.col) row=\(hit.row) count=\(event.clickCount) selection.active=\(selection.active) didSelectionDrag=\(didSelectionDrag) ")
         #endif
+        
+        didSelectionDrag = false
     }
     
     public override func mouseDragged(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        let mouseHit = calculateMouseHit(at: point)
-        if mouseInteractionOwner == .none {
-            mouseInteractionOwner = terminalMouseOwnsNewGesture(with: event) ? .terminalApp : .localSelection
-        }
-
-        if mouseInteractionOwner == .terminalApp {
-            stopSelectionAutoScroll()
-            if allowMouseReporting && (terminal.mouseMode.sendButtonTracking() || terminal.mouseMode.sendMotionEvent()) {
-                sendTerminalMouseDrag(with: event, hit: mouseHit)
+        let displayBuffer = terminal.displayBuffer
+        let mouseHit = calculateMouseHit(with: event)
+        let hit = mouseHit.grid
+        if allowMouseReporting && !mouseReportingBypassed(with: event) {
+            if terminal.mouseMode.sendMotionEvent() {
+                let flags = encodeMouseEvent(with: event)
+                let screenRow = max (0, min (displayBuffer.rows - 1, hit.row - displayBuffer.yDisp))
+                terminal.sendMotion(buttonFlags: flags, x: hit.col, y: screenRow, pixelX: mouseHit.pixels.col, pixelY: mouseHit.pixels.row)
+            
                 return
             }
-            if allowMouseReporting && terminal.mouseMode != .off {
+            if terminal.mouseMode != .off {
                 return
             }
         }
-
-        let rawSelectionHit = selectionPosition(for: point)
-        let selectionHit = selectionDragPosition(for: point)
+                
         if selection.active {
-            selection.dragExtend(bufferPosition: selectionHit)
+            selection.dragExtend(bufferPosition: Position(col: hit.col, row: hit.row))
         } else {
-            // 起点用 mouseDown 记录的锚点（真正按下的格子），缺省回退到当前点。
-            let anchor = pendingSelectionAnchor ?? rawSelectionHit
-            selection.setSoftStart(bufferPosition: anchor)
+            selection.setSoftStart(bufferPosition: Position(col: hit.col, row: hit.row))
             selection.startSelection()
-            selection.dragExtend(bufferPosition: selectionHit)
         }
-        pendingSelectionAnchor = nil
         didSelectionDrag = true
-        mouseInteractionOwner = .localSelection
-        // 标记拖拽划选进行中：在此期间 feedPrepare/linefeed 不会因流式输出清掉选区，
-        // 这是「下拖自动滚动选中」和「Claude Code 里流式划选」能成立的前提。
-        isSelectionDragInProgress = true
-        // 备用屏一开拖就武装内容跟踪：程序（CC）流式输出把内容顶上去时锚点随之平移，
-        // 拖拽中的选区不再和内容脱开（trackAlternateSelectionContentAfterFeed）。
-        if terminal.isDisplayBufferAlternate {
-            armAlternateSelectionTracking()
+        autoScrollDelta = 0
+        let screenRow = hit.row - displayBuffer.yDisp
+        if selection.active {
+            if screenRow <= 0 {
+                autoScrollDelta = calcScrollingVelocity(delta: screenRow * -1) * -1
+            } else if screenRow >= displayBuffer.rows {
+                autoScrollDelta = calcScrollingVelocity(delta: screenRow - displayBuffer.rows)
+            }
         }
-        updateSelectionAutoScroll(at: point)
         setNeedsDisplay(bounds)
     }
     
@@ -3340,10 +2440,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             reportLink(at: hit.grid)
         }
         updateHoverLink(at: hit.grid)
-
-        // Relay patch: 悬停上报同样只在按住 ⌥ 时才转发给程序，与拖拽划选一致——
-        // 不按 ⌥ 时程序完全拿不到鼠标，终端这边专心做本地划选/链接悬停。
-        if terminal.mouseMode.sendMotionEvent() && mouseReportingRequested(with: event) {
+        
+        if terminal.mouseMode.sendMotionEvent() {
             let flags = encodeMouseEvent(with: event, overwriteRelease: true)
             terminal.sendMotion(buttonFlags: flags, x: hit.grid.col, y: hit.grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
@@ -3357,54 +2455,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let goingUp = event.deltaY > 0
 
         // Relay patch: alternate-screen scroll. Fullscreen apps (vim, less,
-        // htop, man, …) run on the alternate buffer, which has no scrollback —
-        // local scrollUp/scrollDown are no-ops there, so the wheel did nothing.
-        // Match iTerm2/Terminal.app/Ghostty and forward the gesture to the app:
+        // htop, man, Claude Code, …) run on the alternate buffer, which has no
+        // scrollback — local scrollUp/scrollDown are no-ops there, so the wheel
+        // did nothing. Match iTerm2/Terminal.app/Ghostty and forward the
+        // gesture to the app:
         //   • app enabled mouse tracking (e.g. `vim` with `set mouse=a`) →
         //     send the wheel as SGR/X10 mouse reports (buttons 4/5);
         //   • otherwise → "alternate scroll mode": send cursor Up/Down keys
         //     (respecting DECCKM), so a plain `vim`/`less` scrolls its content.
-        // A held modifier (shift/option/command) keeps falling through to the
-        // local path, consistent with mouseReportingBypassed elsewhere.
-        //
-        // Relay patch: 备用屏自带 scrollback（见 Terminal init），但只对「不上报鼠标」的
-        // 程序开放本地浏览。CC/codex 这类开着鼠标上报的 TUI 就地重绘：被推进本地 scrollback
-        // 的行全是重绘中间态（树枝装饰、半行、状态栏碎片），拿它当「历史」回看是乱的、从
-        // 那上面复制出来也是乱的；而这类程序收到滚轮上报会自己滚 transcript——那才是干净
-        // 的历史。所以鼠标上报开启时滚轮恒转发；按住 shift/⌥/⌘ 绕过上报时仍可进本地
-        // scrollback（逃生舱）。vim/less/htop（mouseMode off、yBase 恒 0）行为不变。
-        let altBuf = terminal.displayBuffer
-        let appHandlesScroll = allowMouseReporting && terminal.mouseMode != .off
-            && !mouseReportingBypassed(with: event)
-        let inScrollbackRegion = altBuf.yDisp < altBuf.yBase         // 已滚入历史区，继续上下浏览都本地处理
-        let canEnterHistoryFromBottom = goingUp && altBuf.yBase > 0  // 在底部向上滚、且确有历史可看
-        if terminal.isDisplayBufferAlternate && !appHandlesScroll
-            && (inScrollbackRegion || canEnterHistoryFromBottom) {
-            flashScroller()
-            if goingUp {
-                scrollUp (lines: velocity)
-            } else {
-                scrollDown(lines: velocity)
-            }
-            return
-        }
-
-        if terminal.isDisplayBufferAlternate && !mouseReportingBypassed(with: event) {
-            // 视图若还停在本地历史区（逃生舱浏览过、或旧版本进去的），这一下滚轮只做
-            // 「回到实时屏」，吞掉不转发——否则回底的同时 transcript 又被多滚一步（向下
-            // 滚时可感知为过冲）；下一下滚轮才开始滚程序内容。
-            if altBuf.yDisp < altBuf.yBase {
-                scrollTo (row: altBuf.yBase)
-                return
-            }
-            // Relay patch: 走到这里 = 备用屏本地没有可滚的历史(yBase==0)。CC/codex 就地重绘、
-            // yBase 恒 0（实测：滚 249 次全程 0），滚出的历史不进终端缓冲区，选区锚的是终端行
-            // 坐标。旧版为防高亮罩错行在这里直接清选区；现在为选区建立内容指纹：转发滚轮后
-            // 程序重绘，feed 钩子（relocateBrowseSelection）在新屏上按内容把选区绝对重定位
-            // ——高亮跟着内容走，快滚/撕裂帧免疫；滚出屏幕隐藏、滚回来自动恢复。
-            if selection.active && !isSelectionDragInProgress {
-                ensureBrowseSelectionAnchor()
-            }
+        if terminal.isDisplayBufferAlternate {
             // Discrete notched wheels report one tick at a time (velocity 1);
             // give them the xterm `alternateScroll` convention of ~3 lines per
             // notch so vim/less scroll at the expected pace. Trackpads/Magic
@@ -3451,16 +2510,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// 数千行，10 行/拍到不了），步长节奏由调用方闭环控制。
     public func sendProgrammaticAltScroll(up: Bool, lines: Int) {
         guard terminal.isDisplayBufferAlternate else { return }
-        // 与手势路径同防御：视图若停在本地历史区（逃生舱/PageUp/scroller 进去的），
-        // 先拉回实时屏再让程序滚——否则程序滚 transcript、屏幕卡在历史视图不动，
-        // 跳转闭环读到的是静止的历史行，stall 检测会误判跳转失败而收手。
-        let altBuf = terminal.displayBuffer
-        if altBuf.yDisp < altBuf.yBase {
-            scrollTo (row: altBuf.yBase)
-        }
-        if selection.active && !isSelectionDragInProgress {
-            ensureBrowseSelectionAnchor()
-        }
         let cap = 64
         let point = CGPoint(x: bounds.midX, y: bounds.midY)
         if allowMouseReporting && terminal.mouseMode != .off {
@@ -3503,7 +2552,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         return 1
     }
-
+    
     public override func resetCursorRects() {
         addCursorRect(bounds, cursor: .iBeam)
     }

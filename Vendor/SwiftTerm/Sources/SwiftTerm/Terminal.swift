@@ -338,11 +338,6 @@ open class Terminal {
     var isDisplayBufferAlternate: Bool {
         synchronizedOutputBuffer != nil ? synchronizedOutputBufferIsAlternate : isCurrentBufferAlternate
     }
-
-    /// Relay(改动B / P0)：DEC 2026 同步输出窗口内 displayBuffer 指向冻结快照，harvest 不可在此期间【启动】
-    /// （只读、无副作用；prime() 据此守卫——不要塞进 harvestEligible，否则 CC 一开同步窗口就会误 abort
-    /// 正在进行的历史浏览）。
-    var isSynchronizedOutputActive: Bool { synchronizedOutputActive }
     
     public var isCurrentBufferAlternate: Bool {
         buffer === altBuffer
@@ -667,16 +662,9 @@ open class Terminal {
         normalBuffer = Buffer(cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: options.scrollback)
         normalBuffer.fillViewportRows()
 
-        // Relay patch: 备用屏也配 scrollback。CC v2/codex 等 AI agent CLI 在备用屏(1049h)里
-        // 用滚动输出（旧行从顶部滚出），标准 alt 屏无 scrollback 会丢弃这些行；但 Relay 的核心
-        // 动作就是从这些历史里划选复制。对齐 iTerm2 "Save lines to scrollback in alternate
-        // screen mode"。PTY 抓包确认 CC=备用屏+鼠标上报；用户 iTerm2 实证可向上滚看历史并连续
-        // 选中，正是 alt-scrollback 的效果。退出备用屏 activateNormalBuffer→clear() 清掉这段
-        // 历史不污染主屏；scroll() 只看 hasScrollback，历史保存逻辑自动生效。
+        // The alt buffer should never have scrollback.
         // See http://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-The-Alternate-Screen-Buffer
-        altBuffer = Buffer (cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: options.scrollback)
-        // 备用屏关闭 reflow：见 Buffer.disableReflow 说明。
-        altBuffer.disableReflow = true
+        altBuffer = Buffer (cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: nil)
         buffer = normalBuffer
 
         cc = CC(send8bit: false)
@@ -786,14 +774,6 @@ open class Terminal {
         normalBuffer.fillViewportRows()
         normalBuffer.setupTabStops(tabStopWidth: tabStopWidth)
     }
-
-    private func resetAltBuffer(fillAttr: Attribute? = nil) {
-        altBuffer = Buffer(cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: options.scrollback)
-        altBuffer.disableReflow = true
-        altBuffer.scroll = { [weak self] wrapped in self?.scroll(isWrapped: wrapped) }
-        altBuffer.fillViewportRows(attribute: fillAttr)
-        altBuffer.setupTabStops(tabStopWidth: tabStopWidth)
-    }
     
     private func activateNormalBuffer(clearAlt: Bool) {
         if buffer === normalBuffer {
@@ -852,8 +832,7 @@ open class Terminal {
         
         if isReset {
             resetNormalBuffer()
-            resetAltBuffer()
-            buffer = normalBuffer
+            activateNormalBuffer(clearAlt: false)
         } else {
             normalBuffer.resize(newCols: cols, newRows: rows)
             altBuffer.resize(newCols: cols, newRows: rows)
@@ -5451,15 +5430,14 @@ open class Terminal {
     
     /**
      * Changes the scrollback size of the terminal after it has been instantiated.
-     * The new scrollback size affects both the normal buffer and the alternate buffer.
+     * The new scrollback size only affects the normal buffer, not the alternate buffer.
      *
      * - Parameter newScrollback: The new scrollback size in lines. Pass `nil` to disable scrollback.
      */
     public func changeScrollback (_ newScrollback: Int?)
     {
+        // Only the normal buffer has scrollback, the alt buffer should never have scrollback.
         normalBuffer.changeHistorySize(newScrollback)
-        altBuffer.changeHistorySize(newScrollback)
-        altBuffer.disableReflow = true
 
         // Update the options to reflect the new scrollback size.
         options.scrollback = newScrollback ?? 0
@@ -5470,7 +5448,7 @@ open class Terminal {
 
     /**
      * Changes the scrollback (history) size of the terminal after it has been instantiated.
-     * The new scrollback size affects both the normal buffer and the alternate buffer.
+     * The new scrollback size only affects the normal buffer, not the alternate buffer.
      *
      * - Parameter newScrollback: The new scrollback size in lines. Pass `nil` to disable scrollback.
      */
@@ -5563,15 +5541,6 @@ open class Terminal {
     {
         buffer.yDisp = newValue
         synchronizedOutputBuffer?.yDisp = newValue
-        // Relay patch: 修复 userScrolling 断链。Terminal.userScrolling 在上游全仓从未被写为
-        // true（视图层另有一个同名 userScrolling，但 scroll() 读的是这里这个 Terminal 侧的），
-        // 导致 scroll() 末尾 `if !userScrolling { yDisp = yBase }` 每帧新输出都把视口强制拉回
-        // 底部。备用屏配了 scrollback 后，CC/codex 这类持续刷新的 agent 会让用户向上回看历史/
-        // 查看选区时被每帧弹回底部。这里按视口是否离开底部维护回看态：滚到历史区
-        // (yDisp < yBase) 锁住视口、新输出只在底部累积；滚回底部 (yDisp == yBase) 恢复跟随。
-        // setViewYDisp 是所有滚动路径(scrollTo/scrollUp/scrollDown/pageUp/pageDown/拖动条)的
-        // 唯一收口，故在此一处维护即可全覆盖、零回归。
-        userScrolling = newValue < buffer.yBase
     }
 
     /**
