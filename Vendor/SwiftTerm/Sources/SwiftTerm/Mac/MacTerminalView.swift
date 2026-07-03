@@ -3288,15 +3288,19 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // A held modifier (shift/option/command) keeps falling through to the
         // local path, consistent with mouseReportingBypassed elsewhere.
         //
-        // Relay patch: 备用屏现在自带 scrollback（见 Terminal init）。滚轮优先在 Relay 自己的
-        // 历史里本地上下浏览，而不是把手势转发给程序——这样 Claude Code / codex 等会把旧输出
-        // 滚出屏幕的 TUI，用户能像 iTerm2 那样向上滚回看历史并选中。判据天然放过 vim/less/htop
-        // 这类「就地重绘、不产生 scrollback」的全屏程序：它们 yBase 恒为 0，两个条件都不成立，
-        // 仍走下面的转发路径。
+        // Relay patch: 备用屏自带 scrollback（见 Terminal init），但只对「不上报鼠标」的
+        // 程序开放本地浏览。CC/codex 这类开着鼠标上报的 TUI 就地重绘：被推进本地 scrollback
+        // 的行全是重绘中间态（树枝装饰、半行、状态栏碎片），拿它当「历史」回看是乱的、从
+        // 那上面复制出来也是乱的；而这类程序收到滚轮上报会自己滚 transcript——那才是干净
+        // 的历史。所以鼠标上报开启时滚轮恒转发；按住 shift/⌥/⌘ 绕过上报时仍可进本地
+        // scrollback（逃生舱）。vim/less/htop（mouseMode off、yBase 恒 0）行为不变。
         let altBuf = terminal.displayBuffer
+        let appHandlesScroll = allowMouseReporting && terminal.mouseMode != .off
+            && !mouseReportingBypassed(with: event)
         let inScrollbackRegion = altBuf.yDisp < altBuf.yBase         // 已滚入历史区，继续上下浏览都本地处理
         let canEnterHistoryFromBottom = goingUp && altBuf.yBase > 0  // 在底部向上滚、且确有历史可看
-        if terminal.isDisplayBufferAlternate && (inScrollbackRegion || canEnterHistoryFromBottom) {
+        if terminal.isDisplayBufferAlternate && !appHandlesScroll
+            && (inScrollbackRegion || canEnterHistoryFromBottom) {
             flashScroller()
             if goingUp {
                 scrollUp (lines: velocity)
@@ -3307,6 +3311,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
 
         if terminal.isDisplayBufferAlternate && !mouseReportingBypassed(with: event) {
+            // 视图若还停在本地历史区（旧版本进去的，或松开修饰键前浏览过），先拉回
+            // 实时屏再转发——否则程序滚它的 transcript，屏幕却卡在历史视图不动。
+            if altBuf.yDisp < altBuf.yBase {
+                scrollTo (row: altBuf.yBase)
+            }
             // Relay patch: 走到这里 = 备用屏本地没有可滚的历史(yBase==0)。CC/codex 就地重绘、
             // yBase 恒 0（实测：滚 249 次全程 0），滚出的历史不进终端缓冲区，选区锚的是终端行
             // 坐标。旧版为防高亮罩错行在这里直接清选区；现在为选区建立内容指纹：转发滚轮后
