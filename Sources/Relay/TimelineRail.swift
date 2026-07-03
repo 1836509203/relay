@@ -1,9 +1,10 @@
 // 侧栏收起时的对话时间轴（Codex 式）：窗口左缘一列小横线，一条线 = 活动
 // Claude 会话的一轮对话（用户提问 + 回答）。静默态是一列安静的细线（最新一轮
 // 最亮）；鼠标滑过时按与光标的距离做鱼眼式联动伸长（最近的最长、邻近渐次衰减），
-// 并在最近的刻度旁弹出该轮预览（提问 + 回答开头）。
-// 点击跳转做不了：CC 跑在备用屏、自管滚动，终端没有可回滚的 scrollback。
-// 数据来自 CC transcript（AgentTranscript.recentTurns），hook 事件驱动刷新。
+// 并在最近的刻度旁弹出该轮预览（提问 + 回答开头）。点击跳转走两阶段闭环
+// 滚动（SessionStore.jumpToTurn）。只展示当前会话的轮次：最后一个 compact
+// 边界之前的历史已被 CC 换成摘要，跳不到，不给刻度。
+// 数据来自 CC transcript（AgentTranscript.recentTurns），onTick 轮询驱动刷新。
 import SwiftUI
 
 struct TimelineRail: View {
@@ -155,11 +156,9 @@ private struct TimelineTick: View {
     private var tickColor: Color {
         // 当前所在轮始终满亮；其余静默时是半透明主色（视觉为灰但要一眼可见，
         // 0.38 在深底上近乎隐形），被光标带起时向满亮白过渡——Codex 的 hover
-        // 中心是白线，不是亮灰。压缩点之前（跳转到不了）的轮次打暗一半，
-        // 视觉上就能分出「可精确跳达」与「best effort」两段。
+        // 中心是白线，不是亮灰。
         if isCurrent { return Theme.sidebarPrimary }
-        let base = turn.reachable ? 0.52 : 0.26
-        return Theme.sidebarPrimary.opacity(base + (1 - base) * lift)
+        return Theme.sidebarPrimary.opacity(0.52 + 0.48 * lift)
     }
 
     private var preview: some View {
@@ -172,17 +171,10 @@ private struct TimelineTick: View {
                 .font(Theme.uiFont(size: 11.5))
                 .foregroundColor(Theme.sidebarSecondary)
                 .lineLimit(4)
-            if turn.timestamp != nil || !turn.reachable {
-                HStack(spacing: 6) {
-                    if let ts = turn.timestamp {
-                        Text(Self.relativeTime(ts))
-                    }
-                    if !turn.reachable {
-                        Text("已压缩 · 点击滚到最早可见处")
-                    }
-                }
-                .font(Theme.uiFont(size: 10.5))
-                .foregroundColor(Theme.sidebarSecondary.opacity(0.7))
+            if let ts = turn.timestamp {
+                Text(Self.relativeTime(ts))
+                    .font(Theme.uiFont(size: 10.5))
+                    .foregroundColor(Theme.sidebarSecondary.opacity(0.7))
             }
         }
         .padding(.horizontal, 13)

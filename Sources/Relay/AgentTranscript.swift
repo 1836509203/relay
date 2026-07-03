@@ -177,9 +177,6 @@ struct ConversationTurn: Identifiable, Equatable {
     let prompt: String
     let reply: String
     let timestamp: Date?
-    /// 是否在 CC 当前重绘范围内（最后一个 compact 边界之后）。压缩点之前的
-    /// 轮次终端里物理滚不到：刻度打暗、点击 best effort 滚到最早可见处。
-    var reachable: Bool = true
     /// 内容派生的稳定 id：读取窗口大小变化时轮次序号会漂，时间戳（毫秒级）
     /// + 提问前缀跨刷新稳定。
     var id: String { "\(timestamp?.timeIntervalSince1970 ?? 0)|\(prompt.prefix(32))" }
@@ -241,21 +238,19 @@ extension AgentTranscript {
     private enum TurnEvent {
         case prompt(String, Date?)
         case reply(String)
-        case compactBoundary(Date?)
+        case compactBoundary
     }
 
     /// userPrompt 开新轮，随后的 assistantText 累进该轮回答摘要（摘要够长即止）。
-    /// 一次问答 = 一条刻度：近 limit 轮全部显示，不按 compact 边界截断——
-    /// 用户的心智模型是「聊了几轮就有几条」，刻度缺失比跳转不精确更伤。
-    /// 压缩点之前的轮次可能在 CC 重绘范围外，点击跳转 best effort（粗滚到
-    /// 可浏览最顶由 stall 检测收手）。compactBoundary 仍需识别：恢复注入的
-    /// 续接摘要不是真实提问，不能当成一轮。
+    /// 只显示当前会话的问答：最后一个 compact 边界之前的轮次全部丢弃——
+    /// 边界行落盘意味着 CC 已把那段历史替换成摘要，重绘后旧轮次在终端里
+    /// 滚不回也跳不到，留着只是噪音（打暗展示的方案被用户否掉）。进行中的
+    /// auto-compact 实测不写边界行，不会误砍屏上仍可浏览的轮次；边界行还
+    /// 兼作续接摘要的过滤——恢复注入的摘要不是真实提问，不能当成一轮。
     static func parseTurns(lines: [Substring], limit: Int, droppedHead: Bool) -> [ConversationTurn] {
         var acc: [(prompt: String, reply: String, ts: Date?)] = []
         // 窗口从中间截断时，第一个提问之前的行属于上一轮的残段，丢弃。
         var sawBoundary = !droppedHead
-        // 最后一个 compact 边界出现时已积累的轮数：之前的轮次在 CC 重绘范围外。
-        var boundaryAt = 0
         for line in lines {
             guard let event = turnEvent(line) else { continue }
             switch event {
@@ -268,14 +263,11 @@ extension AgentTranscript {
                 acc[acc.count - 1].reply = prev.isEmpty ? r : prev + "\n" + r
             case .compactBoundary:
                 sawBoundary = true
-                boundaryAt = acc.count
+                acc.removeAll()
             }
         }
-        let dropped = max(0, acc.count - limit)
-        return acc.suffix(limit).enumerated().map { i, t in
-            ConversationTurn(
-                prompt: snip(t.prompt, 160), reply: snip(t.reply, 400), timestamp: t.ts,
-                reachable: dropped + i >= boundaryAt)
+        return acc.suffix(limit).map { t in
+            ConversationTurn(prompt: snip(t.prompt, 160), reply: snip(t.reply, 400), timestamp: t.ts)
         }
     }
 
@@ -284,9 +276,7 @@ extension AgentTranscript {
     private static func turnEvent(_ line: Substring) -> TurnEvent? {
         guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
               let type = obj["type"] as? String else { return nil }
-        if obj["isCompactSummary"] as? Bool == true {
-            return .compactBoundary(parseTimestamp(obj["timestamp"] as? String))
-        }
+        if obj["isCompactSummary"] as? Bool == true { return .compactBoundary }
         if obj["isSidechain"] as? Bool == true { return nil }
         if obj["isMeta"] as? Bool == true { return nil }
         guard let message = obj["message"] as? [String: Any] else { return nil }
@@ -309,9 +299,7 @@ extension AgentTranscript {
             }
             guard var t = text?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty
             else { return nil }
-            if t.hasPrefix("This session is being continued") {
-                return .compactBoundary(parseTimestamp(obj["timestamp"] as? String))
-            }
+            if t.hasPrefix("This session is being continued") { return .compactBoundary }
             if t.hasPrefix("<command-") || t.hasPrefix("<local-command")
                 || t.hasPrefix("[Request interrupted") { return nil }
             t = t.replacingOccurrences(of: "\n", with: " ")

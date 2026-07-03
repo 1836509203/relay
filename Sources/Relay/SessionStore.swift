@@ -572,12 +572,12 @@ final class SessionStore: ObservableObject {
     }
 
     /// 屏幕文本（已去空白拼接）→ 所在轮次 id。多轮同屏时取最新的一轮。
-    /// 只在可跳达（reachable）的轮里匹配：压缩点之前的轮次视口物理到不了，
-    /// 但 compact 续接摘要会引用旧提问原文，substring 匹配会被这种引用骗到。
+    /// 轮次列表只含最后 compact 边界之后的当前会话轮，续接摘要引用旧提问
+    /// 原文骗过 substring 匹配的坑随打暗方案一起拆掉了。
     static func locateTurn(screen: String, turns: [ConversationTurn]) -> String? {
         guard !screen.isEmpty else { return nil }
         var found: String?
-        for t in turns where t.reachable {
+        for t in turns {
             guard let key = turnKey(t) else { continue }
             if screen.contains(key) { found = t.id }
         }
