@@ -462,18 +462,6 @@ final class SessionStore: ObservableObject {
     /// 上次解析时 transcript 的 mtime（只在 turnsQueue 上读写）。
     private var turnsParsedMtime: [String: Date] = [:]
 
-    /// 临时诊断（统一日志会掩码 NSLog 参数，直接落文件）。定位后删。
-    static func railLog(_ msg: String) {
-        let line = "\(Date()) \(msg)\n"
-        guard let data = line.data(using: .utf8) else { return }
-        let path = "/tmp/relay-rail.log"
-        if let h = FileHandle(forWritingAtPath: path) {
-            h.seekToEndOfFile(); h.write(data); try? h.close()
-        } else {
-            try? line.write(toFile: path, atomically: false, encoding: .utf8)
-        }
-    }
-
     /// 见 claudeSince。首次确认时顺带强刷轮次（此前 refreshTurns 一直被 guard 挡着）。
     private func markClaudeAlive(_ sid: String) {
         guard claudeSince[sid] == nil else { return }
@@ -512,25 +500,17 @@ final class SessionStore: ObservableObject {
         turnsQueue.async { [weak self] in
             guard let self else { return }
             guard let url = bound ?? Self.bindTranscript(cwd: cwd, screenLines: screenLines) else {
-                Self.railLog("bind(\(sid.prefix(5))) failed: screenLines=\(screenLines.count) cwd=\(cwd)")
                 return
             }
             // 文件没有新写入就不重复解析（重会话尾窗可达 16MB，2 秒一次太浪费）。
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate
-            if bound != nil, let mtime, self.turnsParsedMtime[sid] == mtime {
-                Self.railLog("skip(\(sid.prefix(5))) mtime unchanged \(mtime)")
-                return
-            }
+            if bound != nil, let mtime, self.turnsParsedMtime[sid] == mtime { return }
             if let mtime { self.turnsParsedMtime[sid] = mtime }
             let list = AgentTranscript.recentTurns(fromTranscript: url, limit: 32)
-            Self.railLog("parsed(\(sid.prefix(5))) \(url.lastPathComponent) turns=\(list.count)")
             DispatchQueue.main.async {
                 if self.boundTranscript[sid] == nil { self.boundTranscript[sid] = url }
-                if self.turns[sid] != list {
-                    Self.railLog("publish(\(sid.prefix(5))) turns=\(list.count) active=\(self.activeId == sid)")
-                    self.turns[sid] = list
-                }
+                if self.turns[sid] != list { self.turns[sid] = list }
             }
         }
     }
