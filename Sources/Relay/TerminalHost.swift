@@ -47,8 +47,13 @@ final class RelayTerminalView: LocalProcessTerminalView {
     /// reset=true 会重建 buffer 使容量立即生效（清屏，仅限喂数据前）。
     func ensureScrollback(reset: Bool = false) {
         let t = getTerminal()
-        t.options.scrollback = SessionStore.shared.settings.scrollback
-        if reset { t.resetToInitialState() }
+        let scrollback = SessionStore.shared.settings.scrollback
+        if reset {
+            t.options.scrollback = scrollback
+            t.resetToInitialState()
+        } else {
+            t.changeScrollback(scrollback)
+        }
     }
 
     override init(frame: CGRect) {

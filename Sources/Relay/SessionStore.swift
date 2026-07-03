@@ -592,10 +592,12 @@ final class SessionStore: ObservableObject {
     }
 
     /// 屏幕文本（已去空白拼接）→ 所在轮次 id。多轮同屏时取最新的一轮。
+    /// 只在可跳达（reachable）的轮里匹配：压缩点之前的轮次视口物理到不了，
+    /// 但 compact 续接摘要会引用旧提问原文，substring 匹配会被这种引用骗到。
     static func locateTurn(screen: String, turns: [ConversationTurn]) -> String? {
         guard !screen.isEmpty else { return nil }
         var found: String?
-        for t in turns {
+        for t in turns where t.reachable {
             guard let key = turnKey(t) else { continue }
             if screen.contains(key) { found = t.id }
         }
@@ -719,8 +721,15 @@ final class SessionStore: ObservableObject {
               let s = sessions.first(where: { $0.id == id }),
               s.kind == .claude else { return false }
         let cwd = liveCwd[id] ?? s.cwd
-        guard let cwd, !cwd.isEmpty,
-              let text = AgentTranscript.latestClaudeResponse(cwd: cwd) else { return false }
+        guard let cwd, !cwd.isEmpty else { return false }
+        var transcript = boundTranscript[id]
+        if transcript == nil {
+            transcript = Self.bindTranscript(cwd: cwd, screenLines: views[id]?.visibleLines() ?? [])
+            if let transcript { boundTranscript[id] = transcript }
+        }
+        let text = transcript.flatMap { AgentTranscript.lastAssistantText(fromTranscript: $0) }
+            ?? AgentTranscript.latestClaudeResponse(cwd: cwd)
+        guard let text else { return false }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(text, forType: .string)

@@ -172,16 +172,18 @@ private struct TimelineTick: View {
                 .font(Theme.uiFont(size: 11.5))
                 .foregroundColor(Theme.sidebarSecondary)
                 .lineLimit(4)
-            HStack(spacing: 6) {
-                if let ts = turn.timestamp {
-                    Text(Self.relativeTime(ts))
+            if turn.timestamp != nil || !turn.reachable {
+                HStack(spacing: 6) {
+                    if let ts = turn.timestamp {
+                        Text(Self.relativeTime(ts))
+                    }
+                    if !turn.reachable {
+                        Text("已压缩 · 点击滚到最早可见处")
+                    }
                 }
-                if !turn.reachable {
-                    Text("已压缩 · 点击滚到最早可见处")
-                }
+                .font(Theme.uiFont(size: 10.5))
+                .foregroundColor(Theme.sidebarSecondary.opacity(0.7))
             }
-            .font(Theme.uiFont(size: 10.5))
-            .foregroundColor(Theme.sidebarSecondary.opacity(0.7))
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 10)

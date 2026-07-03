@@ -64,43 +64,29 @@ final class SelectionTests: TerminalDelegate {
     }
 
 #if os(macOS)
-    private func mouseDraggedEvent(at point: CGPoint) -> NSEvent {
+    private func mouseEvent(_ type: NSEvent.EventType, at point: CGPoint, modifierFlags: NSEvent.ModifierFlags = [], clickCount: Int = 1) -> NSEvent {
         NSEvent.mouseEvent(
-            with: .leftMouseDragged,
+            with: type,
             location: point,
-            modifierFlags: [],
-            timestamp: 0,
-            windowNumber: 0,
-            context: nil,
-            eventNumber: 0,
-            clickCount: 1,
-            pressure: 1)!
-    }
-
-    private func mouseUpEvent(at point: CGPoint) -> NSEvent {
-        NSEvent.mouseEvent(
-            with: .leftMouseUp,
-            location: point,
-            modifierFlags: [],
-            timestamp: 0,
-            windowNumber: 0,
-            context: nil,
-            eventNumber: 0,
-            clickCount: 1,
-            pressure: 1)!
-    }
-
-    private func mouseDownEvent(at point: CGPoint, clickCount: Int = 1) -> NSEvent {
-        NSEvent.mouseEvent(
-            with: .leftMouseDown,
-            location: point,
-            modifierFlags: [],
+            modifierFlags: modifierFlags,
             timestamp: 0,
             windowNumber: 0,
             context: nil,
             eventNumber: 0,
             clickCount: clickCount,
             pressure: 1)!
+    }
+
+    private func mouseDraggedEvent(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags = []) -> NSEvent {
+        mouseEvent(.leftMouseDragged, at: point, modifierFlags: modifierFlags)
+    }
+
+    private func mouseUpEvent(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags = []) -> NSEvent {
+        mouseEvent(.leftMouseUp, at: point, modifierFlags: modifierFlags)
+    }
+
+    private func mouseDownEvent(at point: CGPoint, clickCount: Int = 1, modifierFlags: NSEvent.ModifierFlags = []) -> NSEvent {
+        mouseEvent(.leftMouseDown, at: point, modifierFlags: modifierFlags, clickCount: clickCount)
     }
 
     // Test only on macOS due to differences in how frames are handled on mac and iOS
@@ -118,6 +104,46 @@ final class SelectionTests: TerminalDelegate {
         // Scroll all the way back up, check the top-left corner
         view.scrollTo(row: 1)
         #expect(view.calculateMouseHit(at: CGPoint(x: 0, y: 10)).grid.row == 1)
+    }
+
+    @Test func testLocalSelectionGestureKeepsOwnershipWhenOptionIsPressedMidDrag() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1002h")
+        view.feed(text: (0..<20).map { "line \($0)" }.joined(separator: "\r\n"))
+        #expect(view.terminal.mouseMode == .buttonEventTracking)
+
+        let start = CGPoint(x: view.cellDimension.width * 2, y: view.bounds.midY)
+        let end = CGPoint(x: view.cellDimension.width * 12, y: view.bounds.midY)
+        view.mouseDown(with: mouseDownEvent(at: start))
+        view.mouseDragged(with: mouseDraggedEvent(at: end, modifierFlags: .option))
+        view.mouseUp(with: mouseUpEvent(at: end, modifierFlags: .option))
+
+        #expect(view.selection.active == true)
+        #expect(delegate.sent.isEmpty == true)
+    }
+
+    @Test func testTerminalMouseGestureKeepsOwnershipWhenOptionIsReleasedMidDrag() {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 800, height: 240)))
+        let delegate = CapturingTerminalViewDelegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1B}[?1002h")
+        #expect(view.terminal.mouseMode == .buttonEventTracking)
+
+        let start = CGPoint(x: view.cellDimension.width * 2, y: view.bounds.midY)
+        let end = CGPoint(x: view.cellDimension.width * 12, y: view.bounds.midY)
+        view.mouseDown(with: mouseDownEvent(at: start, modifierFlags: .option))
+        let afterDown = delegate.sent.count
+        #expect(afterDown > 0)
+
+        view.mouseDragged(with: mouseDraggedEvent(at: end))
+        let afterDrag = delegate.sent.count
+        #expect(afterDrag > afterDown)
+
+        view.mouseUp(with: mouseUpEvent(at: end))
+        #expect(delegate.sent.count > afterDrag)
+        #expect(view.selection.active == false)
     }
 
     // Relay regression: 拖拽到视口上/下边缘时，选区应靠自动滚动继续扩展。
@@ -710,6 +736,8 @@ final class SelectionTests: TerminalDelegate {
         let frame3 = Array(frame1.dropFirst(9)) + (0..<9).map { "beta line \($0)" }
         view.feed(text: "\u{1B}[2J\u{1B}[H" + frame3.joined(separator: "\r\n"))
         #expect(view.selection.active == false)
+        #expect(view.hasCopyableSelection() == true)
+        #expect(view.selectedTextForCopy().contains("alpha line 4"))
 
         // 滚回来：选中内容重新入屏 → 高亮自动恢复到原内容、原列。
         view.feed(text: "\u{1B}[2J\u{1B}[H" + frame2.joined(separator: "\r\n"))

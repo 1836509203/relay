@@ -1818,7 +1818,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             case Int(NSFindPanelAction.previous.rawValue):
                 return true
             case Int(NSFindPanelAction.setFindString.rawValue):
-                return selection.active
+                return hasCopyableSelection()
             default:
                 return false
             }
@@ -1838,7 +1838,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 case .previousMatch:
                     return true
                 case .setSearchString:
-                    return selection.active
+                    return hasCopyableSelection()
                 default:
                     return false
                 }
@@ -1849,7 +1849,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         case #selector(selectAll(_:)):
             return true
         case #selector(copy(_:)):
-            return selection.active
+            return hasCopyableSelection()
         default:
             print ("Validating User Interface Item: \(item)")
             return false
@@ -2062,6 +2062,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     {
         // find the selected range of text in the buffer and put in the clipboard
         let str = selectedTextForCopy()
+        guard !str.isEmpty else {
+            return
+        }
         
         let clipboard = NSPasteboard.general
         clipboard.clearContents()
@@ -2073,7 +2076,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         let copyItem = menu.addItem(withTitle: "拷贝", action: #selector(copy(_:)), keyEquivalent: "")
         copyItem.target = self
-        copyItem.isEnabled = selection?.active == true
+        copyItem.isEnabled = hasCopyableSelection()
 
         let pasteItem = menu.addItem(withTitle: "粘贴", action: #selector(paste(_:)), keyEquivalent: "")
         pasteItem.target = self
@@ -2088,6 +2091,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public override func selectAll(_ sender: Any?)
     {
         resetAlternateSelectionAutoScrollCapture()
+        browseSelectionAnchor = nil
         selectAll ()
     }
     
@@ -2145,11 +2149,19 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // mouseDown 记录的选区锚点：保证拖拽划选从「真正按下的格子」开始，而非拖动第一帧的采样点。
     private var pendingSelectionAnchor: Position?
 
+    enum MouseInteractionOwner {
+        case none
+        case localSelection
+        case localSelectionAutoScrolling
+        case terminalApp
+    }
+
     // 拖拽划选进行中标志：为 true 时，流式输出（feedPrepare / linefeed）不得清掉选区，
     // 否则在 Claude Code/codex 等持续刷新的程序里，用户刚划下的选区会被下一帧抹掉，根本选不中。
     // mouseDragged 置 true，mouseDown / mouseUp 复位。非 private：feedPrepare 在
     // AppleTerminalView.swift 的同模块扩展里需读取它。
     var isSelectionDragInProgress = false
+    private var mouseInteractionOwner: MouseInteractionOwner = .none
 
     enum AlternateSelectionAutoScrollDirection {
         case up
@@ -2274,6 +2286,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         guard selectionAutoScrollTimer == nil else {
             return
         }
+        if mouseInteractionOwner == .localSelection {
+            mouseInteractionOwner = .localSelectionAutoScrolling
+        }
         let timer = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] timer in
             self?.scrollingTimerElapsed(source: timer)
         }
@@ -2287,6 +2302,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         autoScrollDelta = 0
         selectionAutoScrollTimer?.invalidate()
         selectionAutoScrollTimer = nil
+        if mouseInteractionOwner == .localSelectionAutoScrolling {
+            mouseInteractionOwner = .localSelection
+        }
     }
 
     func updateSelectionAutoScroll (at point: CGPoint)
@@ -2358,6 +2376,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     private func canSelectionAutoScrollLocally(delta: Int) -> Bool {
         let displayBuffer = terminal.displayBuffer
+        // Relay patch: 程序自管滚动（鼠标上报开启）且视图在实时屏时，拖选到边缘
+        // 不进本地 scrollback——里面是就地重绘的中间态（树枝装饰/半行），选到的是
+        // 脏行；返回 false 走转发路径让程序翻页+累积器拼接（与 scrollWheel 同语义）。
+        // 视图已在历史区（逃生舱显式进入的）则保持本地滚动，继续选历史行。
+        if terminal.isDisplayBufferAlternate && allowMouseReporting && terminal.mouseMode != .off
+            && displayBuffer.yDisp >= displayBuffer.yBase {
+            return false
+        }
         let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
         if delta < 0 {
             return displayBuffer.yDisp > 0
@@ -2397,7 +2423,22 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
            let text = alternateSelectionAutoScrollText, !text.isEmpty {
             return text
         }
-        return selection.getSelectedText()
+        if !selection.active, terminal.isDisplayBufferAlternate,
+           let text = browseSelectionAnchor?.text, !text.isEmpty {
+            return text
+        }
+        return Self.sanitizedCopiedText(selection.getSelectedText())
+    }
+
+    func hasCopyableSelection () -> Bool
+    {
+        if selection?.active == true {
+            return !selectedTextForCopy().isEmpty
+        }
+        if terminal.isDisplayBufferAlternate, let text = browseSelectionAnchor?.text {
+            return !text.isEmpty
+        }
+        return false
     }
 
     private func resetAlternateSelectionAutoScrollCapture ()
@@ -2421,6 +2462,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         var lowerRow: Int
         let upperCol: Int
         let lowerCol: Int
+        /// 选区暂时滚出屏幕时仍可复制的封存文本。视觉高亮是当前屏幕投影，
+        /// 复制语义是用户原本框住的内容，二者不能绑死在 selection.active 上。
+        let text: String
         /// 内容窗口（≤4 行屏幕文本，至少含一行非空白）+ 窗口首行相对 upperRow 的行差。
         /// 两条：upper 侧与 lower 侧各一，长选区只剩一端在屏内时也能找回。锚在固定 UI 区
         /// （CC 底部状态栏）的窗口会在首个滚动帧被识别并剔除（见 relocateBrowseSelection）。
@@ -2468,9 +2512,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             }
         }
         guard !prints.isEmpty else { return }
+        let selectedText = Self.sanitizedCopiedText(selection.getSelectedText())
+        guard !selectedText.isEmpty else { return }
         browseSelectionAnchor = BrowseSelectionAnchor(
             upperRow: ordered.upper.row, lowerRow: ordered.lower.row,
             upperCol: ordered.upper.col, lowerCol: ordered.lower.col,
+            text: selectedText,
             fingerprints: prints)
     }
 
@@ -2671,6 +2718,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             s.removeLast()
         }
         return s
+    }
+
+    static func sanitizedCopiedText (_ text: String) -> String
+    {
+        if text.contains("\u{0}") {
+            return text.replacingOccurrences(of: "\u{0}", with: " ")
+        }
+        return text
     }
 
     func visibleAlternateScreenLines () -> [String]
@@ -2927,6 +2982,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return f.contains(.shift) || f.contains(.option) || f.contains(.command)
     }
 
+    private func terminalMouseOwnsNewGesture(with event: NSEvent) -> Bool {
+        allowMouseReporting && terminal.mouseMode.sendButtonPress() && mouseReportingRequested(with: event)
+    }
+
+    private func sendTerminalMouseDrag(with event: NSEvent, hit: (grid: Position, pixels: Position)) {
+        let displayBuffer = terminal.displayBuffer
+        let flags = encodeMouseEvent(with: event)
+        let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
+        terminal.sendMotion(buttonFlags: flags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+    }
+
     /// Relay patch（划选优先）：本产品是 AI agent 终端，从运行中的 Claude Code/
     /// Codex 输出里划选、复制是高频核心动作。因此点击/拖拽反转了终端默认优先级——
     /// 普通拖拽 **始终本地划选**，即使 TUI（vim/tmux/Claude Code/Codex 等）开了
@@ -2989,8 +3055,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     public override func mouseDown(with event: NSEvent) {
         stopSelectionAutoScroll()
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() && mouseReportingRequested(with: event) {
-            sharedMouseEvent(with: event)
+        mouseInteractionOwner = terminalMouseOwnsNewGesture(with: event) ? .terminalApp : .localSelection
+        if mouseInteractionOwner == .terminalApp {
+            pendingSelectionAnchor = nil
+            isSelectionDragInProgress = false
+            if terminal.mouseMode.sendButtonPress() {
+                sharedMouseEvent(with: event)
+            }
+            setNeedsDisplay(bounds)
             return
         }
 
@@ -3035,6 +3107,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var didSelectionDrag: Bool = false
     
     public override func mouseUp(with event: NSEvent) {
+        let owner = mouseInteractionOwner
+        defer {
+            mouseInteractionOwner = .none
+            didSelectionDrag = false
+        }
+
         stopSelectionAutoScroll()
         pendingSelectionAnchor = nil
         if terminal.isDisplayBufferAlternate, isSelectionDragInProgress,
@@ -3055,13 +3133,20 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         alternateSelectionAutoScrollNeedsCaptureAfterFeed = false
         // 拖拽结束：恢复主屏「输出滚动时清选区」的原行为（备用屏由 feedPrepare/linefeed 自身判断保留）。
         isSelectionDragInProgress = false
+        let hit = calculateMouseHit(with: event).grid
+        if owner == .terminalApp {
+            resetAlternateSelectionAutoScrollCapture()
+            if allowMouseReporting && terminal.mouseMode.sendButtonRelease() {
+                sharedMouseEvent(with: event)
+            }
+            return
+        }
         // 选区定格：为浏览态建立内容指纹——之后滚轮浏览/程序流式输出时高亮按内容绝对
         // 重定位（快滚免疫），滚出屏隐藏、滚回来恢复。
         browseSelectionAnchor = nil
         if terminal.isDisplayBufferAlternate, selection.active {
             ensureBrowseSelectionAnchor()
         }
-        let hit = calculateMouseHit(with: event).grid
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
             terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
@@ -3074,34 +3159,27 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             onRequestOpenLocalPath?(token)
             return
         }
-        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() && mouseReportingRequested(with: event) {
-            sharedMouseEvent(with: event)
-            return
-        }
         
         #if DEBUG
         // let hit = calculateMouseHit(with: event)
         //print ("Up at col=\(hit.col) row=\(hit.row) count=\(event.clickCount) selection.active=\(selection.active) didSelectionDrag=\(didSelectionDrag) ")
         #endif
-        
-        didSelectionDrag = false
     }
     
     public override func mouseDragged(with event: NSEvent) {
-        let displayBuffer = terminal.displayBuffer
         let point = convert(event.locationInWindow, from: nil)
         let mouseHit = calculateMouseHit(at: point)
-        let hit = mouseHit.grid
-        if allowMouseReporting && mouseReportingRequested(with: event) {
+        if mouseInteractionOwner == .none {
+            mouseInteractionOwner = terminalMouseOwnsNewGesture(with: event) ? .terminalApp : .localSelection
+        }
+
+        if mouseInteractionOwner == .terminalApp {
             stopSelectionAutoScroll()
-            if terminal.mouseMode.sendMotionEvent() {
-                let flags = encodeMouseEvent(with: event)
-                let screenRow = max (0, min (displayBuffer.rows - 1, hit.row - displayBuffer.yDisp))
-                terminal.sendMotion(buttonFlags: flags, x: hit.col, y: screenRow, pixelX: mouseHit.pixels.col, pixelY: mouseHit.pixels.row)
-            
+            if allowMouseReporting && (terminal.mouseMode.sendButtonTracking() || terminal.mouseMode.sendMotionEvent()) {
+                sendTerminalMouseDrag(with: event, hit: mouseHit)
                 return
             }
-            if terminal.mouseMode != .off {
+            if allowMouseReporting && terminal.mouseMode != .off {
                 return
             }
         }
@@ -3119,6 +3197,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         pendingSelectionAnchor = nil
         didSelectionDrag = true
+        mouseInteractionOwner = .localSelection
         // 标记拖拽划选进行中：在此期间 feedPrepare/linefeed 不会因流式输出清掉选区，
         // 这是「下拖自动滚动选中」和「Claude Code 里流式划选」能成立的前提。
         isSelectionDragInProgress = true
@@ -3311,10 +3390,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
 
         if terminal.isDisplayBufferAlternate && !mouseReportingBypassed(with: event) {
-            // 视图若还停在本地历史区（旧版本进去的，或松开修饰键前浏览过），先拉回
-            // 实时屏再转发——否则程序滚它的 transcript，屏幕却卡在历史视图不动。
+            // 视图若还停在本地历史区（逃生舱浏览过、或旧版本进去的），这一下滚轮只做
+            // 「回到实时屏」，吞掉不转发——否则回底的同时 transcript 又被多滚一步（向下
+            // 滚时可感知为过冲）；下一下滚轮才开始滚程序内容。
             if altBuf.yDisp < altBuf.yBase {
                 scrollTo (row: altBuf.yBase)
+                return
             }
             // Relay patch: 走到这里 = 备用屏本地没有可滚的历史(yBase==0)。CC/codex 就地重绘、
             // yBase 恒 0（实测：滚 249 次全程 0），滚出的历史不进终端缓冲区，选区锚的是终端行
@@ -3370,6 +3451,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// 数千行，10 行/拍到不了），步长节奏由调用方闭环控制。
     public func sendProgrammaticAltScroll(up: Bool, lines: Int) {
         guard terminal.isDisplayBufferAlternate else { return }
+        // 与手势路径同防御：视图若停在本地历史区（逃生舱/PageUp/scroller 进去的），
+        // 先拉回实时屏再让程序滚——否则程序滚 transcript、屏幕卡在历史视图不动，
+        // 跳转闭环读到的是静止的历史行，stall 检测会误判跳转失败而收手。
+        let altBuf = terminal.displayBuffer
+        if altBuf.yDisp < altBuf.yBase {
+            scrollTo (row: altBuf.yBase)
+        }
         if selection.active && !isSelectionDragInProgress {
             ensureBrowseSelectionAnchor()
         }
