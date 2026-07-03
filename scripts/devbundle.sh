@@ -22,6 +22,9 @@ PLIST="$DEV/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $DEV_ID" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $DEV_NAME" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DEV_NAME" "$PLIST"
+/usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment:RELAY_DATA_DIR string $DATA_DIR" "$PLIST"
 
 # 去掉拷贝带入的扩展属性/自定义图标资源叉，否则 codesign 报 "resource fork ... not allowed"。
 xattr -cr "$DEV"
@@ -38,11 +41,8 @@ pkill -f "$DEV/Contents/MacOS/Relay" 2>/dev/null || true
 sleep 1
 
 mkdir -p "$DATA_DIR"
-# 直接拉起可执行（而非 open）：只有这样 RELAY_DATA_DIR 环境变量才确实传进 app ——
-# open 经 LaunchServices 启动会丢掉调用方 env。nohup + disown 让它在 Bash 工具调用
-# 结束后继续存活。（RELAY_ALT_HARVEST 已随收割代码删除，v0.5.7 起无此开关。）
-RELAY_DATA_DIR="$DATA_DIR" \
-    nohup "$DEV/Contents/MacOS/Relay" >/tmp/relay-dev.log 2>&1 &
-disown || true
+# 通过 LaunchServices 启动真实 app bundle，避免直接执行 GUI 二进制时被进程管理器
+# 当作短生命周期进程清掉。RELAY_DATA_DIR 通过 dev bundle 的 LSEnvironment 注入。
+/usr/bin/open -n "$DEV"
 
 echo "OK: relaunched $DEV (id=$DEV_ID, data=$DATA_DIR)"
