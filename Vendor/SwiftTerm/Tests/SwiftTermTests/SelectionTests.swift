@@ -319,3 +319,68 @@ final class SelectionTests: TerminalDelegate {
         #expect(selection.end.col == 3)
     }
 }
+
+#if os(macOS)
+import AppKit
+
+// Relay regression: 本地划选的锚点必须取 mouseDown 的格子，不能等第一个
+// mouseDragged 才定——快速拖拽时两事件间光标已飘出十几列，选区会丢头
+//（实测 ⌥ 拖选 CC login 长 URL 时 "https://cla" 开头选不进去）。
+final class SelectionAnchorTests {
+    private func event(_ type: NSEvent.EventType, at point: CGPoint,
+                       flags: NSEvent.ModifierFlags = []) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: type, location: point, modifierFlags: flags, timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+    }
+
+    /// (col, row) 格中心的视图坐标（左下原点）。
+    private func point(_ view: TerminalView, col: Int, row: Int) -> CGPoint {
+        CGPoint(x: (CGFloat(col) + 0.5) * view.cellDimension.width,
+                y: view.bounds.height - (CGFloat(row) + 0.5) * view.cellDimension.height)
+    }
+
+    private func makeViewWithWrappedUrl() -> TerminalView {
+        let view = TerminalView(frame: CGRect(origin: .zero, size: .init(width: 640, height: 240)))
+        let cols = view.terminal.cols
+        // 一条跨行折断的长 URL + 鼠标上报开启（CC 场景），头部 11 字符是丢头重灾区。
+        view.feed(text: "https://cla" + String(repeating: "x", count: cols * 2))
+        view.feed(text: "\u{1b}[?1002h")
+        return view
+    }
+
+    /// ⌥ 拖选：按在 col0，第一个 dragged 事件已飘到 col11（快速拖拽），
+    /// 选中文本必须仍从按下的格子（URL 头）开始。
+    @Test func testFastOptionDragKeepsHeadAnchoredAtMouseDown() {
+        let view = makeViewWithWrappedUrl()
+        view.mouseDown(with: event(.leftMouseDown, at: point(view, col: 0, row: 0), flags: .option))
+        view.mouseDragged(with: event(.leftMouseDragged, at: point(view, col: 11, row: 0), flags: .option))
+        view.mouseDragged(with: event(.leftMouseDragged, at: point(view, col: 20, row: 1), flags: .option))
+        view.mouseUp(with: event(.leftMouseUp, at: point(view, col: 20, row: 1), flags: .option))
+
+        #expect(view.selection.active)
+        #expect(view.selection.getSelectedText().hasPrefix("https://cla"))
+    }
+
+    /// 无修饰键按下（事件上报给程序），拖拽途中才按下 ⇧ 接管成本地划选：
+    /// 锚点同样应回溯到按下位置，而不是按下 ⇧ 那一刻的位置。
+    @Test func testMidDragShiftTakeoverAnchorsAtMouseDown() {
+        let view = makeViewWithWrappedUrl()
+        view.mouseDown(with: event(.leftMouseDown, at: point(view, col: 0, row: 0)))
+        view.mouseDragged(with: event(.leftMouseDragged, at: point(view, col: 8, row: 0)))
+        view.mouseDragged(with: event(.leftMouseDragged, at: point(view, col: 15, row: 0), flags: .shift))
+        view.mouseUp(with: event(.leftMouseUp, at: point(view, col: 15, row: 0), flags: .shift))
+
+        #expect(view.selection.active)
+        #expect(view.selection.getSelectedText().hasPrefix("https://cla"))
+    }
+
+    /// 松开后锚点即清：下一次拖选不受上一次按下位置污染。
+    @Test func testAnchorClearedOnMouseUp() {
+        let view = makeViewWithWrappedUrl()
+        view.mouseDown(with: event(.leftMouseDown, at: point(view, col: 0, row: 0), flags: .option))
+        view.mouseUp(with: event(.leftMouseUp, at: point(view, col: 0, row: 0), flags: .option))
+        #expect(view.pendingSelectionAnchor == nil)
+    }
+}
+#endif

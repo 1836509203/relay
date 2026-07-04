@@ -2209,13 +2209,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     public override func mouseDown(with event: NSEvent) {
+        let hit = calculateMouseHit(with: event).grid
+        // 锚点在按下时就记（iTerm2 语义：选区从按下的格子开始）。若等到第一个
+        // mouseDragged 才定锚，快速拖拽时事件间隔内光标已飘出十几列，选区开头
+        // 会整段丢掉（实测选长 URL 时 https:// 头选不进去）。上报分支也记录：
+        // 按下后中途才按 ⇧/⌥ 接管成本地划选时，同样从按下位置起算。
+        pendingSelectionAnchor = hit
         if allowMouseReporting && terminal.mouseMode.sendButtonPress() && !mouseReportingBypassed(with: event) {
             sharedMouseEvent(with: event)
             return
         }
-        
-        let hit = calculateMouseHit(with: event).grid
-        
+
         switch event.clickCount {
         case 1:
             if selection.active == true {
@@ -2246,8 +2250,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     var didSelectionDrag: Bool = false
-    
+    /// 本次按下的命中格（buffer 坐标），本地划选建立选区时的锚点；松开即清。
+    var pendingSelectionAnchor: Position? = nil
+
     public override func mouseUp(with event: NSEvent) {
+        pendingSelectionAnchor = nil
         let hit = calculateMouseHit(with: event).grid
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
@@ -2294,8 +2301,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if selection.active {
             selection.dragExtend(bufferPosition: Position(col: hit.col, row: hit.row))
         } else {
-            selection.setSoftStart(bufferPosition: Position(col: hit.col, row: hit.row))
+            selection.setSoftStart(bufferPosition: pendingSelectionAnchor ?? Position(col: hit.col, row: hit.row))
             selection.startSelection()
+            selection.dragExtend(bufferPosition: Position(col: hit.col, row: hit.row))
         }
         didSelectionDrag = true
         autoScrollDelta = 0
