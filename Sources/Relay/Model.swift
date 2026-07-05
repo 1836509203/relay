@@ -100,6 +100,7 @@ struct AppSettings: Codable {
     static let defaultFontSize: Double = 14
     static let defaultLineSpacing: Double = 1
     static let defaultLetterSpacing: Double = -0.25
+    private static let systemFontDefaultLetterSpacing: Double = -0.75
     /// 默认终端字体：Noto Sans Mono CJK SC。其 ASCII "W" 步进约 0.5em，故汉字(占 2 格)=1.0em=
     /// 中文自然字宽、字距紧凑（参照 Codex）；而系统等宽 SF Mono 的 "W" 约 0.6em，汉字 2 格=1.2em
     /// 会有 ~20% 右侧空隙。未安装该字体时 TerminalTheme.font 会优雅回退到 SF Mono。
@@ -107,7 +108,7 @@ struct AppSettings: Codable {
     private static let legacyDefaultFontSize: Double = 12
     private static let legacyDefaultLineSpacing: Double = 0
     private static let legacyDefaultLetterSpacing: Double = 0
-    private static let currentTerminalGeometryVersion = 3
+    private static let currentTerminalGeometryVersion = 4
 
     /// 终端默认排版贴近 Codex 主内容的阅读密度；字格仍保持等宽，只做轻微收紧。
     var fontSize: Double = defaultFontSize
@@ -234,6 +235,14 @@ struct AppSettings: Codable {
                 fontSize = Self.defaultFontSize
                 lineSpacing = Self.defaultLineSpacing
                 letterSpacing = Self.defaultLetterSpacing
+            }
+        }
+
+        if terminalGeometryVersion < 4, fontName == "system" {
+            let usingLooseSystemSpacing = approx(letterSpacing, Self.legacyDefaultLetterSpacing)
+                || approx(letterSpacing, Self.defaultLetterSpacing)
+            if usingLooseSystemSpacing {
+                letterSpacing = Self.systemFontDefaultLetterSpacing
             }
         }
 
