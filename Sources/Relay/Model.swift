@@ -169,6 +169,9 @@ struct AppSettings: Codable {
     /// system / on / off
     var motionPreference: String = "system"
     var uiFontSize: Double = 14
+    /// 退出时正聚焦的会话 id（仅退出路径写入）：重启把焦点还给用户当时正看着的
+    /// 会话，而不是「最后创建」的那个。找不到（会话已删）回落最后一个。
+    var lastActiveId: String?
 
     // 旧版本设置文件缺字段时取默认值。
     init() {}
@@ -201,6 +204,7 @@ struct AppSettings: Codable {
         uiFontName = (try? c.decode(String.self, forKey: .uiFontName)) ?? "system"
         motionPreference = (try? c.decode(String.self, forKey: .motionPreference)) ?? "system"
         uiFontSize = (try? c.decode(Double.self, forKey: .uiFontSize)) ?? 14
+        lastActiveId = try? c.decode(String.self, forKey: .lastActiveId)
 
         migrateTerminalGeometryIfNeeded()
     }

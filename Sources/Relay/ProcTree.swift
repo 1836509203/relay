@@ -10,6 +10,13 @@ struct ProcTable {
     private let cmd: [pid_t: String]
     private let children: [pid_t: [pid_t]]
 
+    /// ps 失败返回的空表：classify 对任何 pid 都答 .shell，不可用于降级判定。
+    var isEmpty: Bool { cmd.isEmpty }
+
+    /// root 进程本身是否在快照里——不在（ps 输出截断/进程刚退）时对该树的
+    /// 分类不可信，调用方应跳过而不是当作「已不是 agent」。
+    func contains(_ pid: pid_t) -> Bool { cmd[pid] != nil }
+
     /// 抓取当前进程表。`ps` 失败时返回空表（调用方跳过本轮，不崩）。
     static func snapshot() -> ProcTable {
         var cmd: [pid_t: String] = [:]

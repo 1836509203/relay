@@ -116,7 +116,6 @@ final class SessionStore: ObservableObject {
     private var ticker: Timer?
     private var tick: UInt64 = 0
     private var idCounter = 0
-    private var notifCounter = 0
     private let scrollbackCap = 256 * 1024
     private(set) var hookServer: HookServer?
     private let ioQueue = DispatchQueue(label: "relay.io", qos: .utility)
@@ -325,7 +324,14 @@ final class SessionStore: ObservableObject {
         det.removeValue(forKey: id)
         sessions.removeAll { $0.id == id }
         unread.remove(id)
-        try? FileManager.default.removeItem(at: DataDir.scrollbackFile(id))
+        liveCwd.removeValue(forKey: id)
+        restoredIds.remove(id)
+        clearClaudeTurns(id) // 轮次/transcript 绑定等会话级辅助状态一并清，防长期运行字典累积
+        // 删除必须与写入同队列串行：flush/onExit 已排进 ioQueue 的异步快照写若晚于
+        // 主线程删除执行，会把刚关闭会话的 scrollback 文件写回磁盘（id 不复用，
+        // 复活的文件永久泄漏、无人清理）。
+        let file = DataDir.scrollbackFile(id)
+        ioQueue.async { try? FileManager.default.removeItem(at: file) }
         panes.removeAll { $0 == id }
     }
 
@@ -335,6 +341,9 @@ final class SessionStore: ObservableObject {
         if let a = activeId, sessions.contains(where: { $0.id == a }) { return }
         if let p = panes.first {
             activeId = p
+            // 键盘焦点跟着落过去：关闭 pane 后 firstResponder 还挂在死视图/侧栏上，
+            // 幸存 pane 看着聚焦了却打不进字。
+            focusActiveTerminal()
             return
         }
         activeId = nil
@@ -509,6 +518,9 @@ final class SessionStore: ObservableObject {
             if let mtime { self.turnsParsedMtime[sid] = mtime }
             let list = AgentTranscript.recentTurns(fromTranscript: url, limit: 32)
             DispatchQueue.main.async {
+                // 解析期间会话可能已被关闭（destroy 已清理）：不再写回，
+                // 否则给死会话复活 turns/boundTranscript 条目（字典泄漏）。
+                guard self.sessions.contains(where: { $0.id == sid }) else { return }
                 if self.boundTranscript[sid] == nil { self.boundTranscript[sid] = url }
                 if self.turns[sid] != list { self.turns[sid] = list }
             }
@@ -851,7 +863,8 @@ final class SessionStore: ObservableObject {
         // 可用目录（同项目下各标签目录一致）；最后才回落 home。
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let session = sessions.first(where: { $0.id == id })
-        let startDir = resolveStartDir(for: id) ?? home
+        let resolvedDir = resolveStartDir(for: id)
+        let startDir = resolvedDir ?? home
         v.startProcess(
             executable: shell, args: ["-l"],
             environment: env.map { "\($0.key)=\($0.value)" },
@@ -861,12 +874,24 @@ final class SessionStore: ObservableObject {
         // 无感继续）。仅对从磁盘恢复的会话触发一次；新建的 claude/codex 不动。
         // 不用固定延时——login shell 启动慢会在提示符出现前误执行残缺命令；
         // 改由 autoResume 等「shell 已输出且静默一小段」再发，并有超时兜底。
+        // 两道闸门：
+        // ① 目录没恢复出来（回落 home）不续——resume 按 cwd 找会话，在 home 里
+        //   --continue 会接上完全无关的历史对话，比不续更糟；
+        // ② 同 kind+同目录只自动续第一个标签——同项目多个恢复的 claude 标签都发
+        //   --continue 会全部附到同一个（最新）会话上，续重且互相污染。
         if restoredIds.remove(id) != nil,
-           let kind = session?.kind, let cmd = resumeCommand(for: kind) {
-            autoResume(id: id, cmd: cmd, view: v, started: Date())
+           let kind = session?.kind, let cmd = resumeCommand(for: kind),
+           let dir = resolvedDir {
+            let dedupeKey = "\(kind.rawValue)|\(dir)"
+            if autoResumedKeys.insert(dedupeKey).inserted {
+                autoResume(id: id, cmd: cmd, view: v, started: Date())
+            }
         }
         return v
     }
+
+    /// 本次启动已自动续接过的 kind+目录组合（见 terminalView 的去重闸门）。
+    private var autoResumedKeys: Set<String> = []
 
     /// 路径存在且是目录（恢复 cwd 前校验，目录被删/改名则回落 home）。
     private func isUsableDir(_ path: String) -> Bool {
@@ -892,7 +917,8 @@ final class SessionStore: ObservableObject {
         switch kind {
         case .claude: return "claude --continue"
         case .codex: return "codex resume --last"
-        case .opencode: return "opencode"
+        // 裸 `opencode` 是开新会话，不是续接；--continue 才接上最近一次会话。
+        case .opencode: return "opencode --continue"
         default: return nil
         }
     }
@@ -902,10 +928,13 @@ final class SessionStore: ObservableObject {
     /// resume 命令并回车。固定延时不可靠：login shell 启动慢会在提示符出现前
     /// 误执行残缺命令。
     /// - maxWait 兜底：极端情况下 shell 长时间无输出也强制发，避免永不继续。
-    /// - 视图被替换 / 会话已删 / 进程已退出 → 放弃，不向错误目标注入。
+    /// - 视图被替换 / 会话已删 / 进程已退出 / 用户已开始打字 → 放弃，不向错误目标注入。
     private func autoResume(id: String, cmd: String, view: RelayTerminalView, started: Date) {
         let quiet = 0.6, maxWait = 8.0
         guard views[id] === view, sessions.contains(where: { $0.id == id }) else { return }
+        // 用户抢先手动输入：quiet 判定分不清「banner 打完」和「用户打字停顿」，
+        // 照发会把 resume 命令拼进敲了一半的命令行并回车执行。用户接管即放弃。
+        if view.userHasTyped { return }
         let ds = det[id]
         if ds?.exited == true { return }
         let now = Date()
@@ -972,16 +1001,33 @@ final class SessionStore: ObservableObject {
         ds?.dirty = false
         ds?.lastBusy = nil
         ds?.exited = true // 退出后残留输出不再点亮状态（见 feed）
-        if let v = views[id] {
-            saveScrollback(id, snapshotData(of: v))
-        }
         let failed = (code ?? 1) != 0
         // 进程在视图创建后极短时间内异常退出 = startProcess 没真正起来
         //（如 $SHELL 指向坏路径）。清掉死视图与检测态，让下次点开重建，
         // 否则 terminalView(for:) 永远返回这个黑屏死视图、会话彻底坏死。
         // 正常用过的 shell（存活超过阈值）即便非零退出也保留，用户可能想
         // 看最后的输出。历史快照仍在磁盘，重建时会回放。
+        var quickFail = false
         if failed, let started = ds?.startedAt, Date().timeIntervalSince(started) < 1.5 {
+            quickFail = true
+        }
+        if let v = views[id] {
+            // 收尾标记：进程退出后窗口不再有任何输出，没有这行标记画面只是悄悄
+            // 冻结，用户分不清「卡死」还是「退了」（iTerm2 的 [进程已完成] 同理）。
+            // 先喂再存快照，重启回放的历史里也能看到会话在哪里结束。
+            // 秒退重建的死视图不喂（马上销毁）。
+            if !quickFail {
+                let label: String
+                if let code {
+                    label = code == 0 ? "进程已结束" : "进程已结束（状态码 \(code)）"
+                } else {
+                    label = "进程已被终止"
+                }
+                v.feed(text: "\r\n\u{1b}[2m── \(label) ──\u{1b}[0m\r\n")
+            }
+            saveScrollback(id, snapshotData(of: v))
+        }
+        if quickFail {
             views[id]?.removeFromSuperview()
             views.removeValue(forKey: id)
             det.removeValue(forKey: id)
@@ -1049,6 +1095,12 @@ final class SessionStore: ObservableObject {
                   !ds.hookSeen, s.status == .running,
                   let lb = ds.lastBusy, now.timeIntervalSince(lb) > Detector.settleSeconds
             else { continue }
+            // agent 的 lastBusy 只靠上面的扫屏续命，而扫屏在用户滚离底部时冻结；
+            // settle 若不同步冻结，回看历史 >settleSeconds 就把运行中的 agent 误结算
+            // 成 Done（假「已完成」通知 + 未读点，滚回底部又跳回 Running）。
+            // 判定冻结期间结算一并冻结，回到底部后由扫屏续命或正常收尾。
+            // （备用屏 TUI canScroll 恒 false，不受此守卫影响，行为不变。）
+            if s.kind.isAgent, let v = views[id], v.canScroll, v.scrollPosition < 0.99 { continue }
             det[id]?.lastBusy = nil
             applyStatus(id, s.kind.isAgent ? .done : .idle, nil)
         }
@@ -1189,12 +1241,13 @@ final class SessionStore: ObservableObject {
     /// taskId 写入 userInfo，供点击通知时跳回对应任务（见 AppDelegate 代理）。
     private func postSystemNotification(title: String, body: String, taskId: String? = nil) {
         guard Bundle.main.bundleIdentifier != nil else { return }
-        notifCounter += 1
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         if let taskId { content.userInfo = ["task": taskId] }
-        let req = UNNotificationRequest(identifier: "n\(notifCounter)", content: content, trigger: nil)
+        // identifier 必须跨启动唯一："n<计数>" 每次启动从头数，会顶替上次运行
+        // 残留在通知中心的同名通知——用户没看的历史提醒被静默吞掉。
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
     }
 
@@ -1220,8 +1273,17 @@ final class SessionStore: ObservableObject {
         sessions = list
         restoredIds = Set(list.map { $0.id }) // 这批是恢复的，agent 会话重开预填 resume
         for s in list where s.cwd != nil { liveCwd[s.id] = s.cwd } // 落盘前先沿用上次目录
-        activeId = list.last?.id
-        if let a = activeId { panes = [a] }
+        // 焦点还给退出时正看着的会话（settings 记录），而不是「最后创建」的那个；
+        // 会话已被删则回落最后一个。
+        if let la = settings.lastActiveId, list.contains(where: { $0.id == la }) {
+            activeId = la
+        } else {
+            activeId = list.last?.id
+        }
+        if let a = activeId {
+            panes = [a]
+            lastTabByTask[taskId(of: a)] = a // 侧栏点该任务时回到这个标签页
+        }
         persistSessions() // 归位后的状态立即落盘，避免磁盘上残留旧 running 状态
     }
 
@@ -1257,6 +1319,11 @@ final class SessionStore: ObservableObject {
             data.removeFirst(data.count - scrollbackCap)
             if let nl = data.firstIndex(of: 0x0A) {
                 data.removeSubrange(data.startIndex...nl)
+            } else {
+                // 整块没有换行（单条超长行）：至少对齐到 UTF-8 字符边界，
+                // 否则截断点落在多字节字符（中文 3 字节）中间，回放的历史
+                // 开头会顶着几个乱码替换符。
+                while let b = data.first, b & 0xC0 == 0x80 { data.removeFirst() }
             }
         }
         return data
@@ -1264,6 +1331,30 @@ final class SessionStore: ObservableObject {
 
     /// 退出前同步落盘全部会话缓冲（applicationWillTerminate 调用）。
     func persistAllScrollback() {
+        // 先排干 ioQueue 上遗留的异步落盘（旧快照）再写最终数据——两边都是
+        // atomic rename，谁后落地谁赢；不排干的话，退出前最后一次 cwd 采样和
+        // 最终屏幕内容可能被还在队列里的旧快照覆盖回去。
+        ioQueue.sync {}
+        // 校正持久化 kind：agent 已退出但 5s 一轮的 reclassify 尚未降级时，
+        // 落盘旧 kind 会让重启把用户已主动退出的 agent 会话再 --continue 复活。
+        // 退出路径只跑一次 ps 快照，成本可接受。
+        // ps 失败返回空表（snapshot 的契约是「调用方跳过本轮」）：空表对任何
+        // pid 都 classify 成 .shell，照跑会把全部运行中 agent 会话降级落盘、
+        // 重启续接整体失效。表空或 root 不在表里（输出截断）都跳过校正——
+        // 宁可保留旧 kind（最坏是 5s 窗口的误续接），不能误杀续接本身。
+        let table = ProcTable.snapshot()
+        for (id, v) in views where !table.isEmpty {
+            guard let i = sessions.firstIndex(where: { $0.id == id }), sessions[i].kind.isAgent,
+                  let pid = v.process?.shellPid, pid > 0, v.process?.running == true,
+                  table.contains(pid) else { continue }
+            let kind = table.classify(root: pid)
+            if !kind.isAgent {
+                sessions[i].kind = kind
+                sessions[i].host = kind == .ssh ? table.sshHost(root: pid) : nil
+                sessions[i].group = kind.group(host: sessions[i].host)
+                // 名字按 applyReclassify 的降级语义保留原样（不丢任务身份）。
+            }
+        }
         for (id, v) in views {
             // 退出前最后采样一次工作目录，确保落盘的是最新位置。
             if v.process?.running == true, let dir = processCwd(pid: v.process?.shellPid ?? 0) {
@@ -1273,6 +1364,11 @@ final class SessionStore: ObservableObject {
         }
         if let data = try? JSONEncoder().encode(sessionsForPersist()) {
             try? data.write(to: DataDir.sessionsFile, options: .atomic)
+        }
+        // 记录退出时的聚焦会话（重启恢复焦点用），随设置一并同步落盘。
+        settings.lastActiveId = activeId
+        if let data = try? JSONEncoder().encode(settings) {
+            try? data.write(to: DataDir.settingsFile, options: .atomic)
         }
     }
 }
