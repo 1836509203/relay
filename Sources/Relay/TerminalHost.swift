@@ -14,6 +14,20 @@ let plainCell: (CharData) -> Character = { $0.isNull ? " " : $0.getCharacter() }
 final class RelayTerminalView: LocalProcessTerminalView {
     var sessionId = ""
 
+    /// 用户是否已在本视图敲过键（autoResume 用：用户抢先接管就放弃自动续接，
+    /// 避免把 resume 命令拼进用户敲了一半的命令行）。
+    private(set) var userHasTyped = false
+
+    override func keyDown(with event: NSEvent) {
+        userHasTyped = true
+        super.keyDown(with: event)
+    }
+
+    override func paste(_ sender: Any) {
+        userHasTyped = true // 粘贴命令同样算用户接管
+        super.paste(sender)
+    }
+
     /// 渲染路径与设置对齐（Metal ⇄ CoreGraphics，可随时切换，buffer 无损）。
     /// 只有挂在窗口里的视图才持有 Metal —— 每套管线/drawable/字形图集
     /// ~160MB，N 个后台会话不该各占一份；detach 时立即释放（setUseMetal(false)
@@ -67,6 +81,10 @@ final class RelayTerminalView: LocalProcessTerminalView {
         // ⌘-hover 时，能解析为真实文件的裸路径才高亮成链接（下划线 + 手型光标），
         // 让「⌘-点击打开」这一手势可被发现。与打开走同一套解析，能高亮即能点开。
         onResolveLocalPath = { [weak self] in self?.resolveLocalPath($0) != nil }
+        usePageKeysForAlternateScrollFallback = { [weak self] in
+            guard let self else { return false }
+            return SessionStore.shared.sessions.first(where: { $0.id == self.sessionId })?.kind.isAgent == true
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }

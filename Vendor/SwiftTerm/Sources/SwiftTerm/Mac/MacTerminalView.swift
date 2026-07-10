@@ -629,6 +629,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// need a way of toggling this behavior.
     public var allowMouseReporting: Bool = true
 
+    /// Relay patch: lets the host opt specific alternate-screen apps out of the
+    /// xterm-style wheel -> cursor-key fallback. Agent TUIs use Up/Down for prompt
+    /// history, so wheel fallback should page their transcript instead.
+    public var usePageKeysForAlternateScrollFallback: (() -> Bool)?
+
     /// Controls how link tracking resolves hovered links:
     /// `.explicit` = OSC 8 only, `.implicit` = explicit + implicit fallback, `.none` = off.
     public var linkReporting: LinkReporting = .implicit
@@ -968,7 +973,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // doCommand/noop: - but more research needs to take place to figure out the priority
     // of those keys.
     //
-    public override func keyDown(with event: NSEvent) {
+    // Relay 补丁：public → open，允许宿主子类观察用户键入（autoResume 抢先输入守卫）。
+    open override func keyDown(with event: NSEvent) {
         selection.active = false
         let eventFlags = event.modifierFlags
 
@@ -2480,6 +2486,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             let lines = event.hasPreciseScrollingDeltas ? velocity : max (velocity, 3)
             if allowMouseReporting && terminal.mouseMode != .off {
                 sendAlternateMouseWheel(up: goingUp, lines: lines, event: event)
+            } else if usePageKeysForAlternateScrollFallback?() == true {
+                sendAlternateScrollPageKeys(up: goingUp, event: event)
             } else {
                 sendAlternateScrollKeys(up: goingUp, lines: lines)
             }
@@ -2497,6 +2505,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // Relay patch: cap how many line-events one physical gesture forwards to the
     // app, so a fast trackpad flick (velocity up to `rows`) can't flood it.
     private static let alternateScrollLineCap = 10
+    private static let alternateScrollPagePreciseThreshold: CGFloat = 36
+    private static let alternateScrollPageMinimumInterval: TimeInterval = 0.08
+    private var alternateScrollPageDirection = 0
+    private var alternateScrollPageAccumulator: CGFloat = 0
+    private var alternateScrollPageLastSentAt: TimeInterval = 0
 
     /// Relay patch: alternate-scroll — translate the wheel into cursor Up/Down
     /// key presses for apps that don't track the mouse (default `vim`, `less`,
@@ -2506,6 +2519,40 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             ? (terminal.applicationCursor ? EscapeSequences.moveUpApp : EscapeSequences.moveUpNormal)
             : (terminal.applicationCursor ? EscapeSequences.moveDownApp : EscapeSequences.moveDownNormal)
         let count = max (1, min (lines, cap))
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(seq.count * count)
+        for _ in 0..<count { bytes.append(contentsOf: seq) }
+        send(bytes)
+    }
+
+    /// Relay patch: agent TUI fallback. Claude/Codex/OpenCode use cursor Up/Down
+    /// for prompt history; sending repeated arrows from a trackpad gesture jumps to
+    /// "History 100/100". Page keys target the transcript viewport instead.
+    private func sendAlternateScrollPageKeys(up: Bool, event: NSEvent) {
+        let direction = up ? 1 : -1
+        if direction != alternateScrollPageDirection || event.phase.contains(.began) {
+            alternateScrollPageDirection = direction
+            alternateScrollPageAccumulator = 0
+        }
+
+        if event.hasPreciseScrollingDeltas {
+            let delta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.deltaY
+            alternateScrollPageAccumulator += abs(delta)
+            guard alternateScrollPageAccumulator >= Self.alternateScrollPagePreciseThreshold else { return }
+        }
+        // 限速对有级滚轮同样生效：一格一页没问题，但快速拨轮每秒可来十几个
+        // notch 事件，不限速就是每秒十几页打穿 transcript。
+        let now = event.timestamp
+        guard now - alternateScrollPageLastSentAt >= Self.alternateScrollPageMinimumInterval else { return }
+        alternateScrollPageAccumulator = 0
+        alternateScrollPageLastSentAt = now
+
+        sendAlternateScrollPageKeys(up: up, pages: 1)
+    }
+
+    private func sendAlternateScrollPageKeys(up: Bool, pages: Int) {
+        let seq = up ? EscapeSequences.cmdPageUp : EscapeSequences.cmdPageDown
+        let count = max(1, min(pages, 4))
         var bytes: [UInt8] = []
         bytes.reserveCapacity(seq.count * count)
         for _ in 0..<count { bytes.append(contentsOf: seq) }
@@ -2522,6 +2569,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let point = CGPoint(x: bounds.midX, y: bounds.midY)
         if allowMouseReporting && terminal.mouseMode != .off {
             sendAlternateMouseWheel(up: up, lines: lines, at: point, modifierFlags: [], cap: cap)
+        } else if usePageKeysForAlternateScrollFallback?() == true {
+            // 行步长折算成页（约 24 行/页）：粗滚步长(10/24/48)至少推一页；
+            // 精调小步(2 行)发整页必过冲（一页≈整屏 > settle 容差），退化为
+            // 不动——调用方（时间轴跳转）的 stall 检测会就地收束，目标已在屏、
+            // 只是不强求顶进屏幕上部。否则精调↔粗滚来回过冲，振荡到超时。
+            let pages = lines >= 10 ? max(1, lines / 24) : 0
+            if pages > 0 { sendAlternateScrollPageKeys(up: up, pages: pages) }
         } else {
             sendAlternateScrollKeys(up: up, lines: lines, cap: cap)
         }
